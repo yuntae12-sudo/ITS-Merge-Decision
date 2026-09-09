@@ -1,9 +1,11 @@
 """Tests for src/scenarios/merge_detector.py using synthetic geometry.
 
 Covers the minimum topology cases from the project plan (Commit D
-section 23): true lane-ending merge, ordinary parallel lane change,
-serial map-feature continuation, crossing lane, and weak/ambiguous
-convergence.
+section 23, later hardened into a three-way ACCEPT/REJECT/REVIEW model
+by the fix commits): true lane-ending merge, ordinary parallel lane
+change, serial map-feature continuation (now REVIEW, not REJECT --
+see merge_detector.py's module docstring "Serial-vs-merge ambiguity"),
+crossing lane, and weak/ambiguous convergence.
 """
 
 import numpy as np
@@ -15,7 +17,8 @@ from src.scenarios.merge_detector import (
     REJECT_HEADING_MISMATCH,
     REJECT_INSUFFICIENT_CONVERGENCE,
     REJECT_PARALLEL_LANE_CHANGE,
-    REJECT_SERIAL_CONTINUATION,
+    REVIEW_AMBIGUOUS_SERIAL_OR_MERGE,
+    MergeDecision,
     MergeTopologyConfig,
     compute_merge_start_end_s,
     compute_remaining_merge_distance,
@@ -68,11 +71,12 @@ def _make_transition(source_id, target_id, transition_frame=10):
 
 def test_case1_true_lane_ending_merge_accepted():
     """Source curves toward and ends near a straight target; separation
-    decreases monotonically over the approach.
+    decreases monotonically over the approach, landing 0.5 m off target
+    (outside the ambiguous serial-vs-merge band) -- confidently ACCEPT.
     """
 
     xs = np.linspace(0.0, 30.0, 31)
-    source_xy = np.stack([xs, 5.0 - (xs / 30.0) * 4.5], axis=1)
+    source_xy = np.stack([xs, 5.0 - (xs / 30.0) * 4.2], axis=1)
     source = _make_lane(1, source_xy)
 
     target_xs = np.linspace(-10.0, 40.0, 51)
@@ -85,16 +89,23 @@ def test_case1_true_lane_ending_merge_accepted():
         transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
     )
 
+    # Confirm this case lands clearly outside the ambiguous band (the
+    # point of this test is ACCEPT via confirmed convergence, not a
+    # boundary-adjacent endpoint distance).
+    assert diagnostic.endpoint_target_distance_m > (
+        DEFAULT_CONFIG.serial_continuation_max_lateral_m
+    )
+    assert diagnostic.decision == MergeDecision.ACCEPT
     assert diagnostic.is_merge_candidate is True
-    assert diagnostic.reject_reason is None
+    assert diagnostic.reason is None
     assert diagnostic.lanes_converge is True
-    assert diagnostic.serial_continuation is False
 
 
 def test_case2_ordinary_parallel_lane_change_rejected():
     """Source and target run parallel at a constant ~2 m separation --
     a normal lane change, not a merge (separation never meaningfully
-    decreases).
+    decreases). Confidently REJECT (not ambiguous: convergence itself
+    was never shown).
     """
 
     xs = np.linspace(0.0, 30.0, 31)
@@ -110,17 +121,22 @@ def test_case2_ordinary_parallel_lane_change_rejected():
         transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
     )
 
-    assert diagnostic.is_merge_candidate is False
-    assert diagnostic.reject_reason == REJECT_PARALLEL_LANE_CHANGE
+    assert diagnostic.decision == MergeDecision.REJECT
+    assert diagnostic.reason == REJECT_PARALLEL_LANE_CHANGE
     assert diagnostic.parallel_continuation is True
 
 
-def test_case3_serial_map_feature_continuation_rejected():
+def test_case3_collinear_serial_continuation_is_review_not_reject():
     """Source A ends essentially exactly where target B starts, as
-    consecutive serial segments of the same physical lane -- this must
-    NOT be classified as a merge even though the endpoint is extremely
-    close to the target (near-zero lateral offset, landing at the
-    target's own start).
+    consecutive serial segments of the same physical lane (collinear
+    A-end == B-start). Real-WOMD investigation showed this geometry
+    (endpoint landing within serial_continuation_max_lateral_m of the
+    target) is equally consistent with a true merge whose target WOMD
+    feature happens to begin exactly at the convergence point --
+    available geometry cannot tell these apart, so this must be
+    REVIEW, NOT an automatic REJECT (see merge_detector.py's module
+    docstring "Serial-vs-merge ambiguity" for the full investigation
+    behind this).
     """
 
     source_xy = np.stack(
@@ -140,14 +156,67 @@ def test_case3_serial_map_feature_continuation_rejected():
         transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
     )
 
+    assert diagnostic.decision == MergeDecision.REVIEW
+    assert diagnostic.reason == REVIEW_AMBIGUOUS_SERIAL_OR_MERGE
     assert diagnostic.is_merge_candidate is False
-    assert diagnostic.reject_reason == REJECT_SERIAL_CONTINUATION
-    assert diagnostic.serial_continuation is True
+    assert diagnostic.endpoint_target_distance_m == pytest.approx(
+        0.0, abs=1e-6
+    )
+
+
+def test_case3b_true_merge_near_convergence_point_accepted():
+    """The regression this fix commit specifically requires (project
+    plan section 2 regression #2), matching real-WOMD record 28's true
+    merge (lane 485->344, endpoint_target_distance == 2.14 m): a TRUE
+    merge whose target WOMD feature begins very close to the
+    convergence point -- close enough that a naive "endpoint touches
+    target" check could plausibly flag it, but with the source's
+    upstream approach genuinely curving in (non-collinear, large
+    upstream separation shrinking toward the endpoint) rather than
+    simply continuing the target's line. This lands OUTSIDE
+    serial_continuation_max_lateral_m (0.5 m) and must ACCEPT, not
+    REVIEW.
+
+    Note: a source ending at EXACTLY 0.0 m from the target is, in the
+    current single-signal (endpoint-distance) REVIEW model, always
+    inside the ambiguous band for any positive threshold -- see Known
+    Limitations in the fix commit report. That exact-zero case is
+    demonstrated separately by test_case3_collinear_serial_continuation
+    _is_review_not_reject, which documents it as REVIEW rather than an
+    automatic REJECT (the actual fix this commit makes for that exact
+    geometry).
+    """
+
+    # Source curves in from an offset, ending 0.6 m off the target's
+    # own start point (just outside serial_continuation_max_lateral_m
+    # =0.5), matching real-WOMD record 28's true merge shape (large
+    # upstream separation shrinking to near-zero at the endpoint).
+    xs = np.linspace(0.0, 30.0, 31)
+    source_xy = np.stack([xs, 10.0 - (xs / 30.0) * 9.4], axis=1)
+    source = _make_lane(1, source_xy)
+
+    target_xs = np.linspace(30.0, 60.0, 31)
+    target_xy = np.stack([target_xs, np.zeros_like(target_xs)], axis=1)
+    target = _make_lane(2, target_xy)
+
+    transition = _make_transition(1, 2)
+
+    diagnostic = detect_merge(
+        transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
+    )
+
+    assert diagnostic.endpoint_target_distance_m > (
+        DEFAULT_CONFIG.serial_continuation_max_lateral_m
+    )
+    assert diagnostic.decision == MergeDecision.ACCEPT
+    assert diagnostic.is_merge_candidate is True
+    assert diagnostic.reason is None
 
 
 def test_case4_crossing_lane_rejected():
     """Source ends physically near the target, but the target crosses
-    at ~90 degrees -- heading incompatible, not a merge.
+    at ~90 degrees -- heading incompatible, not a merge. Confidently
+    REJECT.
     """
 
     source_xy = np.stack(
@@ -167,8 +236,8 @@ def test_case4_crossing_lane_rejected():
         transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
     )
 
-    assert diagnostic.is_merge_candidate is False
-    assert diagnostic.reject_reason == REJECT_HEADING_MISMATCH
+    assert diagnostic.decision == MergeDecision.REJECT
+    assert diagnostic.reason == REJECT_HEADING_MISMATCH
 
 
 def test_case5_weak_ambiguous_convergence_rejected():
@@ -177,8 +246,8 @@ def test_case5_weak_ambiguous_convergence_rejected():
     min_separation_reduction_m even though a majority of steps
     decrease. This models a real observed case (WOMD record 7,
     lane 256->257: reduction ~0.94 m, decreasing_fraction ~0.67) that
-    is genuinely ambiguous rather than clearly parallel or clearly
-    converging, and must not be accepted as a confirmed merge.
+    is confidently REJECTed (convergence itself is not confirmed, so
+    there is no serial-vs-merge ambiguity to resolve).
     """
 
     xs = np.linspace(0.0, 30.0, 31)
@@ -202,8 +271,8 @@ def test_case5_weak_ambiguous_convergence_rejected():
         transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
     )
 
-    assert diagnostic.is_merge_candidate is False
-    assert diagnostic.reject_reason == REJECT_INSUFFICIENT_CONVERGENCE
+    assert diagnostic.decision == MergeDecision.REJECT
+    assert diagnostic.reason == REJECT_INSUFFICIENT_CONVERGENCE
     assert diagnostic.parallel_continuation is False
 
 
@@ -224,6 +293,32 @@ def test_merge_start_end_uses_source_arc_length():
     assert merge_end_s == pytest.approx(source.arc_length[-1])
     assert merge_start_s < merge_end_s
     assert merge_start_s >= 0.0
+
+
+def test_merge_start_end_short_source_lane_stays_in_domain():
+    """Fix (project plan section 7): when the source lane is shorter
+    than convergence_window_m, merge_start_s must stay within the
+    source lane's own arc-length domain
+    (source_start_s <= merge_start_s <= merge_end_s), not construct an
+    out-of-domain negative sample internally.
+    """
+
+    # Source lane is only 10 m long -- shorter than
+    # DEFAULT_CONFIG.convergence_window_m (30 m).
+    xs = np.linspace(0.0, 10.0, 11)
+    source_xy = np.stack([xs, 3.0 - (xs / 10.0) * 3.0], axis=1)
+    source = _make_lane(1, source_xy)
+
+    target_xs = np.linspace(-10.0, 20.0, 31)
+    target_xy = np.stack([target_xs, np.zeros_like(target_xs)], axis=1)
+    target = _make_lane(2, target_xy)
+
+    merge_start_s, merge_end_s = compute_merge_start_end_s(
+        source, target, DEFAULT_CONFIG
+    )
+
+    assert merge_end_s == pytest.approx(source.arc_length[-1])
+    assert source.arc_length[0] <= merge_start_s <= merge_end_s
 
 
 def test_remaining_merge_distance_nonnegative_and_uses_source_arc_length():

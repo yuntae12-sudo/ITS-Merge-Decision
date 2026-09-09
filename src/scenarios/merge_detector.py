@@ -3,18 +3,35 @@
 Commit C's ``find_lane_transitions`` only observes "ego moved from
 lane A to lane B in a stable way" -- it makes no claim about *why*.
 This module classifies each such ``LaneTransition`` against a series
-of independent geometric/temporal gates and decides whether it is a
-plausible Merge candidate, a normal parallel lane change, a serial
-map-segment continuation (the same physical lane split across
-multiple WOMD feature ids), a crossing/unrelated lane, or ambiguous.
+of independent geometric/temporal gates and produces a three-way
+decision: ACCEPT (confident merge candidate), REJECT (confidently not
+a merge -- clearly parallel lane change, crossing lane, insufficient
+convergence, etc.), or REVIEW (available geometry cannot confidently
+distinguish a true merge from a serial map-segment continuation --
+see "Serial-vs-merge ambiguity" below).
 
-Important constraint -- no invented lane topology
---------------------------------------------------
-Waymax's ``roadgraph_points`` (as reconstructed into ``LanePolyline``
-by ``lane_geometry.py``) exposes only sampled point geometry: position,
-per-point direction, and an id grouping. There is no
-predecessor/successor/neighbor-lane field anywhere in this pipeline.
-Every judgment below is therefore either:
+Important architectural conclusion -- no authoritative lane topology
+----------------------------------------------------------------------
+The current Waymax tf_example input pipeline (confirmed by inspecting
+``waymax.dataloader.womd_utils.get_features_description()``'s full
+feature list) exposes:
+
+  - ``roadgraph_samples/*`` -- the flat point cloud reconstructed into
+    ``LanePolyline`` by ``lane_geometry.py``: position, per-point
+    direction, an id grouping, no connectivity.
+  - ``path_samples/*`` -- SDC route path samples (``on_route`` etc.),
+    which describe ego's own predicted route, NOT a lane connectivity
+    graph between arbitrary lanes.
+  - agent trajectories and traffic-light state -- unrelated to lane
+    topology.
+
+None of these expose lane predecessor/successor/neighbor topology.
+That information exists only in WOMD's separate Scenario protobuf
+format (``MapFeature.lane.entry_lanes`` / ``exit_lanes``), which
+requires a different dataset download and the (currently uninstalled)
+``waymo_open_dataset`` package -- explicitly out of scope for this
+commit (see Known Limitations in the commit report). Every judgment
+below is therefore either:
 
   (a) directly available geometry -- polyline endpoints, arc length,
       per-point heading, exact segment projection (all already
@@ -24,12 +41,57 @@ Every judgment below is therefore either:
       as a proxy for merge topology, since no explicit
       "target_lane.entry_lanes" field exists to consult directly.
 
-Every gate below is commented as to which category it falls into. If
-raw WOMD scenario-proto topology (which does encode lane
-predecessors/successors, unlike the roadgraph_points sample cloud used
-here) becomes necessary for higher precision, that is a known
-limitation of this Commit, not something silently assumed to already
-be present.
+Geometry inference is never described as ground-truth topology in this
+module's docstrings, logs, or diagnostic field names.
+
+Serial-vs-merge ambiguity (why REVIEW exists)
+-----------------------------------------------
+An earlier version of this module tried to hard-classify "serial
+map-segment continuation" (the same physical lane split across
+multiple WOMD feature ids -- not a merge) from geometry alone, using
+endpoint proximity, terminal collinearity with the target's tangent,
+and the upstream source-target separation trend. Real-WOMD
+investigation (30 scenes, 38 transitions) showed this does not work
+reliably:
+
+  - Upstream separation is NOT a discriminator: both confirmed serial
+    transitions and the one true merge-like candidate found in this
+    survey (record 28, lane 485->344) show the SAME curve shape --
+    large separation far upstream (15-30 m), shrinking to near zero at
+    the endpoint. Requiring "already small upstream" as a serial
+    condition let true merges be misclassified as accepted merges
+    just as often as it correctly flagged serial cases, once real data
+    was checked (see Design Decisions in the commit report).
+  - Terminal collinearity (perpendicular distance from source's
+    upstream samples to the target's backward-extended local tangent)
+    is unreliable whenever the target lane is long or curved: a local
+    tangent line is only a valid straight-line approximation very
+    close to the anchor point, so confirmed serial cases (e.g.
+    196->206, endpoint distance exactly 0.0 m) can show a LARGE
+    collinearity offset (up to ~15 m) purely because the target curves
+    away from its own endpoint tangent, not because source and target
+    are unrelated.
+
+What DOES separate the one true merge from confirmed serial cases in
+this survey is much simpler: ``endpoint_target_distance`` itself.
+Confirmed serial transitions all land with the source endpoint
+essentially exactly ON the target polyline (0.000 m lateral offset,
+well under ``serial_continuation_max_lateral_m``); the one true merge
+found landed 2.14 m off target -- comfortably inside
+``max_endpoint_target_distance_m`` (this study's "close enough to be
+plausibly converging") but well outside the much tighter
+"essentially on top of it" band. This module uses exactly that
+signal, and only that signal, to trigger REVIEW rather than an
+automatic REJECT or ACCEPT: an endpoint landing within
+``serial_continuation_max_lateral_m`` of the target is consistent with
+BOTH a serial continuation and a merge whose target WOMD feature
+happens to begin exactly at the convergence point -- available
+geometry cannot tell those apart, so it is flagged for manual review
+(Compressed Commit E) rather than confidently decided either way.
+Collinearity and upstream separation are still computed and exposed
+on ``MergeDiagnostic`` as diagnostic context (they may be useful during
+manual review), but neither is used to decide ACCEPT/REJECT/REVIEW
+given how unreliable they proved to be as hard gates.
 
 Offline vs. online (event-time) distinction
 --------------------------------------------
@@ -43,6 +105,7 @@ future frames. See the Gate 6 docstring below for where this applies.
 """
 
 import dataclasses
+import enum
 from typing import List, Optional
 
 import numpy as np
@@ -72,25 +135,55 @@ class MergeTopologyConfig:
     min_target_lane_frames: int
 
 
+class MergeDecision(enum.Enum):
+    """Three-way outcome of classifying a LaneTransition.
+
+    ACCEPT: confident merge candidate -- all gates passed and the
+        endpoint did not land in the ambiguous serial-vs-merge band.
+    REJECT: confidently NOT a merge -- a gate clearly failed (missing
+        geometry, insufficient history, source not near its end,
+        target too far, heading mismatch, clearly parallel, clearly
+        insufficient convergence, or insufficient target persistence).
+    REVIEW: available geometry cannot confidently distinguish a true
+        merge from a serial map-segment continuation (see module
+        docstring "Serial-vs-merge ambiguity"). Not a rejection --
+        Compressed Commit E's manual validation step is expected to
+        resolve these.
+    """
+
+    ACCEPT = "accept"
+    REJECT = "reject"
+    REVIEW = "review"
+
+
 REJECT_MISSING_GEOMETRY = "missing_geometry"
 REJECT_SOURCE_NOT_NEAR_END = "source_not_near_end"
 REJECT_TARGET_TOO_FAR = "target_too_far"
 REJECT_HEADING_MISMATCH = "heading_mismatch"
-REJECT_SERIAL_CONTINUATION = "serial_lane_continuation"
 REJECT_PARALLEL_LANE_CHANGE = "parallel_lane_change"
 REJECT_INSUFFICIENT_CONVERGENCE = "insufficient_convergence"
 REJECT_INSUFFICIENT_PRE_MERGE = "insufficient_pre_merge_history"
 REJECT_INSUFFICIENT_TARGET_PERSISTENCE = "insufficient_target_persistence"
+
+REVIEW_AMBIGUOUS_SERIAL_OR_MERGE = "ambiguous_serial_or_merge"
 
 
 @dataclasses.dataclass(frozen=True)
 class MergeDiagnostic:
     """Structured result of classifying one LaneTransition.
 
-    Every candidate -- accepted or rejected -- keeps enough
-    diagnostic information to answer "why". ``reject_reason`` is one
-    of the ``REJECT_*`` constants in this module, or ``None`` if
-    ``is_merge_candidate`` is True.
+    Every candidate -- ACCEPT, REJECT, or REVIEW -- keeps enough
+    diagnostic information to answer "why". ``reason`` is one of the
+    ``REJECT_*`` constants when ``decision == MergeDecision.REJECT``,
+    ``REVIEW_AMBIGUOUS_SERIAL_OR_MERGE`` when
+    ``decision == MergeDecision.REVIEW``, or ``None`` when
+    ``decision == MergeDecision.ACCEPT``.
+
+    ``is_merge_candidate`` is kept for backward compatibility with
+    Commit D callers (e.g. scripts/inspect_merge_candidate.py's
+    feature-extraction branch) and is True only for ACCEPT -- REVIEW is
+    deliberately NOT treated as accepted merge for feature-extraction
+    purposes, since it has not been confirmed.
     """
 
     source_lane_id: int
@@ -117,14 +210,21 @@ class MergeDiagnostic:
     # available geometry).
     heading_difference_deg: Optional[float]
 
-    # Gate 5 / serial-continuation vs. parallel-change: convergence
-    # evidence (geometry-inferred from sampled separation trend; see
-    # module docstring).
+    # Gate 5 / parallel-change vs. convergence: convergence evidence
+    # (geometry-inferred from sampled separation trend; see module
+    # docstring).
     lanes_converge: bool
     parallel_continuation: bool
-    serial_continuation: bool
     separation_reduction_m: Optional[float]
     decreasing_fraction: Optional[float]
+    # Diagnostic-only context, NOT used to decide ACCEPT/REJECT/REVIEW
+    # (see module docstring "Serial-vs-merge ambiguity" for why both
+    # proved unreliable as hard gates): max perpendicular distance from
+    # the source's upstream samples to the target's own backward
+    # -extended tangent line, and the farthest (most-upstream) sampled
+    # source-target separation.
+    max_collinear_offset_m: Optional[float]
+    upstream_separation_m: Optional[float]
 
     # Gate 6: pre-merge source history and post-transition target
     # persistence (uses Commit C's stable-sequence frame ranges;
@@ -133,8 +233,12 @@ class MergeDiagnostic:
     pre_merge_frames: int
     target_lane_persistent: bool
 
+    decision: MergeDecision
+    reason: Optional[str]
+
+    # Backward-compatible convenience field: True only for
+    # decision == MergeDecision.ACCEPT (see class docstring).
     is_merge_candidate: bool
-    reject_reason: Optional[str]
 
 
 def load_merge_topology_config(config_path: str) -> MergeTopologyConfig:
@@ -189,6 +293,58 @@ def _interpolate_xy(polyline: LanePolyline, arc_length_m: float):
     return xy0 + t * (xy1 - xy0)
 
 
+def _sample_source_upstream_arc_lengths(
+    source_polyline: LanePolyline,
+    config: MergeTopologyConfig,
+) -> np.ndarray:
+    """Arc-length positions to sample upstream of the source endpoint.
+
+    Fix (project plan section 7): builds the window directly in-domain
+    -- ``[max(source_end_s - convergence_window_m, source_start_s),
+    source_end_s]`` -- and samples evenly across it, rather than
+    sampling fixed offsets from the endpoint and clamping each one
+    independently. The latter approach could construct
+    negative/out-of-domain arc lengths internally and, whenever
+    ``source_lane_length < convergence_window_m``, would repeatedly
+    clamp several of the farthest samples to the same
+    ``source_polyline.arc_length[0]`` point (redundant samples, and a
+    window that silently extended past the source lane's own domain
+    before clamping). Guarantees
+    ``source_start_s <= every sample <= source_end_s``.
+    """
+
+    source_start_s = source_polyline.arc_length[0]
+    source_end_s = source_polyline.arc_length[-1]
+
+    window_start_s = max(
+        source_end_s - config.convergence_window_m, source_start_s
+    )
+
+    return np.linspace(
+        window_start_s, source_end_s, config.convergence_sample_count
+    )
+
+
+def _sample_source_upstream_points(
+    source_polyline: LanePolyline,
+    config: MergeTopologyConfig,
+):
+    """Samples (x, y) positions along the source polyline over a window
+    upstream of its endpoint (farthest to nearest the endpoint).
+    """
+
+    sample_arc_lengths = _sample_source_upstream_arc_lengths(
+        source_polyline, config
+    )
+
+    return np.asarray(
+        [
+            _interpolate_xy(source_polyline, s)
+            for s in sample_arc_lengths
+        ]
+    )
+
+
 def _measure_convergence(
     source_polyline: LanePolyline,
     target_polyline: LanePolyline,
@@ -212,16 +368,10 @@ def _measure_convergence(
         decreased.
     """
 
-    source_end_s = source_polyline.arc_length[-1]
-    sample_offsets = np.linspace(
-        config.convergence_window_m, 0.0, config.convergence_sample_count
-    )
+    points = _sample_source_upstream_points(source_polyline, config)
 
     separations = []
-
-    for offset in sample_offsets:
-        sample_s = max(source_end_s - offset, source_polyline.arc_length[0])
-        xy = _interpolate_xy(source_polyline, sample_s)
+    for xy in points:
         projection = project_point_to_polyline(
             target_polyline, float(xy[0]), float(xy[1])
         )
@@ -236,6 +386,89 @@ def _measure_convergence(
     )
 
     return separations, reduction_m, decreasing_fraction
+
+
+def _measure_collinearity_with_target(
+    source_polyline: LanePolyline,
+    target_polyline: LanePolyline,
+    endpoint_projection: dict,
+    config: MergeTopologyConfig,
+):
+    """Measures how closely the source lane's terminal geometry follows
+    a straight backward extension of the TARGET lane's own tangent at
+    the convergence point.
+
+    Diagnostic-only (see module docstring "Serial-vs-merge ambiguity"):
+    this is NOT used to decide ACCEPT/REJECT/REVIEW. Real-WOMD
+    investigation showed it is unreliable whenever the target lane is
+    long or curved -- a local tangent line is only a valid
+    approximation very close to the anchor point, so confirmed serial
+    continuation cases can show a large collinearity offset purely
+    because the target curves away from its own endpoint tangent, not
+    because source and target are geometrically unrelated. It is
+    exposed on ``MergeDiagnostic`` purely as manual-review context.
+
+    Geometry-inferred evidence (see module docstring): there is no
+    explicit "same physical lane" flag. This measures the perpendicular
+    distance from each upstream source sample to the straight line
+    through the target's convergence point with the target's local
+    tangent direction there.
+
+    Returns:
+        perpendicular_distances: array (farthest-to-nearest source
+        endpoint, matching ``_measure_convergence``'s `separations`
+        ordering) of perpendicular distance from each upstream source
+        sample to the target's backward-extended tangent line.
+    """
+
+    heading = endpoint_projection["heading_rad"]
+    tangent = np.array([np.cos(heading), np.sin(heading)])
+
+    segment_index = endpoint_projection["segment_index"]
+    anchor = target_polyline.xy[segment_index]
+
+    points = _sample_source_upstream_points(source_polyline, config)
+
+    relative = points - anchor
+    along = relative @ tangent
+    perpendicular = relative - along[:, None] * tangent
+    perpendicular_distance = np.hypot(perpendicular[:, 0], perpendicular[:, 1])
+
+    return perpendicular_distance
+
+
+def _is_ambiguous_serial_or_merge(
+    endpoint_target_distance: float,
+    config: MergeTopologyConfig,
+) -> bool:
+    """Decides whether a transition falls in the geometry-ambiguous
+    band between serial map-segment continuation and a true merge (see
+    module docstring "Serial-vs-merge ambiguity" for the full
+    investigation this is based on).
+
+    This uses exactly ONE signal: whether the source endpoint lands
+    within ``serial_continuation_max_lateral_m`` of the target polyline
+    -- essentially exactly on top of it. That threshold is deliberately
+    much tighter than ``max_endpoint_target_distance_m`` (this study's
+    "plausibly converging" band): every confirmed serial-continuation
+    transition observed in this study's 30-scene/38-transition survey
+    landed with 0.000 m lateral offset there, while the one true
+    merge-like candidate found (record 28, lane 485->344) landed 2.14 m
+    off target -- comfortably inside ``max_endpoint_target_distance_m``
+    but well outside this tighter band. Two other candidate signals
+    (terminal collinearity with the target's tangent, and the upstream
+    source-target separation trend) were investigated and found
+    unreliable as additional conditions here -- see the module
+    docstring for why -- so neither is used; they remain available on
+    ``MergeDiagnostic`` purely as manual-review context.
+
+    Landing inside this band does not by itself confirm serial
+    continuation OR a merge: both are geometrically consistent with it,
+    which is exactly why it triggers REVIEW instead of an automatic
+    REJECT or ACCEPT.
+    """
+
+    return endpoint_target_distance <= config.serial_continuation_max_lateral_m
 
 
 def detect_merge(
@@ -261,15 +494,17 @@ def detect_merge(
 
     Returns:
         MergeDiagnostic with every gate's evidence populated as far as
-        it was reached, and ``is_merge_candidate`` / ``reject_reason``
-        set based on the first gate that failed (later gates are still
-        computed where the necessary geometry is available, so
-        rejected candidates keep useful diagnostics, but a gate that
-        depends on an earlier failed gate's output may be left as
-        ``None``/``False`` defaults).
+        it was reached, and ``decision`` / ``reason`` set based on the
+        first hard-reject gate that failed, or REVIEW if the
+        serial-vs-merge ambiguity band was hit, or ACCEPT if every
+        gate passed cleanly (later gates are still computed where the
+        necessary geometry is available, so rejected/review candidates
+        keep useful diagnostics, but a gate that depends on an earlier
+        failed gate's output may be left as ``None``/``False``
+        defaults).
     """
 
-    def _reject(reason, **evidence):
+    def _finalize(decision, reason, **evidence):
         defaults = dict(
             source_lane_id=transition.source_lane_id,
             target_lane_id=transition.target_lane_id,
@@ -281,20 +516,25 @@ def detect_merge(
             heading_difference_deg=None,
             lanes_converge=False,
             parallel_continuation=False,
-            serial_continuation=False,
             separation_reduction_m=None,
             decreasing_fraction=None,
+            max_collinear_offset_m=None,
+            upstream_separation_m=None,
             pre_merge_frames=(
                 transition.source_end_frame
                 - transition.source_start_frame
                 + 1
             ),
             target_lane_persistent=False,
-            is_merge_candidate=False,
-            reject_reason=reason,
+            decision=decision,
+            reason=reason,
+            is_merge_candidate=(decision == MergeDecision.ACCEPT),
         )
         defaults.update(evidence)
         return MergeDiagnostic(**defaults)
+
+    def _reject(reason, **evidence):
+        return _finalize(MergeDecision.REJECT, reason, **evidence)
 
     pre_merge_frames = (
         transition.source_end_frame - transition.source_start_frame + 1
@@ -386,69 +626,39 @@ def detect_merge(
             target_lane_persistent=target_lane_persistent,
         )
 
-    # Serial map-segment continuation check (geometry-inferred
-    # heuristic, see module docstring / Case 3 in
-    # tests/scenarios/test_merge_detector.py): the same physical lane
-    # is sometimes split into consecutive WOMD feature ids with A's
-    # travel-direction endpoint landing essentially exactly on B's own
-    # start or end with near-zero lateral offset -- i.e. this is not a
-    # lateral convergence at all, source and target are collinear
-    # continuations of one another.
-    serial_continuation = (
-        endpoint_target_distance <= config.serial_continuation_max_lateral_m
-        and (
-            endpoint_target_arc_length
-            <= config.serial_continuation_max_lateral_m
-            or endpoint_target_arc_length
-            >= target_polyline.arc_length[-1]
-            - config.serial_continuation_max_lateral_m
-        )
-    )
-
-    # Gate 5: convergence vs. parallel continuation (geometry-inferred
-    # from the sampled separation trend -- see module docstring and
-    # _measure_convergence).
+    # Gate 5 evidence: sampled source-target separation trend
+    # (geometry-inferred, see module docstring and _measure_convergence)
+    # and terminal collinearity with the target's own backward-extended
+    # tangent (see _measure_collinearity_with_target). The latter is
+    # diagnostic-only context now -- see module docstring "Serial-vs
+    # -merge ambiguity" for why it and the upstream-separation value are
+    # not used to decide ACCEPT/REJECT/REVIEW.
     separations, reduction_m, decreasing_fraction = _measure_convergence(
         source_polyline, target_polyline, config
     )
+    collinear_offsets = _measure_collinearity_with_target(
+        source_polyline, target_polyline, endpoint_projection, config
+    )
+    max_collinear_offset = float(np.max(collinear_offsets))
+    upstream_separation = float(separations[0])
 
     lanes_converge = (
         reduction_m >= config.min_separation_reduction_m
         and decreasing_fraction >= config.min_decreasing_fraction
     )
-    # Distinguish two failure shapes when convergence isn't confirmed:
-    # "parallel" means separation barely changed at all (near-zero
+    # "Parallel" means separation barely changed at all (near-zero
     # reduction, e.g. an ordinary lane change where source and target
-    # simply run alongside each other); "insufficient/ambiguous" means
-    # some reduction was observed but it didn't clear both criteria
-    # (e.g. a decreasing trend that isn't consistent enough, or a
-    # borderline reduction amount) -- geometrically different from a
-    # lane that never converges at all, even though neither is
-    # accepted as a merge.
+    # simply run alongside each other) -- a confident REJECT.
+    # Anything else that fails to confirm convergence is
+    # insufficient/ambiguous convergence -- also a confident REJECT
+    # (this is a different question from the serial-vs-merge ambiguity
+    # below: here the geometry does not even show a plausible
+    # converging approach, so there is nothing to send for manual
+    # review).
     near_zero_reduction = reduction_m < (
         0.5 * config.min_separation_reduction_m
     )
-    parallel_continuation = (
-        not lanes_converge
-        and not serial_continuation
-        and near_zero_reduction
-    )
-
-    if serial_continuation:
-        return _reject(
-            REJECT_SERIAL_CONTINUATION,
-            source_lane_ends=True,
-            source_remaining_distance_m=source_remaining,
-            endpoint_target_distance_m=endpoint_target_distance,
-            endpoint_target_arc_length_m=endpoint_target_arc_length,
-            heading_difference_deg=heading_difference_deg,
-            lanes_converge=lanes_converge,
-            serial_continuation=True,
-            separation_reduction_m=reduction_m,
-            decreasing_fraction=decreasing_fraction,
-            pre_merge_frames=pre_merge_frames,
-            target_lane_persistent=target_lane_persistent,
-        )
+    parallel_continuation = not lanes_converge and near_zero_reduction
 
     if not lanes_converge:
         reason = (
@@ -467,6 +677,8 @@ def detect_merge(
             parallel_continuation=parallel_continuation,
             separation_reduction_m=reduction_m,
             decreasing_fraction=decreasing_fraction,
+            max_collinear_offset_m=max_collinear_offset,
+            upstream_separation_m=upstream_separation,
             pre_merge_frames=pre_merge_frames,
             target_lane_persistent=target_lane_persistent,
         )
@@ -488,14 +700,21 @@ def detect_merge(
             lanes_converge=True,
             separation_reduction_m=reduction_m,
             decreasing_fraction=decreasing_fraction,
+            max_collinear_offset_m=max_collinear_offset,
+            upstream_separation_m=upstream_separation,
             pre_merge_frames=pre_merge_frames,
             target_lane_persistent=False,
         )
 
-    return MergeDiagnostic(
-        source_lane_id=transition.source_lane_id,
-        target_lane_id=transition.target_lane_id,
-        transition_frame=transition.transition_frame,
+    # Serial-vs-merge ambiguity check (see module docstring): every
+    # other gate has now passed, including a confirmed converging
+    # approach and target persistence. The ONLY remaining question is
+    # whether this converging transition is a true merge or a serial
+    # map-segment continuation that happens to also show convergence
+    # -like geometry. Available geometry cannot answer that reliably
+    # (see module docstring), so this is REVIEW, not an automatic
+    # ACCEPT or REJECT.
+    common_evidence = dict(
         source_lane_ends=True,
         source_remaining_distance_m=source_remaining,
         endpoint_target_distance_m=endpoint_target_distance,
@@ -503,14 +722,22 @@ def detect_merge(
         heading_difference_deg=heading_difference_deg,
         lanes_converge=True,
         parallel_continuation=False,
-        serial_continuation=False,
         separation_reduction_m=reduction_m,
         decreasing_fraction=decreasing_fraction,
+        max_collinear_offset_m=max_collinear_offset,
+        upstream_separation_m=upstream_separation,
         pre_merge_frames=pre_merge_frames,
         target_lane_persistent=True,
-        is_merge_candidate=True,
-        reject_reason=None,
     )
+
+    if _is_ambiguous_serial_or_merge(endpoint_target_distance, config):
+        return _finalize(
+            MergeDecision.REVIEW,
+            REVIEW_AMBIGUOUS_SERIAL_OR_MERGE,
+            **common_evidence,
+        )
+
+    return _finalize(MergeDecision.ACCEPT, None, **common_evidence)
 
 
 def compute_merge_start_end_s(
@@ -539,13 +766,15 @@ def compute_merge_start_end_s(
         (i.e. the whole configured window is used).
     """
 
-    source_end_s = source_polyline.arc_length[-1]
-    merge_end_s = source_end_s
+    merge_end_s = source_polyline.arc_length[-1]
 
-    sample_offsets = np.linspace(
-        config.convergence_window_m, 0.0, config.convergence_sample_count
-    )
-    sample_s = source_end_s - sample_offsets
+    # Fix (project plan section 7): sample in-domain arc lengths via
+    # the same helper used elsewhere, rather than constructing
+    # `source_end_s - offset` directly -- guarantees every sample (and
+    # therefore merge_start_s) satisfies
+    # source_polyline.arc_length[0] <= sample <= merge_end_s, even when
+    # the source lane is shorter than convergence_window_m.
+    sample_s = _sample_source_upstream_arc_lengths(source_polyline, config)
 
     separations = []
     for s in sample_s:

@@ -1,10 +1,12 @@
 """Phase 1 CLI: run the merge detector over a scenario's stable
 lane transitions and print detailed diagnostics.
 
-For each stable A->B transition (Commit C), classifies it against the
-merge topology gates (Commit D) and, if accepted, extracts target-lane
-interaction features (Front/Rear gap, relative speed, TTC, d_m,
-traffic density).
+For each stable A->B transition (Commit C), classifies it as ACCEPT
+(confident merge candidate), REJECT (confidently not a merge), or
+REVIEW (available geometry cannot confidently distinguish a true merge
+from a serial map-segment continuation -- see merge_detector.py's
+module docstring). ACCEPTed transitions get target-lane interaction
+features (Front/Rear gap, relative speed, TTC, d_m, traffic density).
 
 Example:
     python scripts/inspect_merge_candidate.py --record-index 0
@@ -26,6 +28,7 @@ from src.scenarios.lane_assignment import (
 )
 from src.scenarios.lane_geometry import extract_lane_polylines, project_point_to_polyline
 from src.scenarios.merge_detector import (
+    MergeDecision,
     compute_merge_start_end_s,
     compute_remaining_merge_distance,
     detect_merge,
@@ -145,7 +148,12 @@ def main():
         print("=" * 70)
         return
 
-    accepted_count = 0
+    decision_counts = {
+        MergeDecision.ACCEPT: 0,
+        MergeDecision.REJECT: 0,
+        MergeDecision.REVIEW: 0,
+    }
+    reason_counts = {}
 
     for index, transition in enumerate(transitions):
 
@@ -193,7 +201,12 @@ def main():
         print(f"  decreasing_fraction      : {diagnostic.decreasing_fraction}")
         print(f"  lanes_converge           : {diagnostic.lanes_converge}")
         print(
-            f"  serial_continuation      : {diagnostic.serial_continuation}"
+            f"  max_collinear_offset_m   : "
+            f"{diagnostic.max_collinear_offset_m} (diagnostic-only)"
+        )
+        print(
+            f"  upstream_separation_m    : "
+            f"{diagnostic.upstream_separation_m} (diagnostic-only)"
         )
         print(
             f"  parallel_continuation    : "
@@ -205,12 +218,17 @@ def main():
             f"{diagnostic.target_lane_persistent}"
         )
 
-        if diagnostic.is_merge_candidate:
-            print("\n  RESULT: ACCEPT")
-            accepted_count += 1
-        else:
-            print("\n  RESULT: REJECT")
-            print(f"  reject_reason: {diagnostic.reject_reason}")
+        decision_counts[diagnostic.decision] += 1
+        reason_counts[diagnostic.reason] = (
+            reason_counts.get(diagnostic.reason, 0) + 1
+        )
+
+        print(f"\n  RESULT: {diagnostic.decision.value.upper()}")
+
+        if diagnostic.reason is not None:
+            print(f"  reason: {diagnostic.reason}")
+
+        if diagnostic.decision != MergeDecision.ACCEPT:
             continue
 
         merge_start_s, merge_end_s = compute_merge_start_end_s(
@@ -240,6 +258,7 @@ def main():
             ).astype(bool),
             x=np.asarray(record.state.log_trajectory.x[:, frame]),
             y=np.asarray(record.state.log_trajectory.y[:, frame]),
+            yaw=np.asarray(record.state.log_trajectory.yaw[:, frame]),
             vel_x=np.asarray(record.state.log_trajectory.vel_x[:, frame]),
             vel_y=np.asarray(record.state.log_trajectory.vel_y[:, frame]),
             length=np.asarray(record.state.log_trajectory.length[:, frame]),
@@ -249,6 +268,10 @@ def main():
         print(f"\n  merge_start_s : {merge_start_s:.2f}")
         print(f"  merge_end_s   : {merge_end_s:.2f}")
         print(f"  d_m           : {d_m:.2f}")
+        print(
+            f"  ego_longitudinal_speed: "
+            f"{features.ego_longitudinal_speed_mps:.2f}"
+        )
         print(f"  front_id      : {features.front_vehicle_id}")
         print(f"  front_gap     : {features.front_gap_m}")
         print(f"  front_rel_speed(dv_f): {features.front_relative_speed_mps}")
@@ -260,9 +283,28 @@ def main():
         print(f"  traffic_density: {features.traffic_density}")
 
     print("\n" + "=" * 70)
+    print("Decision Summary")
+    print("=" * 70)
+    print(f"  ACCEPT: {decision_counts[MergeDecision.ACCEPT]}")
+    print(f"  REJECT: {decision_counts[MergeDecision.REJECT]}")
+    print(f"  REVIEW: {decision_counts[MergeDecision.REVIEW]}")
+    print(f"  TOTAL : {len(transitions)}")
+
+    assert sum(decision_counts.values()) == len(transitions), (
+        "decision counts must sum to total transitions inspected"
+    )
+
+    print("\n  Reason histogram:")
+    for reason, count in sorted(
+        reason_counts.items(), key=lambda item: (-item[1], str(item[0]))
+    ):
+        print(f"    {reason}: {count}")
+
+    print("\n" + "=" * 70)
     print(
         f"MERGE CANDIDATE INSPECTION: PASS "
-        f"({accepted_count} accepted / {len(transitions)} transitions)"
+        f"({decision_counts[MergeDecision.ACCEPT]} accepted / "
+        f"{len(transitions)} transitions)"
     )
     print("=" * 70)
 

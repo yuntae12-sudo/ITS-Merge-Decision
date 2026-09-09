@@ -170,14 +170,33 @@ merge_topology:
   # while still requiring most of the approach to show convergence,
   # not just the final sample.
   min_decreasing_fraction: 0.6
-  # Maximum lateral offset (m) at the source lane's OWN endpoint,
-  # relative to a straight extension of the target lane backward from
-  # its start, used to help distinguish serial map-segment
-  # continuation (near-zero offset: A's end IS B's start/geometry)
-  # from a genuine lateral merge (a real, if small, remaining offset).
-  # This is used together with the endpoint-target arc-length position
-  # (see Design Decisions: serial continuation lands at target arc
-  # length ~0, not partway or at the target's own end).
+  # Serial-vs-merge ambiguity threshold (see merge_detector.py module
+  # docstring "Serial-vs-merge ambiguity" for the full investigation):
+  # a source endpoint landing within this lateral distance of the
+  # target polyline is flagged REVIEW (ambiguous_serial_or_merge)
+  # rather than confidently ACCEPTed or REJECTed, because available
+  # roadgraph geometry cannot reliably tell serial map-segment
+  # continuation apart from a true merge whose target WOMD feature
+  # happens to begin exactly at the convergence point.
+  #
+  # Set from a 30-scene/38-transition survey: every confirmed serial
+  # continuation case landed with EXACTLY 0.000 m lateral offset here,
+  # while the one true merge-like candidate found (record 28, lane
+  # 485->344) landed 2.14 m off target -- comfortably inside
+  # max_endpoint_target_distance_m (5.0 m, this study's "plausibly
+  # converging" band) but well outside this much tighter "essentially
+  # on top of it" band. Two additional candidate signals (terminal
+  # collinearity with the target's own tangent, and the upstream
+  # source-target separation trend) were investigated as ways to
+  # narrow this ambiguous band further and found NOT to reliably
+  # distinguish the two cases with this dataset's geometry (both
+  # confirmed serial cases and the one true merge can show large
+  # upstream separation shrinking to near zero at the endpoint, and
+  # collinearity is unreliable whenever the target lane is long or
+  # curved) -- see the module docstring for the detailed investigation.
+  # They remain exposed on MergeDiagnostic as manual-review context
+  # (max_collinear_offset_m, upstream_separation_m) but are not used to
+  # decide ACCEPT/REJECT/REVIEW.
   serial_continuation_max_lateral_m: 0.5
 
 event:
@@ -208,6 +227,24 @@ agent_selection:
   # count as occupying that lane" judgment applies to a surrounding
   # agent as it does to ego.
   max_target_lane_lateral_distance_m: 5.0
+  # Maximum heading difference (deg) between a candidate agent's own
+  # yaw and the target lane's local heading at that agent's
+  # projection, for it to be considered a target-lane front/rear
+  # candidate.
+  #
+  # Fix (fix commit): lateral-distance filtering alone can select a
+  # crossing or opposite-direction vehicle at an intersection that
+  # happens to sit close to the target centerline. Set by inspecting
+  # 180 valid vehicle observations across 10 real WOMD scenes (each
+  # vehicle's heading difference against its own nearest lane, for
+  # lanes within 3 m): p50 was 0.6 deg, p90 was 5.1 deg, but p99 jumped
+  # to 150 deg and the max was 178 deg -- a clear bimodal split between
+  # aligned traffic and crossing/opposite-direction vehicles that
+  # happen to sit near a lane. 45 degrees matches
+  # lane_assignment.max_heading_difference_deg's convention (comfortably
+  # passes the aligned-traffic mode's p90 of ~5 deg, firmly rejects the
+  # crossing/opposite-direction mode starting at ~150 deg).
+  max_target_lane_heading_difference_deg: 45.0
   # Maximum longitudinal search distance (m), in target-lane arc
   # length, for front/rear candidates. Set generously relative to the
   # observed WOMD lane lengths in this study (mean ~30-55 m per scene,
