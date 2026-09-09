@@ -2,6 +2,15 @@
 data/*
 !data/.gitkeep
 
+# Compressed Commit E: data/manifests/ holds generated CSVs
+# (merge_candidates.csv, merge_manual_labels.csv, merge_manifest.csv)
+# that must stay gitignored during development (large/regeneratable),
+# but the directory itself is tracked via .gitkeep so the expected
+# layout is documented in the repo.
+!data/manifests/
+data/manifests/*
+!data/manifests/.gitkeep
+
 # Generated outputs
 outputs/*
 !outputs/.gitkeep

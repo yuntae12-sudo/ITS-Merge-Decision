@@ -89,12 +89,20 @@ def _roadgraph_point_count(state: SimulatorState) -> int:
 def iter_scenarios(
     dataset_config: waymax_config.DatasetConfig,
     limit: Optional[int] = None,
+    start_index: int = 0,
 ) -> Iterator[ScenarioRecord]:
     """Iterates WOMD scenarios one at a time without loading the full dataset.
 
     Args:
         dataset_config: Waymax dataset config (see ``load_dataset_config``).
-        limit: if set, stop after yielding this many scenarios.
+        limit: if set, stop after yielding this many scenarios (counted
+            from `start_index`, not from the start of the dataset).
+        start_index: number of leading scenarios to skip without
+            yielding. Since Waymax's generator has no native seek, this
+            still constructs every skipped scenario internally (not
+            maximally efficient) but is otherwise the correct place
+            for this: it keeps `record_index`/`scene_key` correct and
+            avoids re-implementing skip logic in every caller.
 
     Yields:
         ScenarioRecord: one per scenario, in deterministic order.
@@ -104,9 +112,14 @@ def iter_scenarios(
         config=dataset_config
     )
 
+    stop_index = None if limit is None else start_index + limit
+
     for record_index, state in enumerate(scenario_generator):
 
-        if limit is not None and record_index >= limit:
+        if record_index < start_index:
+            continue
+
+        if stop_index is not None and record_index >= stop_index:
             break
 
         sdc_index = _find_sdc_index(state)
