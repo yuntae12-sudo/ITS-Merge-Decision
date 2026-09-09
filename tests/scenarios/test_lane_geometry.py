@@ -11,6 +11,7 @@ import pytest
 from waymax.datatypes.roadgraph import RoadgraphPoints
 
 from src.scenarios.lane_geometry import (
+    ALL_LANE_TYPE_IDS,
     compute_arc_length,
     extract_lane_polylines,
     nearest_lane_candidates,
@@ -19,58 +20,55 @@ from src.scenarios.lane_geometry import (
 
 
 def _make_roadgraph_points(
-    xy_by_id: dict, lane_type: int = 2
+    xy_by_id: dict,
+    lane_type: int = 2,
+    direction_by_id: dict = None,
 ) -> RoadgraphPoints:
-    """Builds a RoadgraphPoints from {lane_id: [(x, y), ...]} in the
-    given per-id order (this order is what the test intentionally
-    shuffles to prove reconstruction doesn't trust raw array order).
+    """Builds a RoadgraphPoints from {lane_id: [(x, y), ...]}.
+
+    Point storage order for each id is exactly what's passed in
+    ``xy_by_id`` -- tests intentionally shuffle it to prove
+    reconstruction doesn't trust raw array order.
+
+    ``direction_by_id`` independently specifies the *true* WOMD
+    per-point travel direction for each id, as a single (dx, dy) unit
+    vector applied to every point of that id (WOMD direction is
+    locally near-constant on a straight lane segment, which is all
+    these tests use). This is deliberately decoupled from
+    ``xy_by_id``'s storage order: unlike a real WOMD scenario, this
+    test data does not derive direction from consecutive stored
+    points, so a test can shuffle storage order and/or reverse the true
+    direction independently and verify the reconstructed polyline
+    still ends up aligned with the given direction. If omitted for an
+    id, direction defaults to (1, 0).
     """
 
-    xs, ys, ids, types = [], [], [], []
+    direction_by_id = direction_by_id or {}
+
+    xs, ys, ids, types, dir_xs, dir_ys = [], [], [], [], [], []
 
     for lane_id, points in xy_by_id.items():
+
+        dx, dy = direction_by_id.get(lane_id, (1.0, 0.0))
+        norm = np.hypot(dx, dy) or 1.0
+        dx, dy = dx / norm, dy / norm
+
         for x, y in points:
             xs.append(x)
             ys.append(y)
             ids.append(lane_id)
             types.append(lane_type)
+            dir_xs.append(dx)
+            dir_ys.append(dy)
 
     num_points = len(xs)
 
-    xs = np.asarray(xs, dtype=np.float32)
-    ys = np.asarray(ys, dtype=np.float32)
-
-    # Direction vectors are derived from consecutive points within each
-    # id's *intended* order (not the possibly-shuffled storage order),
-    # matching how WOMD provides a genuine local heading per point.
-    dir_x = np.zeros(num_points, dtype=np.float32)
-    dir_y = np.zeros(num_points, dtype=np.float32)
-
-    cursor = 0
-
-    for _, points in xy_by_id.items():
-        points_arr = np.asarray(points, dtype=np.float32)
-        n = points_arr.shape[0]
-
-        for local_i in range(n):
-            if local_i < n - 1:
-                dx = points_arr[local_i + 1, 0] - points_arr[local_i, 0]
-                dy = points_arr[local_i + 1, 1] - points_arr[local_i, 1]
-            else:
-                dx = points_arr[local_i, 0] - points_arr[local_i - 1, 0]
-                dy = points_arr[local_i, 1] - points_arr[local_i - 1, 1]
-
-            norm = np.hypot(dx, dy) or 1.0
-            dir_x[cursor] = dx / norm
-            dir_y[cursor] = dy / norm
-            cursor += 1
-
     return RoadgraphPoints(
-        x=xs,
-        y=ys,
+        x=np.asarray(xs, dtype=np.float32),
+        y=np.asarray(ys, dtype=np.float32),
         z=np.zeros(num_points, dtype=np.float32),
-        dir_x=dir_x,
-        dir_y=dir_y,
+        dir_x=np.asarray(dir_xs, dtype=np.float32),
+        dir_y=np.asarray(dir_ys, dtype=np.float32),
         dir_z=np.zeros(num_points, dtype=np.float32),
         types=np.asarray(types, dtype=np.int32),
         ids=np.asarray(ids, dtype=np.int32),
@@ -126,6 +124,58 @@ def test_extract_lane_polylines_reconstructs_shuffled_order():
     assert is_ascending or is_descending
 
 
+def test_extract_lane_polylines_aligns_to_positive_travel_direction():
+    """The shuffled-order test above only checks monotonicity, so it
+    cannot catch a polyline reconstructed backwards relative to WOMD's
+    own travel direction. This pins the direction independently of
+    storage order: true WOMD direction is (+1, 0), so the reconstructed
+    polyline must run with increasing x regardless of how the points
+    were shuffled in storage.
+    """
+
+    straight_line = [(float(i), 0.0) for i in range(10)]
+
+    shuffled = straight_line.copy()
+    rng = np.random.default_rng(seed=1)
+    rng.shuffle(shuffled)
+
+    roadgraph_points = _make_roadgraph_points(
+        {7: shuffled}, direction_by_id={7: (1.0, 0.0)}
+    )
+
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    xs = polyline.xy[:, 0]
+    assert np.all(np.diff(xs) > 0)
+    assert polyline.arc_length[0] == pytest.approx(0.0)
+    assert polyline.xy[0, 0] == pytest.approx(0.0)
+
+
+def test_extract_lane_polylines_aligns_to_negative_travel_direction():
+    """Same geometry as above, but with WOMD direction reversed to
+    (-1, 0): the reconstructed polyline must now run with decreasing x,
+    proving orientation is driven by WOMD direction and not by an
+    arbitrary geometric chaining endpoint.
+    """
+
+    straight_line = [(float(i), 0.0) for i in range(10)]
+
+    shuffled = straight_line.copy()
+    rng = np.random.default_rng(seed=1)
+    rng.shuffle(shuffled)
+
+    roadgraph_points = _make_roadgraph_points(
+        {7: shuffled}, direction_by_id={7: (-1.0, 0.0)}
+    )
+
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    xs = polyline.xy[:, 0]
+    assert np.all(np.diff(xs) < 0)
+    assert polyline.arc_length[0] == pytest.approx(0.0)
+    assert polyline.xy[0, 0] == pytest.approx(9.0)
+
+
 def test_extract_lane_polylines_filters_non_lane_types():
 
     roadgraph_points = _make_roadgraph_points(
@@ -135,6 +185,47 @@ def test_extract_lane_polylines_filters_non_lane_types():
     polylines = extract_lane_polylines(roadgraph_points)
 
     assert polylines == []
+
+
+def test_extract_lane_polylines_default_excludes_bike_lane():
+    """Ego lane assignment / merge detection default to vehicle-only
+    lane types: a vehicle cannot be assigned to or merge into a bike
+    lane in this study.
+
+    ``_make_roadgraph_points`` assigns one ``lane_type`` per call, so
+    a freeway-lane id and a bike-lane id are built separately here and
+    their point arrays concatenated to give each id its own type.
+    """
+
+    freeway_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (1.0, 0.0)]}, lane_type=1
+    )
+    bike_points = _make_roadgraph_points(
+        {3: [(0.0, 10.0), (1.0, 10.0)]}, lane_type=3
+    )
+
+    combined = RoadgraphPoints(
+        x=np.concatenate([freeway_points.x, bike_points.x]),
+        y=np.concatenate([freeway_points.y, bike_points.y]),
+        z=np.concatenate([freeway_points.z, bike_points.z]),
+        dir_x=np.concatenate([freeway_points.dir_x, bike_points.dir_x]),
+        dir_y=np.concatenate([freeway_points.dir_y, bike_points.dir_y]),
+        dir_z=np.concatenate([freeway_points.dir_z, bike_points.dir_z]),
+        types=np.concatenate([freeway_points.types, bike_points.types]),
+        ids=np.concatenate([freeway_points.ids, bike_points.ids]),
+        valid=np.concatenate([freeway_points.valid, bike_points.valid]),
+    )
+
+    default_polylines = extract_lane_polylines(combined)
+    all_lane_polylines = extract_lane_polylines(
+        combined, lane_type_ids=ALL_LANE_TYPE_IDS
+    )
+
+    default_ids = sorted(p.lane_id for p in default_polylines)
+    all_ids = sorted(p.lane_id for p in all_lane_polylines)
+
+    assert default_ids == [1]
+    assert all_ids == [1, 3]
 
 
 def test_extract_lane_polylines_separates_ids():

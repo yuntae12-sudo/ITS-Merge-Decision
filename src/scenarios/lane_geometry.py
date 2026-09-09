@@ -10,14 +10,21 @@ sampled points themselves.
 What we can rely on (per-point, directly from the data):
     - id groups points belonging to the same map feature.
     - type identifies lane vs. non-lane features.
-    - the direction vector at a point is the feature's local heading.
+    - the direction vector at a point is the feature's local heading,
+      i.e. WOMD's own encoding of lane travel direction.
 
 What we do NOT assume:
     - That points sharing an id are stored in polyline order in the
       underlying array. WOMD does not document this as guaranteed, so
       each polyline's point order is reconstructed explicitly here via
-      nearest-neighbor chaining seeded from an extremal point, rather
-      than trusting raw array order.
+      nearest-neighbor chaining, rather than trusting raw array order.
+    - That the reconstructed geometric sequence runs the same way as
+      WOMD's travel direction. Chaining alone only recovers *a* valid
+      spatial order, not which end is the start, so the sequence is
+      compared against the WOMD ``direction`` field and reversed if it
+      runs opposite (see ``_align_to_travel_direction``). Downstream
+      arc_length, heading, and lateral-distance sign all depend on
+      this alignment being correct.
     - Any lane connectivity (predecessor/successor/neighbor lane ids).
       That topology is not present in roadgraph_points at all; only
       what can be inferred geometrically (e.g. endpoint proximity) is
@@ -33,7 +40,15 @@ import numpy as np
 # Map element type ids that represent a drivable lane centerline, per
 # the WOMD roadgraph type mapping already validated in Phase 0
 # (scripts/run_scene.py MAP_ELEMENT_TYPE_NAMES).
-LANE_TYPE_IDS = frozenset({1, 2, 3})  # FREEWAY, SURFACE_STREET, BIKE_LANE
+#
+# ALL_LANE_TYPE_IDS includes every lane-shaped centerline type, used
+# for visualization/context. VEHICLE_LANE_TYPE_IDS excludes bike lanes
+# and is the default candidate set for anything related to an
+# autonomous *vehicle* driving on a lane (ego lane assignment, merge
+# detection): a vehicle cannot merge into or be assigned to a bike
+# lane in this study.
+ALL_LANE_TYPE_IDS = frozenset({1, 2, 3})  # FREEWAY, SURFACE_STREET, BIKE_LANE
+VEHICLE_LANE_TYPE_IDS = frozenset({1, 2})  # FREEWAY, SURFACE_STREET
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,11 +129,62 @@ def _order_points_by_chaining(
     return _chain_from(farthest_point, xy)
 
 
+def _align_to_travel_direction(
+    xy: np.ndarray, direction: np.ndarray
+) -> np.ndarray:
+    """Orients a geometrically-ordered polyline to match WOMD direction.
+
+    Geometric chaining (``_order_points_by_chaining``) only recovers a
+    valid spatial sequence -- it has no notion of which end is the
+    start. This walks the *given* order's segment vectors and compares
+    them against the per-point WOMD ``direction`` (dir_x, dir_y), which
+    is Waymax's own encoding of local lane travel direction. If the
+    sequence runs opposite to WOMD's direction on average, it is
+    reversed so callers can rely on ``xy[0]`` being the travel-direction
+    start and ``arc_length[0] == 0`` at that start.
+
+    Args:
+        xy: (N, 2) points in geometric chain order.
+        direction: (N, 2) WOMD per-point direction vectors, indexed the
+            same as `xy`.
+
+    Returns:
+        Index array of length N: identity if already aligned, reversed
+        (N-1 .. 0) if the chain ran opposite to WOMD's direction. A
+        single point has no direction to compare and is always
+        returned as identity.
+    """
+
+    num_points = xy.shape[0]
+    identity = np.arange(num_points)
+
+    if num_points < 2:
+        return identity
+
+    segment_vec = np.diff(xy, axis=0)
+    # Compare each segment to the WOMD direction at its start point:
+    # a segment vector should point the same way as the lane's local
+    # direction there if the sequence runs with the lane, opposite if
+    # it runs against it.
+    alignment = np.einsum("ij,ij->i", segment_vec, direction[:-1])
+
+    # A robust (median, not mean) alignment score: a handful of noisy
+    # or near-duplicate points should not flip the decision for an
+    # otherwise consistently-oriented polyline.
+    if np.median(alignment) < 0.0:
+        return identity[::-1]
+
+    return identity
+
+
 def compute_arc_length(xy: np.ndarray) -> np.ndarray:
     """Cumulative Euclidean arc length along an ordered polyline.
 
     Args:
-        xy: (N, 2) ordered point positions.
+        xy: (N, 2) point positions, ordered along the polyline. When
+            called from ``extract_lane_polylines``, this order has
+            already been aligned to WOMD's travel direction, so
+            element 0 is the travel-direction start.
 
     Returns:
         (N,) array where element 0 is 0.0 and element i is the summed
@@ -140,15 +206,21 @@ def compute_arc_length(xy: np.ndarray) -> np.ndarray:
 
 def extract_lane_polylines(
     roadgraph_points,
-    lane_type_ids: frozenset = LANE_TYPE_IDS,
+    lane_type_ids: frozenset = VEHICLE_LANE_TYPE_IDS,
 ) -> List[LanePolyline]:
     """Reconstructs one ordered polyline per lane feature id.
+
+    Defaults to ``VEHICLE_LANE_TYPE_IDS`` (excludes bike lanes): this
+    study's ego lane assignment and merge detection only consider
+    lanes a vehicle can occupy. Pass ``ALL_LANE_TYPE_IDS`` explicitly
+    for visualization/context that should also show bike lanes.
 
     Args:
         roadgraph_points: Waymax ``RoadgraphPoints`` (as found on
             ``SimulatorState.roadgraph_points``).
         lane_type_ids: map element type ids considered a lane
-            centerline (see ``LANE_TYPE_IDS``).
+            centerline (see ``VEHICLE_LANE_TYPE_IDS``,
+            ``ALL_LANE_TYPE_IDS``).
 
     Returns:
         List of ``LanePolyline``, one per distinct valid lane feature
@@ -181,10 +253,21 @@ def extract_lane_polylines(
             [dir_x[feature_idx], dir_y[feature_idx]], axis=1
         ).astype(np.float64)
 
-        order = _order_points_by_chaining(xy, direction)
+        chain_order = _order_points_by_chaining(xy, direction)
 
-        ordered_xy = xy[order]
-        ordered_direction = direction[order]
+        chained_xy = xy[chain_order]
+        chained_direction = direction[chain_order]
+
+        # Geometric chaining recovers a valid sequence but not which
+        # end is the start; align it to WOMD's own travel direction
+        # (dir_x, dir_y) so xy[0] is the travel-direction start and
+        # arc_length is measured from there.
+        alignment_order = _align_to_travel_direction(
+            chained_xy, chained_direction
+        )
+
+        ordered_xy = chained_xy[alignment_order]
+        ordered_direction = chained_direction[alignment_order]
 
         polylines.append(
             LanePolyline(

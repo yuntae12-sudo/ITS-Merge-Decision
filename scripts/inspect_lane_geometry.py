@@ -94,9 +94,10 @@ def main():
 
     ego_x = float(np.asarray(current.x[record.sdc_index, 0]))
     ego_y = float(np.asarray(current.y[record.sdc_index, 0]))
+    ego_yaw = float(np.asarray(current.yaw[record.sdc_index, 0]))
 
     print("\n[2] Ego current position")
-    print(f"x={ego_x:.3f} m, y={ego_y:.3f} m")
+    print(f"x={ego_x:.3f} m, y={ego_y:.3f} m, yaw={ego_yaw:.3f} rad")
 
     # ==================================================================
     # 3. Lane polyline reconstruction
@@ -166,6 +167,67 @@ def main():
     print("\n" + "=" * 70)
     print("LANE GEOMETRY RECONSTRUCTION: PASS")
     print("=" * 70)
+
+    # ==================================================================
+    # 4-1. Ego heading vs. nearby-lane heading sanity check
+    # ==================================================================
+    #
+    # This does not decide lane assignment (that is Commit C's job) --
+    # a scene can have several nearby lanes with unrelated headings
+    # (opposing traffic, a crossing street at an intersection), so the
+    # *nearest* lane by distance alone is not necessarily ego's own
+    # lane. This check instead looks for a heading-consistent lane
+    # among the nearby candidates: if at least one nearby lane's
+    # reconstructed travel direction matches ego's heading, that is
+    # strong evidence direction alignment (Commit fix in this module)
+    # is working -- a systematic ~180 degree flip would instead show
+    # every nearby lane's heading mismatching ego.
+
+    print("\n" + "-" * 70)
+    print("[4-1] Ego Heading vs. Nearby-Lane Heading (sanity check)")
+    print("-" * 70)
+
+    print(f"Ego yaw : {ego_yaw:.3f} rad")
+    print()
+
+    best_lane_id, best_heading_diff = None, np.pi
+
+    for lane_id, distance in nearest:
+
+        polyline = lane_by_id[lane_id]
+        projection = project_point_to_polyline(polyline, ego_x, ego_y)
+
+        heading_diff = (
+            projection["heading_rad"] - ego_yaw + np.pi
+        ) % (2 * np.pi) - np.pi
+
+        print(
+            f"  lane={lane_id:>6} distance={distance:>6.2f} m "
+            f"heading={projection['heading_rad']:>7.3f} rad "
+            f"heading_diff={heading_diff:>7.3f} rad"
+        )
+
+        if abs(heading_diff) < abs(best_heading_diff):
+            best_lane_id, best_heading_diff = lane_id, heading_diff
+
+    print(
+        f"\nClosest heading match: lane {best_lane_id} "
+        f"(heading_diff={best_heading_diff:.3f} rad)"
+    )
+
+    if abs(best_heading_diff) > (np.pi / 2):
+        print(
+            "WARNING: even the best-heading-matching nearby lane "
+            "differs from ego by more than 90 degrees -- reconstructed "
+            "lane direction may be flipped relative to ego travel "
+            "direction."
+        )
+    else:
+        print(
+            "Heading alignment looks consistent: at least one nearby "
+            "lane's reconstructed direction matches ego (no systematic "
+            "~180 degree flip)."
+        )
 
     # ==================================================================
     # 5. Visualization
