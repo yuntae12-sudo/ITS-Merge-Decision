@@ -38,7 +38,11 @@ from src.scenarios.scenario_features import (
     extract_interaction_features,
     load_agent_selection_config,
 )
-from src.scenarios.scenario_loader import iter_scenarios, load_dataset_config
+from src.scenarios.scenario_loader import (
+    build_waymax_config,
+    iter_scenarios,
+    load_dataset_config,
+)
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
 DEFAULT_MERGE_CONFIG = "configs/phase1_merge.yaml"
@@ -79,14 +83,23 @@ def main():
     print("Merge Candidate Inspection")
     print("=" * 70)
 
-    dataset_config = load_dataset_config(args.config)
+    expansion_config = load_dataset_config(args.config)
     lane_assignment_config = load_lane_assignment_config(args.merge_config)
     merge_topology_config = load_merge_topology_config(args.merge_config)
     agent_selection_config = load_agent_selection_config(args.merge_config)
 
+    # This CLI inspects a single shard (the first one in the dataset
+    # expansion config) -- multi-shard scanning is handled by
+    # extract_merge_scenes.py's iter_all_shards.
+    shard_path = expansion_config.shard_paths[0]
+    dataset_config = build_waymax_config(expansion_config, shard_path)
+
     record = None
     for candidate in iter_scenarios(
-        dataset_config, limit=args.record_index + 1
+        dataset_config,
+        limit=args.record_index + 1,
+        source_dataset=expansion_config.dataset_name,
+        source_split=expansion_config.split,
     ):
         record = candidate
 

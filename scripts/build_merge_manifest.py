@@ -59,7 +59,12 @@ from src.scenarios.dataset_builder import (
 from src.scenarios.lane_assignment import load_lane_assignment_config
 from src.scenarios.merge_detector import detect_merge, load_merge_topology_config
 from src.scenarios.scenario_features import load_agent_selection_config
-from src.scenarios.scenario_loader import iter_scenarios, load_dataset_config
+from src.scenarios.scenario_loader import (
+    DatasetExpansionConfig,
+    build_waymax_config,
+    iter_scenarios,
+    load_dataset_config,
+)
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
 DEFAULT_PHASE1_CONFIG = "configs/phase1_merge.yaml"
@@ -304,6 +309,25 @@ def _to_float_or_blank(value):
     return float(value)
 
 
+def _default_shard_path(source_split: str, source_shard: str) -> str:
+    """Derives the physical shard file path for a (source_split,
+    source_shard) pair recorded in a candidates/manifest CSV row.
+
+    This mirrors this study's single local data layout
+    (``data/womd/<split>/<shard file>``, see ``configs/dataset.yaml``
+    and README.md) -- generalized from one hardcoded split/file to any
+    (split, filename) pair actually referenced by the input CSV. This
+    is deliberately simple (no new CLI flag / expansion-config file
+    needed to reload an arbitrary shard): the manifest builder only
+    ever needs to reconstruct a shard whose (split, filename) already
+    appears in a CSV row it read, and this layout is exactly what
+    ``scenario_loader``'s own legacy single-path config and the new
+    ``shards``/``shard_glob`` schema already assume.
+    """
+
+    return str(Path("data") / "womd" / source_split / source_shard)
+
+
 def materialize_confirmed_rows(
     candidate_rows,
     confirmed_ids,
@@ -313,8 +337,25 @@ def materialize_confirmed_rows(
     agent_selection_config,
 ):
     """Materializes the full ACCEPT-only feature set for every
-    CONFIRMED_MERGE candidate, grouped by record_index so each distinct
-    scenario is loaded from the dataset at most once.
+    CONFIRMED_MERGE candidate.
+
+    Safety-critical grouping: candidates are grouped by
+    ``(source_split, source_shard, record_index)`` -- NEVER by
+    record_index alone -- since two different physical shards can
+    legitimately share the same record_index. For each distinct
+    (source_split, source_shard) pair referenced by any confirmed
+    candidate, the exact physical shard file is reconstructed (via
+    ``_default_shard_path`` + ``build_waymax_config``) and iterated in
+    isolation, so a candidate from shard A can never be matched against
+    a same-numbered record_index loaded from shard B.
+
+    ``dataset_config`` is accepted for backward compatibility with
+    existing call sites/tests (kept as the fallback used only when a
+    row's own source_split/source_shard fields are absent -- i.e. an
+    older CSV predating this field) but is otherwise unused: each
+    confirmed row's own recorded (source_split, source_shard) is now
+    the authority on which physical shard to reload, not whatever
+    single dataset config the CLI happened to be invoked with.
 
     Returns:
         dict candidate_id -> materialized feature dict (the
@@ -328,90 +369,137 @@ def materialize_confirmed_rows(
 
     rows_by_id = {row["candidate_id"]: row for row in candidate_rows}
 
-    by_record_index = defaultdict(list)
+    by_shard_record = defaultdict(list)
     for candidate_id in confirmed_ids:
         row = rows_by_id[candidate_id]
-        by_record_index[int(row["record_index"])].append(row)
+        source_split = row.get("source_split") or getattr(
+            dataset_config, "split", "validation"
+        )
+        source_shard = row.get("source_shard")
+        if not source_shard:
+            raise ValueError(
+                f"CONFIRMED_MERGE candidate_id={candidate_id!r} has no "
+                "source_shard recorded -- cannot safely determine which "
+                "physical shard file to reload."
+            )
+        by_shard_record[(source_split, source_shard, int(row["record_index"]))].append(row)
 
-    if not by_record_index:
+    if not by_shard_record:
         return {}
 
+    # Group by physical shard so each shard file is opened at most once,
+    # scanning only up to the max record_index actually needed from it.
+    by_shard = defaultdict(dict)
+    for (source_split, source_shard, record_index), rows in by_shard_record.items():
+        by_shard[(source_split, source_shard)][record_index] = rows
+
     materialized = {}
-    max_record_index = max(by_record_index.keys())
 
-    for record in iter_scenarios(dataset_config, limit=max_record_index + 1):
+    for (source_split, source_shard), rows_by_record_index in by_shard.items():
 
-        record_rows = by_record_index.get(record.record_index)
-        if not record_rows:
-            continue
+        shard_path = _default_shard_path(source_split, source_shard)
+        max_record_index = max(rows_by_record_index.keys())
 
-        for row in record_rows:
+        shard_expansion_config = DatasetExpansionConfig(
+            dataset_name="WOMD",
+            split=source_split,
+            shard_paths=[shard_path],
+            max_num_objects=getattr(dataset_config, "max_num_objects", None),
+            repeat=1,
+            shuffle_seed=None,
+        )
+        shard_waymax_config = build_waymax_config(shard_expansion_config, shard_path)
 
-            candidate_id = row["candidate_id"]
-            transition_frame = int(row["transition_frame"])
-            source_lane_id = int(row["source_lane_id"])
-            target_lane_id = int(row["target_lane_id"])
+        for record in iter_scenarios(
+            shard_waymax_config,
+            limit=max_record_index + 1,
+            source_dataset="WOMD",
+            source_split=source_split,
+        ):
 
-            (
-                transition,
-                source_polyline,
-                target_polyline,
-                ego_source_arc_length,
-            ) = reconstruct_transition(
-                record,
-                lane_assignment_config,
-                transition_frame,
-                source_lane_id,
-                target_lane_id,
-                candidate_id=candidate_id,
-            )
+            record_rows = rows_by_record_index.get(record.record_index)
+            if not record_rows:
+                continue
 
-            diagnostic = detect_merge(
-                transition,
-                source_polyline,
-                target_polyline,
-                ego_source_arc_length,
-                merge_topology_config,
-            )
-
-            stored_decision = row["decision"]
-            stored_reason = row["reason"] if row["reason"] else None
-            new_decision = diagnostic.decision.value
-            new_reason = diagnostic.reason
-
-            if (new_decision, new_reason) != (stored_decision, stored_reason):
+            # Extra safety check: the record we loaded must actually be
+            # from the physical shard file we intended (defends against
+            # any future refactor that might silently swap in a
+            # different iterator).
+            if record.source_shard != source_shard:
                 raise ValueError(
-                    "Detector drift between merge_candidates.csv and "
-                    f"current code/config for candidate_id={candidate_id}: "
-                    f"stored=({stored_decision},{stored_reason}) "
-                    f"recomputed=({new_decision},{new_reason})"
+                    "Manifest materialization safety check failed: "
+                    f"expected source_shard={source_shard!r} but loaded "
+                    f"record from source_shard={record.source_shard!r} "
+                    f"(record_index={record.record_index})."
                 )
 
-            features = materialize_merge_features(
-                transition,
-                source_polyline,
-                target_polyline,
-                ego_source_arc_length,
-                record,
-                merge_topology_config,
-                agent_selection_config,
-            )
+            for row in record_rows:
 
-            source = (
-                "detector_accept"
-                if stored_decision == "accept"
-                else "manual_recompute"
-            )
-            features["feature_materialization_source"] = source
+                candidate_id = row["candidate_id"]
+                transition_frame = int(row["transition_frame"])
+                source_lane_id = int(row["source_lane_id"])
+                target_lane_id = int(row["target_lane_id"])
 
-            materialized[candidate_id] = features
+                (
+                    transition,
+                    source_polyline,
+                    target_polyline,
+                    ego_source_arc_length,
+                ) = reconstruct_transition(
+                    record,
+                    lane_assignment_config,
+                    transition_frame,
+                    source_lane_id,
+                    target_lane_id,
+                    candidate_id=candidate_id,
+                )
+
+                diagnostic = detect_merge(
+                    transition,
+                    source_polyline,
+                    target_polyline,
+                    ego_source_arc_length,
+                    merge_topology_config,
+                )
+
+                stored_decision = row["decision"]
+                stored_reason = row["reason"] if row["reason"] else None
+                new_decision = diagnostic.decision.value
+                new_reason = diagnostic.reason
+
+                if (new_decision, new_reason) != (stored_decision, stored_reason):
+                    raise ValueError(
+                        "Detector drift between merge_candidates.csv and "
+                        f"current code/config for candidate_id={candidate_id}: "
+                        f"stored=({stored_decision},{stored_reason}) "
+                        f"recomputed=({new_decision},{new_reason})"
+                    )
+
+                features = materialize_merge_features(
+                    transition,
+                    source_polyline,
+                    target_polyline,
+                    ego_source_arc_length,
+                    record,
+                    merge_topology_config,
+                    agent_selection_config,
+                )
+
+                source = (
+                    "detector_accept"
+                    if stored_decision == "accept"
+                    else "manual_recompute"
+                )
+                features["feature_materialization_source"] = source
+
+                materialized[candidate_id] = features
 
     missing_ids = confirmed_ids - set(materialized.keys())
     if missing_ids:
         raise ValueError(
             "Failed to materialize features for CONFIRMED_MERGE "
-            f"candidate_id(s) (record_index not reached in dataset scan): "
-            f"{sorted(missing_ids)}"
+            f"candidate_id(s) (record_index not reached in the "
+            f"corresponding shard's dataset scan): {sorted(missing_ids)}"
         )
 
     return materialized

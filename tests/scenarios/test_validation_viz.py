@@ -174,3 +174,81 @@ def test_review_decision_directory_naming():
 
     assert path.parent.name == "review"
     assert "#" not in path.name
+
+
+# ---------------------------------------------------------------------
+# Case L: renderer selection logic is shard-aware.
+# ---------------------------------------------------------------------
+
+
+def _make_row(source_shard, record_index=28, decision="accept"):
+    return {
+        "candidate_id": f"{source_shard}#{record_index}__t50__485_344",
+        "scene_key": f"{source_shard}#{record_index}",
+        "source_shard": source_shard,
+        "record_index": str(record_index),
+        "transition_frame": "50",
+        "source_lane_id": "485",
+        "target_lane_id": "344",
+        "decision": decision,
+    }
+
+
+def test_case_l_source_shard_disambiguates_matching_record_index():
+    from scripts.render_merge_validation import select_candidate_rows
+
+    rows = [
+        _make_row("validation_tfexample.tfrecord-00000-of-00150"),
+        _make_row("validation_tfexample.tfrecord-00005-of-00150"),
+    ]
+
+    # No --source-shard: ambiguous -- both shards returned, flagged.
+    filtered, ambiguous = select_candidate_rows(rows, record_index=28)
+    assert len(filtered) == 2
+    assert ambiguous == [
+        "validation_tfexample.tfrecord-00000-of-00150",
+        "validation_tfexample.tfrecord-00005-of-00150",
+    ]
+
+    # --source-shard given: filters to exactly that one shard, no
+    # ambiguity flagged.
+    filtered, ambiguous = select_candidate_rows(
+        rows, record_index=28,
+        source_shard="validation_tfexample.tfrecord-00005-of-00150",
+    )
+    assert len(filtered) == 1
+    assert filtered[0]["source_shard"] == "validation_tfexample.tfrecord-00005-of-00150"
+    assert ambiguous == []
+
+
+def test_case_l_unambiguous_record_index_no_warning():
+    from scripts.render_merge_validation import select_candidate_rows
+
+    rows = [_make_row("validation_tfexample.tfrecord-00000-of-00150")]
+    filtered, ambiguous = select_candidate_rows(rows, record_index=28)
+    assert len(filtered) == 1
+    assert ambiguous == []
+
+
+def test_case_l_no_record_index_filter_passes_through():
+    from scripts.render_merge_validation import select_candidate_rows
+
+    rows = [
+        _make_row("validation_tfexample.tfrecord-00000-of-00150"),
+        _make_row("validation_tfexample.tfrecord-00005-of-00150"),
+    ]
+    filtered, ambiguous = select_candidate_rows(rows)
+    assert filtered == rows
+    assert ambiguous == []
+
+
+def test_case_l_sanitized_filenames_stay_collision_free_across_shards():
+    from src.scenarios.dataset_builder import sanitize_candidate_id_for_filename
+
+    row_a = _make_row("validation_tfexample.tfrecord-00000-of-00150")
+    row_b = _make_row("validation_tfexample.tfrecord-00005-of-00150")
+
+    filename_a = sanitize_candidate_id_for_filename(row_a["candidate_id"]) + ".png"
+    filename_b = sanitize_candidate_id_for_filename(row_b["candidate_id"]) + ".png"
+
+    assert filename_a != filename_b

@@ -29,10 +29,13 @@ Serialization convention (CSV)
 Determinism
 ------------
 Candidates are always sorted by
-``(source_shard, record_index, transition_frame, source_lane_id,
-target_lane_id)`` before being written or summarized, so re-running the
-scan over the same data produces byte-identical output (module the
-directory/timestamps).
+``(source_split, source_shard, record_index, transition_frame,
+source_lane_id, target_lane_id)`` before being written or summarized,
+so re-running the scan over the same data produces byte-identical
+output (module the directory/timestamps). ``source_split`` is included
+even though one dataset-expansion config only ever has a single split
+value, for clarity/robustness if a combined multi-split CSV is ever
+assembled by hand.
 
 Manifest materialization (fix commit)
 ---------------------------------------
@@ -74,12 +77,16 @@ from src.scenarios.scenario_features import (
 )
 from src.scenarios.scenario_loader import ScenarioRecord
 
-# Hardcoded per task instructions ("hardcode 'WOMD' or read from
-# config -- pick one and document"): every scenario currently scanned
-# by this study comes from the Waymo Open Motion Dataset, and the
-# dataset config (configs/dataset.yaml) has no separate "dataset name"
-# field to read this from (only a path). Hardcoding avoids inventing a
-# config field that would otherwise always hold this same one value.
+# Historical default (pre-multi-shard): every scenario this study has
+# scanned so far comes from the Waymo Open Motion Dataset. Multi-shard
+# dataset expansion configs now carry their own ``dataset_name`` field
+# (default "WOMD" -- see scenario_loader.DatasetExpansionConfig /
+# load_dataset_config), and each ScenarioRecord's ``source_dataset`` is
+# populated from that at load time. This module constant is kept only
+# as the fallback used by ``build_candidate_records`` for records that
+# predate the ``source_dataset`` field (defensive default, not a
+# second independently-maintained idea of what "WOMD" is -- it must
+# equal the loader's own default).
 SOURCE_DATASET = "WOMD"
 
 # CSV field order -- the authoritative schema for merge_candidates.csv.
@@ -215,21 +222,6 @@ def sanitize_candidate_id_for_filename(candidate_id: str) -> str:
     for char in ("#", "/", ":"):
         sanitized = sanitized.replace(char, "_")
     return sanitized
-
-
-def parse_source_split(dataset_path: str) -> str:
-    """Parses the WOMD split name (e.g. "validation") from the dataset
-    path, using the path's parent directory name -- matches this
-    study's single local layout (`data/womd/<split>/<shard file>`).
-
-    Called by the CLI (``scripts/extract_merge_scenes.py``) with the
-    loaded ``DatasetConfig.path``, then passed into
-    ``build_candidate_records`` as ``source_split`` -- this module
-    itself never has direct access to the dataset config's path (only
-    ``ScenarioRecord.source_shard``, the physical file's basename).
-    """
-
-    return Path(dataset_path).parent.name
 
 
 def _derive_merge_frames(
@@ -485,7 +477,6 @@ def build_candidate_records(
     lane_assignment_config: LaneAssignmentConfig,
     merge_topology_config: MergeTopologyConfig,
     agent_selection_config: AgentSelectionConfig,
-    source_split: str = "validation",
 ) -> Tuple[List[CandidateRecord], Optional[Dict]]:
     """Builds all CandidateRecords for one scenario.
 
@@ -494,6 +485,12 @@ def build_candidate_records(
     + stabilize ego's lane sequence, find transitions, classify each
     with ``detect_merge``, and for ACCEPT decisions extract
     interaction features.
+
+    ``source_dataset``/``source_split`` are read directly from
+    ``record`` (populated by the loader at scan time) rather than
+    being passed in separately -- this is now the single source of
+    truth for what dataset/split a scenario came from (see
+    ``scenario_loader.ScenarioRecord``).
 
     Error isolation: the entire per-scene body is wrapped in
     try/except so one bad scene does not crash a batch scan. On
@@ -511,7 +508,6 @@ def build_candidate_records(
             lane_assignment_config,
             merge_topology_config,
             agent_selection_config,
-            source_split,
         ), None
     except Exception as exc:  # noqa: BLE001 - intentional broad catch
         # for per-scene isolation; caller inspects error_info.
@@ -528,7 +524,6 @@ def _build_candidate_records_unsafe(
     lane_assignment_config: LaneAssignmentConfig,
     merge_topology_config: MergeTopologyConfig,
     agent_selection_config: AgentSelectionConfig,
-    source_split: str,
 ) -> List[CandidateRecord]:
 
     log_trajectory = record.state.log_trajectory
@@ -606,8 +601,8 @@ def _build_candidate_records_unsafe(
             CandidateRecord(
                 candidate_id=candidate_id,
                 scene_key=scene_key,
-                source_dataset=SOURCE_DATASET,
-                source_split=source_split,
+                source_dataset=getattr(record, "source_dataset", SOURCE_DATASET),
+                source_split=getattr(record, "source_split", "validation"),
                 source_shard=record.source_shard,
                 record_index=record.record_index,
                 transition_index=transition_index,
@@ -642,6 +637,7 @@ def _build_candidate_records_unsafe(
 
 def _sort_key(candidate: CandidateRecord):
     return (
+        candidate.source_split,
         candidate.source_shard,
         candidate.record_index,
         candidate.transition_frame,
@@ -756,6 +752,87 @@ def compute_summary_statistics(candidates: List[CandidateRecord]) -> Dict:
         "review_ratio_among_accept_review": review_ratio_among_accept_review,
         "reason_histogram": reason_histogram,
     }
+
+
+def compute_multi_shard_summary(
+    candidates: List[CandidateRecord],
+    physical_shards_scanned: int,
+    scenes_scanned: int,
+    scenes_failed: int,
+    per_shard_scan_counts: Optional[Dict[Tuple[str, str], Dict[str, int]]] = None,
+) -> Dict:
+    """Computes the shard-aware summary shape written by
+    ``scripts/extract_merge_scenes.py`` for a multi-shard scan.
+
+    Reuses ``compute_summary_statistics`` for both the ``global``
+    section (over all candidates) and each ``per_shard`` entry (over
+    just that shard's candidates) -- no parallel statistics
+    implementation.
+
+    Args:
+        candidates: every CandidateRecord produced by the scan (across
+            all shards).
+        physical_shards_scanned: number of physical shard files
+            iterated (including any that produced zero candidates).
+        scenes_scanned: total scenario count scanned across all shards
+            (includes scenes with zero transitions).
+        scenes_failed: total scene-level failures across all shards.
+        per_shard_scan_counts: optional dict of
+            ``(source_split, source_shard) -> {"scenes_scanned": int,
+            "scenes_failed": int}``, supplied by the caller since scan
+            -level counts (as opposed to candidate-level counts) are
+            not recoverable from ``candidates`` alone (e.g. a scene
+            with zero transitions, or one that failed and produced no
+            candidates, otherwise leaves no trace). Shards absent from
+            this dict (or when it is None) default to 0/0.
+
+    Returns:
+        A dict with ``global`` (the usual ``compute_summary_statistics``
+        keys plus ``physical_shards_scanned``/``scenes_scanned``/
+        ``scenes_failed``) and ``per_shard`` (a list of per-
+        (source_split, source_shard) summaries, sorted by
+        (source_split, source_shard), each with ``scenes_scanned``/
+        ``scenes_failed`` plus the core ``compute_summary_statistics``
+        counts -- not the ratio/histogram fields, which are most
+        meaningful in aggregate).
+    """
+
+    global_summary = compute_summary_statistics(candidates)
+    global_summary["physical_shards_scanned"] = physical_shards_scanned
+    global_summary["scenes_scanned"] = scenes_scanned
+    global_summary["scenes_failed"] = scenes_failed
+
+    per_shard_scan_counts = per_shard_scan_counts or {}
+
+    by_shard: Dict[Tuple[str, str], List[CandidateRecord]] = {}
+    for candidate in candidates:
+        key = (candidate.source_split, candidate.source_shard)
+        by_shard.setdefault(key, []).append(candidate)
+
+    all_keys = set(by_shard.keys()) | set(per_shard_scan_counts.keys())
+
+    per_shard = []
+    for (source_split, source_shard) in sorted(all_keys):
+        shard_candidates = by_shard.get((source_split, source_shard), [])
+        shard_summary = compute_summary_statistics(shard_candidates)
+        scan_counts = per_shard_scan_counts.get(
+            (source_split, source_shard), {"scenes_scanned": 0, "scenes_failed": 0}
+        )
+        per_shard.append(
+            {
+                "source_split": source_split,
+                "source_shard": source_shard,
+                "scenes_scanned": scan_counts.get("scenes_scanned", 0),
+                "scenes_failed": scan_counts.get("scenes_failed", 0),
+                "scenes_with_transitions": shard_summary["scenes_with_transitions"],
+                "total_stable_transitions": shard_summary["total_stable_transitions"],
+                "accept_count": shard_summary["accept_count"],
+                "reject_count": shard_summary["reject_count"],
+                "review_count": shard_summary["review_count"],
+            }
+        )
+
+    return {"global": global_summary, "per_shard": per_shard}
 
 
 def write_summary_json(summary: Dict, output_path: Path) -> None:

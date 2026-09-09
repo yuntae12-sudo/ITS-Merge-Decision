@@ -10,6 +10,7 @@ import pytest
 
 from src.scenarios.dataset_builder import (
     CandidateRecord,
+    compute_multi_shard_summary,
     compute_summary_statistics,
     make_candidate_id,
     sanitize_candidate_id_for_filename,
@@ -191,6 +192,146 @@ def test_duplicate_candidate_id_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------
+# Case C: combined-CSV deterministic sort across shards.
+# ---------------------------------------------------------------------
+
+
+def test_case_c_combined_csv_sorted_across_shards(tmp_path):
+    # Two shards, deliberately inserted out of sort order, with
+    # overlapping record_index/transition_frame values so the sort key
+    # must actually discriminate on source_shard, not just record_index.
+    candidate_shard_b_first = _make_candidate(
+        scene_key="validation_tfexample.tfrecord-00005-of-00150#28",
+        source_shard="validation_tfexample.tfrecord-00005-of-00150",
+        record_index=28, transition_frame=50, source_lane_id=485, target_lane_id=344,
+    )
+    candidate_shard_a_second = _make_candidate(
+        scene_key="validation_tfexample.tfrecord-00000-of-00150#28",
+        source_shard="validation_tfexample.tfrecord-00000-of-00150",
+        record_index=28, transition_frame=50, source_lane_id=485, target_lane_id=344,
+    )
+    candidate_shard_a_early_frame = _make_candidate(
+        scene_key="validation_tfexample.tfrecord-00000-of-00150#5",
+        source_shard="validation_tfexample.tfrecord-00000-of-00150",
+        record_index=5, transition_frame=10, source_lane_id=1, target_lane_id=2,
+        decision="reject", reason="parallel_lane_change",
+    )
+
+    output_path = tmp_path / "combined.csv"
+    write_candidates_csv(
+        [candidate_shard_b_first, candidate_shard_a_second, candidate_shard_a_early_frame],
+        output_path,
+    )
+
+    with open(output_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    # Expected order: shard 00000 record 5 first (lower record_index),
+    # then shard 00000 record 28, then shard 00005 record 28 (higher
+    # source_shard string sorts after 00000).
+    assert [r["source_shard"] for r in rows] == [
+        "validation_tfexample.tfrecord-00000-of-00150",
+        "validation_tfexample.tfrecord-00000-of-00150",
+        "validation_tfexample.tfrecord-00005-of-00150",
+    ]
+    assert [int(r["record_index"]) for r in rows] == [5, 28, 28]
+
+    # Re-running the same write must produce byte-identical ordering.
+    output_path_2 = tmp_path / "combined_2.csv"
+    write_candidates_csv(
+        [candidate_shard_a_early_frame, candidate_shard_a_second, candidate_shard_b_first],
+        output_path_2,
+    )
+    assert output_path.read_text() == output_path_2.read_text()
+
+
+# ---------------------------------------------------------------------
+# Case D: duplicate candidate_id hard failure, cross-shard variant.
+# ---------------------------------------------------------------------
+
+
+def test_case_d_cross_shard_duplicate_candidate_id_raises(tmp_path):
+    # Same scene_key (hence same candidate_id) can only arise from the
+    # SAME physical shard + record_index; this test confirms the
+    # duplicate check still fires even when other fields superficially
+    # differ (e.g. different transition_index), guarding against a
+    # regression that might only dedupe on a subset of fields.
+    candidate_a = _make_candidate(
+        scene_key="validation_tfexample.tfrecord-00000-of-00150#28",
+        source_shard="validation_tfexample.tfrecord-00000-of-00150",
+        record_index=28, transition_frame=50, source_lane_id=485, target_lane_id=344,
+        transition_index=0,
+    )
+    candidate_b = _make_candidate(
+        scene_key="validation_tfexample.tfrecord-00000-of-00150#28",
+        source_shard="validation_tfexample.tfrecord-00000-of-00150",
+        record_index=28, transition_frame=50, source_lane_id=485, target_lane_id=344,
+        transition_index=1,
+    )
+    with pytest.raises(ValueError, match="Duplicate candidate_id"):
+        write_candidates_csv([candidate_a, candidate_b], tmp_path / "out.csv")
+
+
+# ---------------------------------------------------------------------
+# Case I: summary includes per-shard statistics.
+# ---------------------------------------------------------------------
+
+
+def test_case_i_multi_shard_summary_includes_per_shard_stats():
+    shard_a_candidates = [
+        _make_candidate(
+            scene_key="shardA#0", source_shard="shardA", record_index=0,
+            transition_frame=1, source_lane_id=1, target_lane_id=2,
+            decision="accept",
+        ),
+        _make_candidate(
+            scene_key="shardA#1", source_shard="shardA", record_index=1,
+            transition_frame=2, source_lane_id=3, target_lane_id=4,
+            decision="reject", reason="parallel_lane_change",
+        ),
+    ]
+    shard_b_candidates = [
+        _make_candidate(
+            scene_key="shardB#0", source_shard="shardB", record_index=0,
+            transition_frame=1, source_lane_id=1, target_lane_id=2,
+            decision="review", reason="ambiguous_serial_or_merge",
+        ),
+    ]
+    all_candidates = shard_a_candidates + shard_b_candidates
+
+    summary = compute_multi_shard_summary(
+        all_candidates,
+        physical_shards_scanned=2,
+        scenes_scanned=3,
+        scenes_failed=0,
+        per_shard_scan_counts={
+            ("validation", "shardA"): {"scenes_scanned": 2, "scenes_failed": 0},
+            ("validation", "shardB"): {"scenes_scanned": 1, "scenes_failed": 0},
+        },
+    )
+
+    assert summary["global"]["physical_shards_scanned"] == 2
+    assert summary["global"]["scenes_scanned"] == 3
+    assert summary["global"]["total_stable_transitions"] == 3
+    assert summary["global"]["accept_count"] == 1
+    assert summary["global"]["reject_count"] == 1
+    assert summary["global"]["review_count"] == 1
+
+    per_shard = {(p["source_split"], p["source_shard"]): p for p in summary["per_shard"]}
+    assert per_shard[("validation", "shardA")]["total_stable_transitions"] == 2
+    assert per_shard[("validation", "shardA")]["accept_count"] == 1
+    assert per_shard[("validation", "shardA")]["reject_count"] == 1
+    assert per_shard[("validation", "shardA")]["scenes_scanned"] == 2
+
+    assert per_shard[("validation", "shardB")]["total_stable_transitions"] == 1
+    assert per_shard[("validation", "shardB")]["review_count"] == 1
+    assert per_shard[("validation", "shardB")]["scenes_scanned"] == 1
+
+    # per_shard entries sorted by (source_split, source_shard).
+    assert [p["source_shard"] for p in summary["per_shard"]] == ["shardA", "shardB"]
+
+
+# ---------------------------------------------------------------------
 # Manual label sync / final manifest logic (exercises
 # scripts/build_merge_manifest.py's pure functions directly).
 # ---------------------------------------------------------------------
@@ -234,6 +375,59 @@ def test_stale_labels_kept_not_deleted():
 def test_set_label_applies_to_merged_set():
     merged, _ = sync_labels(["A"], {}, set_label=("A", "CONFIRMED_MERGE"))
     assert merged["A"]["manual_validation"] == "CONFIRMED_MERGE"
+
+
+# ---------------------------------------------------------------------
+# Case M: manual labels remain unique and preserved across shards.
+# ---------------------------------------------------------------------
+
+
+def test_case_m_labels_preserved_independently_across_shards():
+    # Two candidate_ids sharing the same record_index/transition_frame/
+    # lane ids but differing by source_shard (embedded in scene_key,
+    # hence in candidate_id) -- confirms sync_labels/labels storage
+    # treats them as fully independent identities, never conflating or
+    # deduplicating them just because their non-shard fields match.
+    candidate_id_shard_a = make_candidate_id(
+        "validation_tfexample.tfrecord-00000-of-00150#28", 50, 485, 344
+    )
+    candidate_id_shard_b = make_candidate_id(
+        "validation_tfexample.tfrecord-00005-of-00150#28", 50, 485, 344
+    )
+    assert candidate_id_shard_a != candidate_id_shard_b
+
+    existing_labels = {
+        candidate_id_shard_a: {
+            "candidate_id": candidate_id_shard_a,
+            "manual_validation": "CONFIRMED_MERGE",
+            "manual_note": "shard A: genuine merge",
+        },
+    }
+
+    merged, stale = sync_labels(
+        [candidate_id_shard_a, candidate_id_shard_b], existing_labels
+    )
+
+    # Shard A's pre-existing CONFIRMED_MERGE label is preserved exactly.
+    assert merged[candidate_id_shard_a]["manual_validation"] == "CONFIRMED_MERGE"
+    assert merged[candidate_id_shard_a]["manual_note"] == "shard A: genuine merge"
+
+    # Shard B's identically-shaped candidate gets its OWN independent
+    # UNREVIEWED row -- not silently merged with/overwritten by shard
+    # A's label.
+    assert merged[candidate_id_shard_b]["manual_validation"] == "UNREVIEWED"
+    assert merged[candidate_id_shard_b]["manual_note"] == ""
+
+    assert stale == []
+
+    # Independently setting shard B's label must not affect shard A's.
+    merged_2, _ = sync_labels(
+        [candidate_id_shard_a, candidate_id_shard_b],
+        merged,
+        set_label=(candidate_id_shard_b, "CONFIRMED_NON_MERGE"),
+    )
+    assert merged_2[candidate_id_shard_a]["manual_validation"] == "CONFIRMED_MERGE"
+    assert merged_2[candidate_id_shard_b]["manual_validation"] == "CONFIRMED_NON_MERGE"
 
 
 def test_set_label_rejects_invalid_value():
