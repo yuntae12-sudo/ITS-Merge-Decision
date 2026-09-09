@@ -1,10 +1,10 @@
 # Phase 1 merge-detection thresholds.
 #
-# This file only declares the config schema. None of these values are
-# used yet in Commit A (dataset iterator only) -- they are populated
-# with concrete numbers in the commits that implement lane assignment
-# (Commit C), merge topology detection (Commit D), and target-agent
-# feature extraction (Commit E), after inspecting real scenes.
+# This file only declares the config schema. Values are populated with
+# concrete numbers in the commits that consume them, after inspecting
+# real scenes -- not guessed up front. lane_assignment values were set
+# in Commit C; merge_topology, event, agent_selection, and traffic
+# remain null until Commit D/E.
 #
 # Every threshold stays null until a commit that consumes it justifies
 # a concrete value from observed data, per the "no hardcoded heuristics"
@@ -13,13 +13,70 @@
 lane_assignment:
   # Maximum lateral distance (m) from a lane polyline for a point to be
   # considered assigned to that lane.
-  max_lateral_distance_m: null
+  #
+  # Set from Commit C's observation of 5 real WOMD scenes: taking, at
+  # each valid ego frame, the lateral distance of whichever of the 8
+  # nearest-by-vertex lane candidates has the smallest heading
+  # difference from ego, the max across those 5 scenes was ~11.1 m
+  # (scene #4, a wide-radius turn) with most frames well under 5 m.
+  # 5.0 m keeps ordinary lane-width deviation (a WOMD lane is
+  # typically ~3.5 m wide) while still rejecting a physically distant,
+  # unrelated lane; it does reject a handful of real frames in wide
+  # turns, which surface as `lane_id=None` rather than a forced
+  # mismatch (see assign_lane).
+  max_lateral_distance_m: 5.0
   # Maximum heading difference (deg) between ego heading and lane
   # direction for a valid lane assignment.
-  max_heading_difference_deg: null
+  #
+  # Set from the same 5-scene observation: the heading difference of
+  # the best-heading-matching nearby candidate was consistently under
+  # 9 degrees (max ~8.3 deg) across all 5 scenes. Directly inspecting
+  # scene #0 frame 0 showed the *nearest-by-distance* lane (215, 0.78 m
+  # away) had a 130-degree heading mismatch against ego (it is a
+  # crossing/opposing lane at an intersection), while the actual
+  # heading-consistent lane (196, 2.50 m away) differed by only 1.08
+  # degrees -- confirming heading rejection is necessary, not just
+  # lateral distance. 45 degrees comfortably passes normal-driving and
+  # moderate-turn frames while rejecting anything resembling a
+  # crossing or opposing lane.
+  max_heading_difference_deg: 45.0
   # Minimum number of consecutive frames required before accepting a
   # lane assignment change (hysteresis against boundary jitter).
-  persistence_frames: null
+  #
+  # WOMD logged trajectories in this dataset run at 10 Hz (91 frames
+  # over a 9s window, confirmed in Phase 0). 5 frames = 0.5 s of
+  # persistent raw assignment before a stable lane change is accepted,
+  # long enough to filter single/double-frame jitter at a lane boundary
+  # (Case 3/4 in tests/scenarios/test_lane_assignment.py) while still
+  # reacting well within a typical multi-second lane change or merge
+  # maneuver.
+  persistence_frames: 5
+  # Maximum consecutive frames with no acceptable lane candidate
+  # (lane_id=None) that the current stable lane is allowed to bridge
+  # over before being dropped back to None.
+  #
+  # Set conservatively equal to persistence_frames (5 frames / 0.5 s):
+  # a short gap (e.g. crossing a sparse map region) shouldn't flip the
+  # stable sequence, but an unbounded bridge would let two potentially
+  # unrelated lanes be silently joined with no supporting evidence.
+  max_ambiguous_gap_frames: 5
+  # Number of nearest-by-vertex-distance lanes shortlisted before exact
+  # segment-projected scoring. 8 was used throughout Commit C's scene
+  # observation (see above) and was always enough to include the true
+  # heading-consistent lane, even at busy intersections with 15+ nearby
+  # lane features.
+  candidate_count: 8
+  # Relative weights combining normalized lateral distance and
+  # normalized heading difference into one score (see
+  # heading_normalization_deg). Left equal since Commit C's
+  # observations did not surface a case needing one term favored over
+  # the other; revisit if Commit D/E scene review finds otherwise.
+  lateral_weight: 1.0
+  heading_weight: 1.0
+  # Scale (deg) heading difference is divided by before weighting, so
+  # it lands on a comparable footing to lateral distance normalized by
+  # max_lateral_distance_m. Matches max_heading_difference_deg.
+  heading_normalization_deg: 45.0
 
 merge_topology:
   # Maximum distance (m) between the source lane's terminal point and
