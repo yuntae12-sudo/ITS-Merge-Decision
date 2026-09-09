@@ -9,6 +9,7 @@ import numpy as np
 from waymax import config
 from waymax import dataloader
 from waymax import visualization
+from waymax.metrics import metric_factory
 
 
 # ======================================================================
@@ -49,10 +50,12 @@ MAP_ELEMENT_TYPE_NAMES = {
     17: "STOP_SIGN",
     18: "CROSSWALK",
     19: "SPEED_BUMP",
+    20: "DRIVEWAY",
 }
 
 
 def main():
+
     print("=" * 70)
     print("ITS Merge Decision - Phase 0")
     print("=" * 70)
@@ -65,7 +68,7 @@ def main():
     print(jax.devices())
 
     # ==================================================================
-    # 2. WOMD Dataset Config
+    # 2. WOMD Dataset
     # ==================================================================
 
     dataset_config = dataclasses.replace(
@@ -219,11 +222,9 @@ def main():
 
     for i in range(scenario.num_objects):
 
-        # Ego 제외
         if i == ego_idx:
             continue
 
-        # 현재 timestep에서 유효하지 않은 객체 제외
         if not valid[i]:
             continue
 
@@ -233,7 +234,7 @@ def main():
         distance = math.hypot(dx, dy)
 
         # --------------------------------------------------------------
-        # Global -> Ego-local coordinate
+        # Global -> Ego-local
         #
         # rel_x > 0 : Ego 앞
         # rel_x < 0 : Ego 뒤
@@ -269,7 +270,6 @@ def main():
             }
         )
 
-    # 가까운 순
     surrounding_agents.sort(
         key=lambda agent: agent["distance"]
     )
@@ -375,9 +375,7 @@ def main():
 
     print("\nMap element distribution:")
 
-    valid_types = rg_types[
-        rg_valid
-    ]
+    valid_types = rg_types[rg_valid]
 
     unique_types, type_counts = np.unique(
         valid_types,
@@ -414,7 +412,6 @@ def main():
         dy,
     )
 
-    # Global -> Ego local
     rg_rel_x = (
         cos_yaw * dx
         + sin_yaw * dy
@@ -425,7 +422,6 @@ def main():
         + cos_yaw * dy
     )
 
-    # Invalid map points 제외
     valid_distance = np.where(
         rg_valid,
         rg_distance,
@@ -458,15 +454,8 @@ def main():
         f"{radius:.0f} m of Ego:"
     )
 
-    print(
-        f"  Points   : "
-        f"{nearby_count}"
-    )
-
-    print(
-        f"  Features : "
-        f"{nearby_feature_count}"
-    )
+    print(f"  Points   : {nearby_count}")
+    print(f"  Features : {nearby_feature_count}")
 
     # ==================================================================
     # 8-4. Nearest Roadgraph Points
@@ -521,7 +510,6 @@ def main():
     print("[9] Top-view Visualization")
     print("-" * 70)
 
-    # 출력 폴더 생성
     output_dir = Path(
         "outputs/figures"
     )
@@ -540,13 +528,6 @@ def main():
         "Rendering Waymax top-view..."
     )
 
-    # --------------------------------------------------------------
-    # Waymax visualization
-    #
-    # use_log_traj=True:
-    # 실제 WOMD logged trajectory 사용
-    # --------------------------------------------------------------
-
     image = visualization.plot_simulator_state(
         scenario,
         use_log_traj=True,
@@ -556,10 +537,6 @@ def main():
         "Image shape:",
         image.shape,
     )
-
-    # --------------------------------------------------------------
-    # Save PNG
-    # --------------------------------------------------------------
 
     plt.imsave(
         output_path,
@@ -581,6 +558,208 @@ def main():
     print("=" * 70)
 
     # ==================================================================
+    # 10. Basic Waymax Metrics
+    # ==================================================================
+
+    print("\n" + "-" * 70)
+    print("[10] Basic Waymax Metrics")
+    print("-" * 70)
+
+    metrics_config = config.MetricsConfig(
+        metrics_to_run=(
+            "log_divergence",
+            "overlap",
+            "offroad",
+        )
+    )
+
+    print(
+        "Metrics:",
+        metrics_config.metrics_to_run,
+    )
+
+    print(
+        "Computing metrics..."
+    )
+
+    metric_results = metric_factory.run_metrics(
+        simulator_state=scenario,
+        metrics_config=metrics_config,
+    )
+
+    print("\nEgo / SDC metrics:\n")
+
+    for metric_name in metrics_config.metrics_to_run:
+
+        result = metric_results[
+            metric_name
+        ]
+
+        metric_values = np.asarray(
+            result.value
+        )
+
+        metric_valid = np.asarray(
+            result.valid
+        ).astype(bool)
+
+        if metric_valid[ego_idx]:
+
+            ego_value = float(
+                metric_values[ego_idx]
+            )
+
+            print(
+                f"  {metric_name:<20}: "
+                f"{ego_value:.6f}"
+            )
+
+        else:
+
+            print(
+                f"  {metric_name:<20}: "
+                f"INVALID"
+            )
+
+    # ==================================================================
+    # 10-1. Metric summary for all valid objects
+    # ==================================================================
+
+    print("\nMetric summary for all objects:\n")
+
+    print(
+        f"{'METRIC':<22}"
+        f"{'VALID':>8}"
+        f"{'MEAN':>12}"
+        f"{'MAX':>12}"
+    )
+
+    print("-" * 54)
+
+    for metric_name in metrics_config.metrics_to_run:
+
+        result = metric_results[
+            metric_name
+        ]
+
+        metric_values = np.asarray(
+            result.value
+        )
+
+        metric_valid = np.asarray(
+            result.valid
+        ).astype(bool)
+
+        valid_values = metric_values[
+            metric_valid
+        ]
+
+        num_valid = len(
+            valid_values
+        )
+
+        if num_valid > 0:
+
+            mean_value = float(
+                np.mean(valid_values)
+            )
+
+            max_value = float(
+                np.max(valid_values)
+            )
+
+        else:
+
+            mean_value = float("nan")
+            max_value = float("nan")
+
+        print(
+            f"{metric_name:<22}"
+            f"{num_valid:>8}"
+            f"{mean_value:>12.6f}"
+            f"{max_value:>12.6f}"
+        )
+
+    # ==================================================================
+    # 10-2. Safety interpretation
+    # ==================================================================
+
+    overlap_result = metric_results[
+        "overlap"
+    ]
+
+    offroad_result = metric_results[
+        "offroad"
+    ]
+
+    overlap_values = np.asarray(
+        overlap_result.value
+    )
+
+    overlap_valid = np.asarray(
+        overlap_result.valid
+    ).astype(bool)
+
+    offroad_values = np.asarray(
+        offroad_result.value
+    )
+
+    offroad_valid = np.asarray(
+        offroad_result.valid
+    ).astype(bool)
+
+    ego_overlap = None
+    ego_offroad = None
+
+    if overlap_valid[ego_idx]:
+        ego_overlap = float(
+            overlap_values[ego_idx]
+        )
+
+    if offroad_valid[ego_idx]:
+        ego_offroad = float(
+            offroad_values[ego_idx]
+        )
+
+    print("\nEgo safety status:")
+
+    if ego_overlap is not None:
+
+        if ego_overlap >= 0.5:
+            print(
+                "  Overlap : DETECTED"
+            )
+        else:
+            print(
+                "  Overlap : CLEAR"
+            )
+
+    else:
+        print(
+            "  Overlap : INVALID"
+        )
+
+    if ego_offroad is not None:
+
+        if ego_offroad >= 0.5:
+            print(
+                "  Offroad : DETECTED"
+            )
+        else:
+            print(
+                "  Offroad : CLEAR"
+            )
+
+    else:
+        print(
+            "  Offroad : INVALID"
+        )
+
+    print("\n" + "=" * 70)
+    print("BASIC METRICS: PASS")
+    print("=" * 70)
+
+    # ==================================================================
     # Phase 0 Current Status
     # ==================================================================
 
@@ -594,6 +773,7 @@ def main():
     print("[PASS] Surrounding agent extraction")
     print("[PASS] Roadgraph inspection")
     print("[PASS] Top-view visualization")
+    print("[PASS] Basic Waymax metrics")
 
     print("=" * 70)
 
