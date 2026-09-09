@@ -13,6 +13,20 @@ from waymax.metrics import metric_factory
 
 
 # ======================================================================
+# Phase 0 paths
+# ======================================================================
+
+DATASET_PATH = (
+    "data/womd/validation/"
+    "validation_tfexample.tfrecord-00000-of-00150"
+)
+
+SCENE_NAME = "scene_000"
+
+OUTPUT_ROOT = Path("outputs/phase0") / SCENE_NAME
+
+
+# ======================================================================
 # Object type mapping
 # ======================================================================
 
@@ -73,10 +87,7 @@ def main():
 
     dataset_config = dataclasses.replace(
         config.WOD_1_3_1_VALIDATION,
-        path=(
-            "data/womd/validation/"
-            "validation_tfexample.tfrecord-00000-of-00150"
-        ),
+        path=DATASET_PATH,
         max_num_objects=64,
         repeat=1,
         shuffle_seed=None,
@@ -510,9 +521,7 @@ def main():
     print("[9] Top-view Visualization")
     print("-" * 70)
 
-    output_dir = Path(
-        "outputs/figures"
-    )
+    output_dir = OUTPUT_ROOT / "figures"
 
     output_dir.mkdir(
         parents=True,
@@ -521,7 +530,7 @@ def main():
 
     output_path = (
         output_dir
-        / "scene_000_topview.png"
+        / "topview.png"
     )
 
     print(

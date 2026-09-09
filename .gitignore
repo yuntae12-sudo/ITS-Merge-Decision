@@ -1,8 +1,18 @@
+# Dataset
+data/*
+!data/.gitkeep
+
+# Generated outputs
+outputs/*
+!outputs/.gitkeep
+
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 
-# Virtual environment
+# Virtual / Environment
+.env
 .venv/
 venv/
 
@@ -10,14 +20,8 @@ venv/
 .vscode/
 .idea/
 
-# Data
-data/*
-!data/.gitkeep
-
-# Outputs
-outputs/*
-!outputs/figures/
-!outputs/metrics/
+# OS
+.DS_Store
 
 # Jupyter
 .ipynb_checkpoints/

@@ -1,2 +1,6 @@
 jax[cuda12]
 git+https://github.com/waymo-research/waymax.git@main#egg=waymo-waymax
+tensorflow
+numpy
+matplotlib
+pillow
