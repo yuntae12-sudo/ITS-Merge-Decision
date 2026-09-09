@@ -1,0 +1,24 @@
+# WOMD dataset loading configuration shared by Phase 1 tooling.
+#
+# This mirrors the Waymax `DatasetConfig` fields already validated in
+# Phase 0 (scripts/run_scene.py, scripts/run_rollout.py). Phase 1 code
+# must not hardcode these values; load them through
+# `src.scenarios.scenario_loader.load_dataset_config`.
+
+# Path to a WOMD tf_example shard (or shard glob pattern supported by
+# Waymax's DatasetConfig.path, e.g. an @N sharded pattern).
+path: "data/womd/validation/validation_tfexample.tfrecord-00000-of-00150"
+
+# Maximum number of tracked objects per scenario. Matches the value used
+# in Phase 0 validation scripts.
+max_num_objects: 64
+
+# Number of times to iterate over the dataset. 1 keeps iteration
+# deterministic and finite, which Phase 1 batch scanning relies on.
+repeat: 1
+
+# Kept explicit (rather than relying on the Waymax default) so dataset
+# ordering stays reproducible across runs, which Phase 1 depends on for
+# stable scene indexing since WOMD tf_example does not expose a parsed
+# scenario id string in this feature set.
+shuffle_seed: null

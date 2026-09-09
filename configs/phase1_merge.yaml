@@ -1,0 +1,57 @@
+# Phase 1 merge-detection thresholds.
+#
+# This file only declares the config schema. None of these values are
+# used yet in Commit A (dataset iterator only) -- they are populated
+# with concrete numbers in the commits that implement lane assignment
+# (Commit C), merge topology detection (Commit D), and target-agent
+# feature extraction (Commit E), after inspecting real scenes.
+#
+# Every threshold stays null until a commit that consumes it justifies
+# a concrete value from observed data, per the "no hardcoded heuristics"
+# principle for this phase.
+
+lane_assignment:
+  # Maximum lateral distance (m) from a lane polyline for a point to be
+  # considered assigned to that lane.
+  max_lateral_distance_m: null
+  # Maximum heading difference (deg) between ego heading and lane
+  # direction for a valid lane assignment.
+  max_heading_difference_deg: null
+  # Minimum number of consecutive frames required before accepting a
+  # lane assignment change (hysteresis against boundary jitter).
+  persistence_frames: null
+
+merge_topology:
+  # Maximum distance (m) between the source lane's terminal point and
+  # the target lane polyline for a transition to be considered a
+  # convergence/merge rather than two parallel lanes.
+  max_endpoint_target_distance_m: null
+  # Maximum heading difference (deg) between source and target lane at
+  # the transition point.
+  max_heading_difference_deg: null
+  # Minimum longitudinal length (m) over which source and target lanes
+  # must converge for the transition to count as merge topology.
+  min_convergence_length_m: null
+
+event:
+  # Minimum number of frames ego must be observed on the source lane
+  # before the transition.
+  min_pre_merge_frames: null
+  # Minimum number of frames ego must remain on the target lane
+  # immediately after transition for it to count (vs. a jitter/reject).
+  min_target_lane_frames: null
+  # Minimum number of frames after the transition required to consider
+  # the merge event complete.
+  min_post_merge_frames: null
+
+agent_selection:
+  # Maximum lateral distance (m) from the target lane centerline for a
+  # surrounding agent to be considered a target-lane front/rear
+  # candidate.
+  max_target_lane_lateral_distance_m: null
+  # Maximum longitudinal search distance (m) for front/rear candidates.
+  max_distance_m: null
+
+traffic:
+  # Radius (m) used to compute local traffic density around ego.
+  density_radius_m: null
