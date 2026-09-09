@@ -287,35 +287,48 @@ def compute_stable_lane_sequence(
     ambiguous/intersection frames (e.g. ``A A A B A A``). This applies a
     straightforward hysteresis rule: a candidate new lane only replaces
     an *already-established* stable lane once it has been the raw
-    assignment for at least ``persistence_frames`` consecutive (valid)
+    assignment for at least ``persistence_frames`` TRULY CONSECUTIVE
     frames; until that threshold is met, frames keep the previously
-    stable lane id. Hysteresis only applies once a stable lane exists,
-    though: at a cold start (no stable lane yet, e.g. the first valid
-    frame(s) of a trajectory, or right after a stable lane was dropped
-    by an over-long ambiguous gap) there is no existing assignment for
-    the rule to protect, so the first real candidate is accepted
-    immediately rather than waiting out persistence_frames again.
+    stable lane id. "Truly consecutive" means a ``None`` frame (no
+    candidate observed) breaks an in-progress pending run just like a
+    different lane id would -- e.g. with ``persistence_frames=5``,
+    ``B B None B B B`` must NOT count as five B observations; the
+    ``None`` resets the pending count, so a fresh run of 3 consecutive
+    B's only reaches 3, not 5.
+
+    Hysteresis only applies once a stable lane has been established,
+    though: at the very first valid frame(s) of a trajectory (true
+    cold start, before any stable lane has ever existed) there is no
+    existing assignment for the rule to protect, so the first real
+    candidate is accepted immediately rather than waiting out
+    persistence_frames. This exception applies ONLY to that initial
+    startup -- it does NOT apply after a stable lane was later dropped
+    by an over-long ambiguous gap (see below). Re-establishing a stable
+    lane after such a drop always requires a fresh
+    persistence_frames-consecutive run, exactly like replacing any
+    other already-established stable lane; the first candidate seen
+    after the gap is never trusted immediately.
 
     Frames with ``lane_id=None`` (invalid pose, or no lane passed
-    rejection) do not themselves force a stable-lane change: they are
-    treated as "no new candidate observed this frame", so a short
-    ambiguous gap does not flip the stable sequence -- the current
-    stable lane carries forward across it. However, this carry-forward
-    is only justified for a *short* gap: without a limit, an arbitrarily
-    long run of ambiguous frames would silently bridge two lanes that
-    may have nothing to do with each other. If
-    ``max_ambiguous_gap_frames`` is set and a run of consecutive
-    ``None`` raw assignments exceeds it, the stable lane is dropped to
-    ``None`` for the remainder of that run (and must be re-established
-    by a fresh persistent run once real candidates resume) rather than
-    bridged. If left as the default ``None``, gaps are bridged
+    rejection) do not themselves force a stable-lane change: the
+    current stable lane carries forward across a short ambiguous gap.
+    However, this carry-forward is only justified for a *short* gap:
+    without a limit, an arbitrarily long run of ambiguous frames would
+    silently bridge two lanes that may have nothing to do with each
+    other. If ``max_ambiguous_gap_frames`` is set and a run of
+    consecutive ``None`` raw assignments exceeds it, the stable lane is
+    dropped to ``None`` for the remainder of that run and must be
+    re-established by a fresh persistence_frames-consecutive run once
+    real candidates resume (per the previous paragraph, not
+    immediately). If left as the default ``None``, gaps are bridged
     indefinitely (equivalent to the previous, unbounded behavior).
 
     Args:
         assignments: raw per-frame assignments, e.g. from
             ``assign_ego_lane_sequence``.
-        persistence_frames: number of consecutive raw-assignment frames
-            required before accepting a stable lane change.
+        persistence_frames: number of truly consecutive raw-assignment
+            frames required before accepting a stable lane change (or
+            establishing one after a dropped gap).
         max_ambiguous_gap_frames: maximum consecutive ``None`` raw
             frames the current stable lane is allowed to bridge over.
 
@@ -331,16 +344,24 @@ def compute_stable_lane_sequence(
     pending_lane: Optional[int] = None
     pending_run_length = 0
     ambiguous_gap_length = 0
+    # True only before the very first stable lane is ever established.
+    # Cleared permanently the first time a stable lane is set, so a
+    # later drop (over-long ambiguous gap) never re-enables the
+    # immediate-acceptance exception.
+    awaiting_initial_lane = True
 
     for frame_index, assignment in enumerate(assignments):
 
         raw_lane_id = assignment.lane_id
 
         if raw_lane_id is None:
-            # No candidate observed this frame: does not break an
-            # in-progress persistence run, but does not advance it
-            # either. The current stable lane carries forward, unless
-            # the ambiguous run has gone on too long to justify that.
+            # No candidate observed this frame: breaks any in-progress
+            # pending run (truly-consecutive requirement) and does not
+            # itself change the stable lane. The current stable lane
+            # carries forward, unless the ambiguous run has gone on too
+            # long to justify that.
+            pending_lane = None
+            pending_run_length = 0
             ambiguous_gap_length += 1
 
             if (
@@ -360,13 +381,15 @@ def compute_stable_lane_sequence(
             stable_sequence[frame_index] = current_stable
             continue
 
-        if current_stable is None:
-            # Cold start (no stable lane has ever been established, or
-            # one was dropped by an over-long ambiguous gap): there is
-            # no existing stable lane for hysteresis to protect, so
-            # accept the very first real candidate immediately rather
-            # than waiting out persistence_frames again.
+        if awaiting_initial_lane:
+            # True cold start only: no stable lane has ever existed, so
+            # there is nothing for hysteresis to protect. Accept the
+            # very first real candidate immediately. This branch can
+            # only fire once per sequence (the flag is cleared below),
+            # so it never applies to re-establishment after a dropped
+            # gap later in the same sequence.
             current_stable = raw_lane_id
+            awaiting_initial_lane = False
             pending_lane = None
             pending_run_length = 0
             stable_sequence[frame_index] = current_stable

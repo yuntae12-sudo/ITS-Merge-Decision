@@ -294,6 +294,47 @@ def test_stable_sequence_case5_stable_transition_after_noise():
     assert transitions[0].transition_frame == 7
 
 
+def test_stable_sequence_pending_run_interrupted_by_none_does_not_count():
+    """persistence_frames must mean truly CONSECUTIVE raw observations.
+    A None in the middle of a pending run must reset it -- "B B None
+    B B" must NOT count as five B observations reaching
+    persistence_frames=3 via a broken-up run of 4 B's.
+    """
+
+    raw = ["A", "A", "A", "B", "B", None, "B", "B"]
+    assignments = _assignments_from_lane_ids(raw)
+
+    stable = compute_stable_lane_sequence(assignments, persistence_frames=3)
+    transitions = find_lane_transitions(stable)
+
+    # Only 2 consecutive B's after the None (indices 6-7) -- short of
+    # persistence_frames=3, so no transition and stable stays "A".
+    assert transitions == []
+    assert stable == ["A"] * 8
+
+
+def test_stable_sequence_pending_run_interrupted_by_none_then_completes():
+    """Same setup as above, but with one more consecutive B: the
+    post-None run must independently reach persistence_frames=3 -- it
+    does NOT inherit credit from the B's seen before the None.
+    """
+
+    raw = ["A", "A", "A", "B", "B", None, "B", "B", "B"]
+    assignments = _assignments_from_lane_ids(raw)
+
+    stable = compute_stable_lane_sequence(assignments, persistence_frames=3)
+    transitions = find_lane_transitions(stable)
+
+    assert len(transitions) == 1
+    assert transitions[0].source_lane_id == "A"
+    assert transitions[0].target_lane_id == "B"
+    # B becomes stable only at index 8, the third CONSECUTIVE B after
+    # the None at index 5 (indices 6, 7, 8) -- not at index 7, which
+    # is where it would land if the pre-None B's (indices 3-4) had
+    # counted toward the same run.
+    assert transitions[0].transition_frame == 8
+
+
 def test_stable_sequence_none_frames_bridge_short_gap():
 
     raw = ["A", "A", "A", None, None, "A", "A"]
@@ -306,24 +347,49 @@ def test_stable_sequence_none_frames_bridge_short_gap():
     assert stable == ["A", "A", "A", "A", "A", "A", "A"]
 
 
-def test_stable_sequence_none_frames_drop_after_long_gap():
+def test_stable_sequence_none_frames_drop_after_long_gap_insufficient_reestablishment():
+    """After the stable lane is dropped by an over-long ambiguous gap,
+    re-establishment is NOT a cold start: it requires a fresh
+    persistence_frames-consecutive run, just like any other stable
+    lane change. Two B frames are insufficient when
+    persistence_frames=3.
+    """
 
-    raw = ["A", "A", "A"] + [None] * 10 + ["A", "A"]
+    raw = ["A", "A", "A"] + [None] * 6 + ["B", "B"]
     assignments = _assignments_from_lane_ids(raw)
 
     stable = compute_stable_lane_sequence(
         assignments, persistence_frames=3, max_ambiguous_gap_frames=3
     )
 
-    # After 3 valid A frames, the ambiguous gap exceeds the configured
-    # limit (3), so the stable lane must drop to None rather than
-    # bridging an unsupported 10-frame gap. It should not silently
-    # re-establish as "A" without a fresh persistent run -- exactly 3
-    # A-frames only satisfies persistence_frames=3 starting at the
-    # first of them, so it re-establishes on the last frame.
+    # The gap (6 frames) exceeds max_ambiguous_gap_frames=3, so the
+    # stable lane drops to None partway through it, and the trailing
+    # two B frames are not enough to re-establish (persistence_frames
+    # =3): stable must still be None at the end.
     assert stable[:3] == ["A", "A", "A"]
-    assert None in stable[4:12]
-    assert stable[-1] == "A"
+    assert stable[-1] is None
+
+
+def test_stable_sequence_none_frames_reestablishes_after_long_gap_with_full_persistence():
+    """Same setup, but with a third consecutive B: re-establishment
+    after a dropped gap only succeeds once persistence_frames
+    consecutive observations of the new lane are seen -- it must not
+    be trusted immediately like a true cold start.
+    """
+
+    raw = ["A", "A", "A"] + [None] * 6 + ["B", "B", "B"]
+    assignments = _assignments_from_lane_ids(raw)
+
+    stable = compute_stable_lane_sequence(
+        assignments, persistence_frames=3, max_ambiguous_gap_frames=3
+    )
+
+    assert stable[:3] == ["A", "A", "A"]
+    # B only becomes stable on the third consecutive B frame (the last
+    # one), not on the first or second.
+    assert stable[-3] is None
+    assert stable[-2] is None
+    assert stable[-1] == "B"
 
 
 def test_stable_sequence_none_at_start_has_no_stable_lane():
@@ -335,10 +401,36 @@ def test_stable_sequence_none_at_start_has_no_stable_lane():
 
     assert stable[0] is None
     assert stable[1] is None
-    # Lane A needs persistence_frames=3 consecutive raw frames before
-    # becoming stable, so it should not appear as stable until index 4.
     assert stable[4] == "A"
     assert stable[5] == "A"
+
+
+def test_stable_sequence_cold_start_accepts_first_candidate_immediately():
+    """Documents and pins down the ONE intentional exception to the
+    persistence rule: true cold start (no stable lane has ever been
+    established yet) accepts the very first real candidate on the
+    spot, without waiting for persistence_frames consecutive frames.
+
+    This is deliberately narrow -- it applies ONLY to this initial
+    startup. It is NOT the same code path as re-establishment after a
+    stable lane is later dropped by an over-long ambiguous gap; see
+    test_stable_sequence_none_frames_drop_after_long_gap_insufficient_reestablishment
+    and ..._reestablishes_after_long_gap_with_full_persistence, which
+    confirm that re-establishment always requires a fresh
+    persistence_frames-consecutive run, with no immediate-acceptance
+    exception.
+    """
+
+    raw = ["A", "A", "A", "A"]
+    assignments = _assignments_from_lane_ids(raw)
+
+    stable = compute_stable_lane_sequence(assignments, persistence_frames=3)
+
+    # With persistence_frames=3, a non-cold-start lane change would not
+    # land until the 3rd consecutive frame -- here it lands
+    # immediately at index 0, proving the cold-start exception fired.
+    assert stable[0] == "A"
+    assert stable == ["A", "A", "A", "A"]
 
 
 # ======================================================================
