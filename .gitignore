@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+data/*
+!data/.gitkeep
+
+# Outputs
+outputs/*
+!outputs/figures/
+!outputs/metrics/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
