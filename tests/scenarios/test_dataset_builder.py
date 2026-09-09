@@ -200,7 +200,7 @@ from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent))
 
-from scripts.build_merge_manifest import build_manifest, sync_labels
+from scripts.build_merge_manifest import sync_labels
 
 
 def test_manual_label_preserved_across_resync():
@@ -241,49 +241,12 @@ def test_set_label_rejects_invalid_value():
         sync_labels(["A"], {}, set_label=("A", "NOT_A_REAL_LABEL"))
 
 
-def test_final_manifest_inclusion_rule_end_to_end():
-    candidate_rows = []
-    for candidate_id, decision in [
-        ("A", "accept"), ("B", "accept"), ("C", "review"), ("D", "review"),
-    ]:
-        candidate_rows.append(
-            {
-                "candidate_id": candidate_id,
-                "scene_key": "shard#0",
-                "source_dataset": "WOMD",
-                "source_split": "validation",
-                "source_shard": "shard",
-                "record_index": "0",
-                "source_lane_id": "1",
-                "target_lane_id": "2",
-                "transition_frame": "10",
-                "merge_start_frame": "5",
-                "merge_complete_frame": "10",
-                "merge_start_s": "1.0",
-                "merge_end_s": "2.0",
-                "ego_longitudinal_speed_mps": "10.0",
-                "front_vehicle_id": "",
-                "front_gap_m": "",
-                "front_relative_speed_mps": "",
-                "front_ttc_s": "",
-                "rear_vehicle_id": "",
-                "rear_gap_m": "",
-                "rear_relative_speed_mps": "",
-                "rear_ttc_s": "",
-                "traffic_density": "0",
-                "decision": decision,
-                "reason": "",
-            }
-        )
-
-    labels = {
-        "A": {"candidate_id": "A", "manual_validation": "CONFIRMED_MERGE", "manual_note": ""},
-        "B": {"candidate_id": "B", "manual_validation": "UNREVIEWED", "manual_note": ""},
-        "C": {"candidate_id": "C", "manual_validation": "CONFIRMED_MERGE", "manual_note": ""},
-        "D": {"candidate_id": "D", "manual_validation": "CONFIRMED_NON_MERGE", "manual_note": ""},
-    }
-
-    manifest_rows = build_manifest(candidate_rows, labels)
-    manifest_ids = {row["candidate_id"] for row in manifest_rows}
-
-    assert manifest_ids == {"A", "C"}
+# NOTE: the final-manifest inclusion rule (ACCEPT/REVIEW x
+# CONFIRMED_MERGE/CONFIRMED_NON_MERGE/UNREVIEWED) is now covered
+# end-to-end in tests/scenarios/test_build_merge_manifest.py (Cases
+# E/F/L), using a real reconstructable synthetic scene -- required
+# since `build_manifest` now reloads and reconstructs each confirmed
+# candidate's transition rather than blindly copying CSV columns (see
+# that module's docstring for the fix this guards against). The
+# pure-function sync_labels tests above remain here since they don't
+# depend on manifest-building at all.

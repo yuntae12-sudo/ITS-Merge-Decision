@@ -33,6 +33,15 @@ Candidates are always sorted by
 target_lane_id)`` before being written or summarized, so re-running the
 scan over the same data produces byte-identical output (module the
 directory/timestamps).
+
+Manifest materialization (fix commit)
+---------------------------------------
+``materialize_merge_features`` and ``reconstruct_transition`` are also
+called by ``scripts/build_merge_manifest.py`` to fully populate the
+ACCEPT-only fields for any manually-CONFIRMED_MERGE candidate whose
+original detector decision was REVIEW or REJECT (a human confirming a
+non-ACCEPT candidate as a genuine merge must still produce a complete,
+usable final-manifest row -- see that script's module docstring).
 """
 
 import csv
@@ -274,6 +283,203 @@ def _derive_merge_frames(
     return merge_start_frame, merge_complete_frame
 
 
+def materialize_merge_features(
+    transition: LaneTransition,
+    source_polyline,
+    target_polyline,
+    ego_source_arc_length_m: Optional[float],
+    record: ScenarioRecord,
+    merge_topology_config: MergeTopologyConfig,
+    agent_selection_config: AgentSelectionConfig,
+) -> dict:
+    """Computes the full ACCEPT-only feature set for one transition.
+
+    This is the single source of truth for the ACCEPT-only
+    ``CandidateRecord`` fields (``merge_start_s``, ``merge_end_s``,
+    ``merge_start_frame``, ``merge_complete_frame``,
+    ``ego_longitudinal_speed_mps``, ``merge_distance_m``, front/rear
+    vehicle_id/gap/relative_speed/ttc, ``traffic_density``). It was
+    extracted from ``_build_candidate_records_unsafe`` (the detector
+    -ACCEPT dataset-scan path) so the exact same computation can also
+    be reused by manual-CONFIRMED_MERGE final-manifest materialization
+    (fix commit "materialize manually confirmed merge features") --
+    no duplicated feature-computation logic between the two callers.
+
+    Args:
+        transition: the (possibly reconstructed) LaneTransition.
+        source_polyline: the source lane's geometry.
+        target_polyline: the target lane's geometry.
+        ego_source_arc_length_m: ego's source-lane arc-length position
+            at the transition frame.
+        record: the ScenarioRecord this transition belongs to (used to
+            read ego/agent trajectory arrays).
+        merge_topology_config: thresholds for merge_start_s/merge_end_s.
+        agent_selection_config: thresholds for Front/Rear selection.
+
+    Returns:
+        A dict with exactly the ACCEPT-only CandidateRecord field names
+        as keys, ready to be splatted into a CandidateRecord/manifest
+        row via ``**extra``.
+    """
+
+    log_trajectory = record.state.log_trajectory
+    sdc_index = record.sdc_index
+
+    ego_x = np.asarray(log_trajectory.x[sdc_index])
+    ego_y = np.asarray(log_trajectory.y[sdc_index])
+    ego_valid = np.asarray(log_trajectory.valid[sdc_index]).astype(bool)
+    ego_vel_x = np.asarray(log_trajectory.vel_x[sdc_index])
+    ego_vel_y = np.asarray(log_trajectory.vel_y[sdc_index])
+    ego_length = np.asarray(log_trajectory.length[sdc_index])
+
+    object_ids = np.asarray(record.state.object_metadata.ids)
+    object_types = np.asarray(record.state.object_metadata.object_types)
+
+    merge_start_s, merge_end_s = compute_merge_start_end_s(
+        source_polyline, target_polyline, merge_topology_config
+    )
+    d_m = compute_remaining_merge_distance(merge_end_s, ego_source_arc_length_m)
+
+    merge_start_frame, merge_complete_frame = _derive_merge_frames(
+        transition,
+        source_polyline,
+        ego_x,
+        ego_y,
+        ego_valid,
+        merge_start_s,
+        merge_end_s,
+    )
+
+    frame = transition.transition_frame
+
+    features = extract_interaction_features(
+        frame_index=frame,
+        target_polyline=target_polyline,
+        merge_distance_m=d_m,
+        ego_id=record.sdc_id,
+        ego_x=float(ego_x[frame]),
+        ego_y=float(ego_y[frame]),
+        ego_vel_x=float(ego_vel_x[frame]),
+        ego_vel_y=float(ego_vel_y[frame]),
+        ego_length_m=float(ego_length[frame]),
+        object_ids=object_ids,
+        object_types=object_types,
+        valid=np.asarray(record.state.log_trajectory.valid[:, frame]).astype(bool),
+        x=np.asarray(record.state.log_trajectory.x[:, frame]),
+        y=np.asarray(record.state.log_trajectory.y[:, frame]),
+        yaw=np.asarray(record.state.log_trajectory.yaw[:, frame]),
+        vel_x=np.asarray(record.state.log_trajectory.vel_x[:, frame]),
+        vel_y=np.asarray(record.state.log_trajectory.vel_y[:, frame]),
+        length=np.asarray(record.state.log_trajectory.length[:, frame]),
+        config=agent_selection_config,
+    )
+
+    return dict(
+        merge_start_s=merge_start_s,
+        merge_end_s=merge_end_s,
+        merge_start_frame=merge_start_frame,
+        merge_complete_frame=merge_complete_frame,
+        ego_longitudinal_speed_mps=features.ego_longitudinal_speed_mps,
+        merge_distance_m=features.merge_distance_m,
+        front_vehicle_id=features.front_vehicle_id,
+        front_gap_m=features.front_gap_m,
+        front_relative_speed_mps=features.front_relative_speed_mps,
+        front_ttc_s=features.front_ttc_s,
+        rear_vehicle_id=features.rear_vehicle_id,
+        rear_gap_m=features.rear_gap_m,
+        rear_relative_speed_mps=features.rear_relative_speed_mps,
+        rear_ttc_s=features.rear_ttc_s,
+        traffic_density=features.traffic_density,
+    )
+
+
+def reconstruct_transition(
+    record: ScenarioRecord,
+    lane_assignment_config: LaneAssignmentConfig,
+    transition_frame: int,
+    source_lane_id: int,
+    target_lane_id: int,
+    candidate_id: str = "",
+):
+    """Rebuilds the exact ``LaneTransition`` + lane polylines for one
+    stored candidate row, by rerunning the same deterministic pipeline
+    used at scan time: ``extract_lane_polylines`` ->
+    ``assign_ego_lane_sequence`` -> ``compute_stable_lane_sequence`` ->
+    ``find_lane_transitions``.
+
+    The match is against ALL FOUR of (the record itself -- i.e. which
+    ScenarioRecord was loaded, implicitly fixing record_index --
+    transition_frame, source_lane_id, target_lane_id), not
+    transition_index alone (transition_index is not stable input to
+    this match; it is merely the position the transition happened to
+    occupy in one particular scan's output list).
+
+    Returns:
+        (transition, source_polyline, target_polyline, ego_source_arc_length_m)
+
+    Raises:
+        ValueError: if no reconstructed transition matches all four
+            identifying fields.
+    """
+
+    log_trajectory = record.state.log_trajectory
+    sdc_index = record.sdc_index
+
+    ego_x = np.asarray(log_trajectory.x[sdc_index])
+    ego_y = np.asarray(log_trajectory.y[sdc_index])
+    ego_yaw = np.asarray(log_trajectory.yaw[sdc_index])
+    ego_valid = np.asarray(log_trajectory.valid[sdc_index]).astype(bool)
+
+    polylines = extract_lane_polylines(record.state.roadgraph_points)
+    lane_by_id = {polyline.lane_id: polyline for polyline in polylines}
+
+    raw_assignments = assign_ego_lane_sequence(
+        ego_x, ego_y, ego_yaw, ego_valid, polylines, lane_assignment_config
+    )
+    stable_sequence = compute_stable_lane_sequence(
+        raw_assignments,
+        persistence_frames=lane_assignment_config.persistence_frames,
+        max_ambiguous_gap_frames=lane_assignment_config.max_ambiguous_gap_frames,
+    )
+    transitions = find_lane_transitions(
+        stable_sequence,
+        max_bridge_gap_frames=lane_assignment_config.max_ambiguous_gap_frames,
+    )
+
+    match = None
+    for transition in transitions:
+        if (
+            transition.transition_frame == transition_frame
+            and transition.source_lane_id == source_lane_id
+            and transition.target_lane_id == target_lane_id
+        ):
+            match = transition
+            break
+
+    if match is None:
+        raise ValueError(
+            f"Manifest materialization drift detected for "
+            f"candidate_id={candidate_id}: no transition matching "
+            f"record_index={record.record_index}, "
+            f"transition_frame={transition_frame}, "
+            f"source_lane_id={source_lane_id}, "
+            f"target_lane_id={target_lane_id}"
+        )
+
+    source_polyline = lane_by_id.get(match.source_lane_id)
+    target_polyline = lane_by_id.get(match.target_lane_id)
+
+    ego_source_arc_length = None
+    if source_polyline is not None:
+        frame = match.transition_frame
+        projection = project_point_to_polyline(
+            source_polyline, float(ego_x[frame]), float(ego_y[frame])
+        )
+        ego_source_arc_length = projection["arc_length_m"]
+
+    return match, source_polyline, target_polyline, ego_source_arc_length
+
+
 def build_candidate_records(
     record: ScenarioRecord,
     lane_assignment_config: LaneAssignmentConfig,
@@ -332,12 +538,6 @@ def _build_candidate_records_unsafe(
     ego_y = np.asarray(log_trajectory.y[sdc_index])
     ego_yaw = np.asarray(log_trajectory.yaw[sdc_index])
     ego_valid = np.asarray(log_trajectory.valid[sdc_index]).astype(bool)
-    ego_vel_x = np.asarray(log_trajectory.vel_x[sdc_index])
-    ego_vel_y = np.asarray(log_trajectory.vel_y[sdc_index])
-    ego_length = np.asarray(log_trajectory.length[sdc_index])
-
-    object_ids = np.asarray(record.state.object_metadata.ids)
-    object_types = np.asarray(record.state.object_metadata.object_types)
 
     polylines = extract_lane_polylines(record.state.roadgraph_points)
     lane_by_id = {polyline.lane_id: polyline for polyline in polylines}
@@ -392,67 +592,14 @@ def _build_candidate_records_unsafe(
 
         if diagnostic.decision == MergeDecision.ACCEPT:
 
-            merge_start_s, merge_end_s = compute_merge_start_end_s(
-                source_polyline, target_polyline, merge_topology_config
-            )
-            d_m = compute_remaining_merge_distance(
-                merge_end_s, ego_source_arc_length
-            )
-
-            merge_start_frame, merge_complete_frame = _derive_merge_frames(
+            extra = materialize_merge_features(
                 transition,
                 source_polyline,
-                ego_x,
-                ego_y,
-                ego_valid,
-                merge_start_s,
-                merge_end_s,
-            )
-
-            frame = transition.transition_frame
-
-            features = extract_interaction_features(
-                frame_index=frame,
-                target_polyline=target_polyline,
-                merge_distance_m=d_m,
-                ego_id=record.sdc_id,
-                ego_x=float(ego_x[frame]),
-                ego_y=float(ego_y[frame]),
-                ego_vel_x=float(ego_vel_x[frame]),
-                ego_vel_y=float(ego_vel_y[frame]),
-                ego_length_m=float(ego_length[frame]),
-                object_ids=object_ids,
-                object_types=object_types,
-                valid=np.asarray(
-                    record.state.log_trajectory.valid[:, frame]
-                ).astype(bool),
-                x=np.asarray(record.state.log_trajectory.x[:, frame]),
-                y=np.asarray(record.state.log_trajectory.y[:, frame]),
-                yaw=np.asarray(record.state.log_trajectory.yaw[:, frame]),
-                vel_x=np.asarray(record.state.log_trajectory.vel_x[:, frame]),
-                vel_y=np.asarray(record.state.log_trajectory.vel_y[:, frame]),
-                length=np.asarray(
-                    record.state.log_trajectory.length[:, frame]
-                ),
-                config=agent_selection_config,
-            )
-
-            extra = dict(
-                merge_start_s=merge_start_s,
-                merge_end_s=merge_end_s,
-                merge_start_frame=merge_start_frame,
-                merge_complete_frame=merge_complete_frame,
-                ego_longitudinal_speed_mps=features.ego_longitudinal_speed_mps,
-                merge_distance_m=features.merge_distance_m,
-                front_vehicle_id=features.front_vehicle_id,
-                front_gap_m=features.front_gap_m,
-                front_relative_speed_mps=features.front_relative_speed_mps,
-                front_ttc_s=features.front_ttc_s,
-                rear_vehicle_id=features.rear_vehicle_id,
-                rear_gap_m=features.rear_gap_m,
-                rear_relative_speed_mps=features.rear_relative_speed_mps,
-                rear_ttc_s=features.rear_ttc_s,
-                traffic_density=features.traffic_density,
+                target_polyline,
+                ego_source_arc_length,
+                record,
+                merge_topology_config,
+                agent_selection_config,
             )
 
         records.append(
