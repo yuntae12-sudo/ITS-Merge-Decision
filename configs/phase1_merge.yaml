@@ -1,0 +1,261 @@
+# Phase 1 merge-detection thresholds.
+#
+# This file only declares the config schema. Values are populated with
+# concrete numbers in the commits that consume them, after inspecting
+# real scenes -- not guessed up front. lane_assignment values were set
+# in Commit C; merge_topology, event, agent_selection, and traffic
+# remain null until Commit D/E.
+#
+# Every threshold stays null until a commit that consumes it justifies
+# a concrete value from observed data, per the "no hardcoded heuristics"
+# principle for this phase.
+
+lane_assignment:
+  # Maximum lateral distance (m) from a lane polyline for a point to be
+  # considered assigned to that lane.
+  #
+  # Set from Commit C's observation of 5 real WOMD scenes: taking, at
+  # each valid ego frame, the lateral distance of whichever of the 8
+  # nearest-by-vertex lane candidates has the smallest heading
+  # difference from ego, the max across those 5 scenes was ~11.1 m
+  # (scene #4, a wide-radius turn) with most frames well under 5 m.
+  # 5.0 m keeps ordinary lane-width deviation (a WOMD lane is
+  # typically ~3.5 m wide) while still rejecting a physically distant,
+  # unrelated lane; it does reject a handful of real frames in wide
+  # turns, which surface as `lane_id=None` rather than a forced
+  # mismatch (see assign_lane).
+  max_lateral_distance_m: 5.0
+  # Maximum heading difference (deg) between ego heading and lane
+  # direction for a valid lane assignment.
+  #
+  # Set from the same 5-scene observation: the heading difference of
+  # the best-heading-matching nearby candidate was consistently under
+  # 9 degrees (max ~8.3 deg) across all 5 scenes. Directly inspecting
+  # scene #0 frame 0 showed the *nearest-by-distance* lane (215, 0.78 m
+  # away) had a 130-degree heading mismatch against ego (it is a
+  # crossing/opposing lane at an intersection), while the actual
+  # heading-consistent lane (196, 2.50 m away) differed by only 1.08
+  # degrees -- confirming heading rejection is necessary, not just
+  # lateral distance. 45 degrees comfortably passes normal-driving and
+  # moderate-turn frames while rejecting anything resembling a
+  # crossing or opposing lane.
+  max_heading_difference_deg: 45.0
+  # Minimum number of consecutive frames required before accepting a
+  # lane assignment change (hysteresis against boundary jitter).
+  #
+  # WOMD logged trajectories in this dataset run at 10 Hz (91 frames
+  # over a 9s window, confirmed in Phase 0). 5 frames = 0.5 s of
+  # persistent raw assignment before a stable lane change is accepted,
+  # long enough to filter single/double-frame jitter at a lane boundary
+  # (Case 3/4 in tests/scenarios/test_lane_assignment.py) while still
+  # reacting well within a typical multi-second lane change or merge
+  # maneuver.
+  persistence_frames: 5
+  # Maximum consecutive frames with no acceptable lane candidate
+  # (lane_id=None) that the current stable lane is allowed to bridge
+  # over before being dropped back to None.
+  #
+  # Set conservatively equal to persistence_frames (5 frames / 0.5 s):
+  # a short gap (e.g. crossing a sparse map region) shouldn't flip the
+  # stable sequence, but an unbounded bridge would let two potentially
+  # unrelated lanes be silently joined with no supporting evidence.
+  max_ambiguous_gap_frames: 5
+  # Number of nearest-by-vertex-distance lanes shortlisted before exact
+  # segment-projected scoring. 8 was used throughout Commit C's scene
+  # observation (see above) and was always enough to include the true
+  # heading-consistent lane, even at busy intersections with 15+ nearby
+  # lane features.
+  candidate_count: 8
+  # Relative weights combining normalized lateral distance and
+  # normalized heading difference into one score (see
+  # heading_normalization_deg). Left equal since Commit C's
+  # observations did not surface a case needing one term favored over
+  # the other; revisit if Commit D/E scene review finds otherwise.
+  lateral_weight: 1.0
+  heading_weight: 1.0
+  # Scale (deg) heading difference is divided by before weighting, so
+  # it lands on a comparable footing to lateral distance normalized by
+  # max_lateral_distance_m. Matches max_heading_difference_deg.
+  heading_normalization_deg: 45.0
+
+merge_topology:
+  # Maximum remaining source-lane arc length (m), measured from ego's
+  # source-lane projection at the transition frame to the source
+  # lane's travel-direction endpoint, for a transition to even be
+  # considered near the source lane's end.
+  #
+  # Set from Commit D's observation of 16 stable transitions across 10
+  # real WOMD scenes (record_index 0-9): ego's remaining source-lane
+  # distance at the transition frame was 0.00 m for 14/16 transitions
+  # (ego reaches the exact source-lane endpoint before switching) and
+  # 10.79 m / 3.77 m for the other two (196->206 in scene 0, 256->257
+  # in scene 7). 15.0 m comfortably covers all 16 observed transitions
+  # while still requiring the transition to happen near the source
+  # lane's end, not mid-lane.
+  max_source_end_distance_m: 15.0
+  # Maximum distance (m) between the source lane's travel-direction
+  # endpoint and the target lane polyline (via exact segment
+  # projection) for a transition to be considered a
+  # convergence/merge rather than two unrelated lanes.
+  #
+  # Set from the same 16-transition observation: 14/16 transitions had
+  # the source endpoint land with lateral_distance == 0.00 m onto the
+  # target polyline (serial map-segment continuation -- see
+  # source_lane_ends / serial_continuation gates for how these are
+  # separately rejected). The two non-zero cases were 46.67 m
+  # (196->206, where the source endpoint projects onto the target's
+  # OWN endpoint at the far end of a much longer target lane -- see
+  # min_convergence_length_m) and 4.43 m / 10.92 m for the record-7
+  # short-segment intersection chain (256->257, 257->262), which this
+  # Commit's synthetic + real validation treats as ambiguous, not a
+  # confirmed merge. 5.0 m is set to accept only genuinely close
+  # convergence (comparable to lane_assignment's own
+  # max_lateral_distance_m), explicitly rejecting the record-7
+  # 4.43 m/10.92 m cases as insufficiently converged rather than
+  # loosening the threshold to force them through.
+  max_endpoint_target_distance_m: 5.0
+  # Maximum heading difference (deg) between the source lane's own
+  # heading at its endpoint and the target lane's heading at the point
+  # the source endpoint projects onto.
+  #
+  # Set from the same observation: every one of the 16 transitions had
+  # a heading difference under 1.1 degrees (the four record-0
+  # transitions were all within 0.06 deg; see Design Decisions). This
+  # is far tighter than lane_assignment's 45 deg because here both
+  # lanes are already known to be geometrically adjacent -- a large
+  # heading mismatch at that point would mean a crossing/unrelated
+  # lane, not a merge. 20 degrees is used to allow realistic
+  # convergence-angle variation beyond what was observed in these
+  # mostly-straight scenes, while still rejecting anything resembling
+  # a crossing lane (Case 4 in tests/scenarios/test_merge_detector.py
+  # uses a 90 degree crossing case well outside this threshold).
+  max_heading_difference_deg: 20.0
+  # Longitudinal window (m) upstream of the source lane's endpoint over
+  # which convergence (decreasing source-target separation) is
+  # sampled and evaluated.
+  #
+  # Set from Commit D's synthetic geometry design (Case 1/2/5 in
+  # tests/scenarios/test_merge_detector.py) together with the observed
+  # WOMD source-lane lengths (mean ~30-55 m per scene, Commit D scene
+  # survey): 30 m is short enough to fit within a typical WOMD lane
+  # segment's own length while long enough to distinguish a
+  # meaningfully converging approach from a short-range coincidence.
+  convergence_window_m: 30.0
+  # Number of points sampled across convergence_window_m (inclusive of
+  # both ends) when measuring the separation trend.
+  #
+  # 7 gives 5 m spacing over the 30 m window -- fine enough to catch
+  # the shape of convergence in the synthetic cases without being
+  # sensitive to per-point roadgraph sampling noise.
+  convergence_sample_count: 7
+  # Minimum reduction (m) in source-target separation from the start
+  # of convergence_window_m to the source lane's endpoint, required to
+  # call the transition a convergence rather than parallel
+  # continuation.
+  #
+  # Set from the synthetic parallel-lane case (Case 2), which has
+  # ~0 m reduction by construction, versus the synthetic true-merge
+  # case (Case 1), which was designed with several meters of
+  # reduction. 2.0 m rejects near-constant separation while accepting
+  # any real geometric convergence.
+  min_separation_reduction_m: 2.0
+  # Minimum fraction of consecutive sampled steps (within
+  # convergence_window_m) that must show decreasing separation, so a
+  # single noisy sample near the end doesn't pass a lane that is
+  # otherwise flat.
+  #
+  # 0.6 (at least 60% of steps decreasing) tolerates the kind of
+  # sampling noise this project has already had to code around in
+  # lane_geometry.py (roadgraph points are not perfectly smooth),
+  # while still requiring most of the approach to show convergence,
+  # not just the final sample.
+  min_decreasing_fraction: 0.6
+  # Serial-vs-merge ambiguity threshold (see merge_detector.py module
+  # docstring "Serial-vs-merge ambiguity" for the full investigation):
+  # a source endpoint landing within this lateral distance of the
+  # target polyline is flagged REVIEW (ambiguous_serial_or_merge)
+  # rather than confidently ACCEPTed or REJECTed, because available
+  # roadgraph geometry cannot reliably tell serial map-segment
+  # continuation apart from a true merge whose target WOMD feature
+  # happens to begin exactly at the convergence point.
+  #
+  # Set from a 30-scene/38-transition survey: every confirmed serial
+  # continuation case landed with EXACTLY 0.000 m lateral offset here,
+  # while the one true merge-like candidate found (record 28, lane
+  # 485->344) landed 2.14 m off target -- comfortably inside
+  # max_endpoint_target_distance_m (5.0 m, this study's "plausibly
+  # converging" band) but well outside this much tighter "essentially
+  # on top of it" band. Two additional candidate signals (terminal
+  # collinearity with the target's own tangent, and the upstream
+  # source-target separation trend) were investigated as ways to
+  # narrow this ambiguous band further and found NOT to reliably
+  # distinguish the two cases with this dataset's geometry (both
+  # confirmed serial cases and the one true merge can show large
+  # upstream separation shrinking to near zero at the endpoint, and
+  # collinearity is unreliable whenever the target lane is long or
+  # curved) -- see the module docstring for the detailed investigation.
+  # They remain exposed on MergeDiagnostic as manual-review context
+  # (max_collinear_offset_m, upstream_separation_m) but are not used to
+  # decide ACCEPT/REJECT/REVIEW.
+  serial_continuation_max_lateral_m: 0.5
+
+event:
+  # Minimum number of consecutive stable frames ego must have been on
+  # the source lane before the transition frame, for the pre-merge
+  # history to be considered established (vs. an already-short/partial
+  # source run at the very start of the trajectory).
+  #
+  # Set equal to lane_assignment.persistence_frames (5): a source run
+  # shorter than what stable-lane persistence itself requires cannot
+  # be a meaningful pre-merge baseline.
+  min_pre_merge_frames: 5
+  # Minimum number of consecutive stable frames ego must remain on the
+  # target lane after the transition for target persistence to be
+  # confirmed (Gate 6). Also equal to persistence_frames, for the same
+  # reason: this is exactly what compute_stable_lane_sequence already
+  # required to accept the target lane as stable in the first place,
+  # so this gate is mostly a restatement/safety check using the
+  # transition's own target_start/target_end_frame span, not a new
+  # independent number.
+  min_target_lane_frames: 5
+
+agent_selection:
+  # Maximum lateral distance (m) from the target lane centerline for a
+  # surrounding agent to be considered a target-lane front/rear
+  # candidate. Matches lane_assignment.max_lateral_distance_m: the
+  # same "how far off a lane centerline can a vehicle be and still
+  # count as occupying that lane" judgment applies to a surrounding
+  # agent as it does to ego.
+  max_target_lane_lateral_distance_m: 5.0
+  # Maximum heading difference (deg) between a candidate agent's own
+  # yaw and the target lane's local heading at that agent's
+  # projection, for it to be considered a target-lane front/rear
+  # candidate.
+  #
+  # Fix (fix commit): lateral-distance filtering alone can select a
+  # crossing or opposite-direction vehicle at an intersection that
+  # happens to sit close to the target centerline. Set by inspecting
+  # 180 valid vehicle observations across 10 real WOMD scenes (each
+  # vehicle's heading difference against its own nearest lane, for
+  # lanes within 3 m): p50 was 0.6 deg, p90 was 5.1 deg, but p99 jumped
+  # to 150 deg and the max was 178 deg -- a clear bimodal split between
+  # aligned traffic and crossing/opposite-direction vehicles that
+  # happen to sit near a lane. 45 degrees matches
+  # lane_assignment.max_heading_difference_deg's convention (comfortably
+  # passes the aligned-traffic mode's p90 of ~5 deg, firmly rejects the
+  # crossing/opposite-direction mode starting at ~150 deg).
+  max_target_lane_heading_difference_deg: 45.0
+  # Maximum longitudinal search distance (m), in target-lane arc
+  # length, for front/rear candidates. Set generously relative to the
+  # observed WOMD lane lengths in this study (mean ~30-55 m per scene,
+  # max ~400 m) so a genuine front/rear vehicle several lane-segments
+  # away is not missed, while still bounding the search.
+  max_distance_m: 100.0
+
+traffic:
+  # Radius (m) used to compute local traffic density around ego (count
+  # of valid vehicle agents within this radius). 50 m is a simple,
+  # generous neighborhood radius for an analysis/context variable (not
+  # part of the planned 8D policy state), comparable to the
+  # max_distance_m front/rear search above.
+  density_radius_m: 50.0
