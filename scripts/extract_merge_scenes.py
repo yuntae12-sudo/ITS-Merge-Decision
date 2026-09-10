@@ -10,20 +10,42 @@ candidates -- flattening everything into one row per transition via
 
     - ``--output`` (default data/manifests/merge_candidates.csv): the
       full candidate manifest, across all scanned shards.
-    - ``outputs/phase1/summaries/merge_scan_summary.json``: shard-aware
-      summary -- a ``global`` section (aggregate counts across all
-      shards) and a ``per_shard`` section (one entry per physical
-      shard scanned).
-    - ``outputs/phase1/summaries/merge_scan_failures.json``: only
-      written if one or more scenes raised an exception during
-      candidate-building (isolated per-scene, never crashes the batch)
-      or one or more physical shards could not be opened/parsed at all
-      (isolated per-shard, never crashes the whole multi-shard scan).
+    - ``--summary-dir`` (default outputs/phase1/summaries; falls back
+      to ``--output``'s parent directory if ``--summary-dir`` is not
+      given AND ``--output`` was overridden from its default -- see
+      below) / ``merge_scan_summary.json``: shard-aware summary -- a
+      ``global`` section (aggregate counts across all shards) and a
+      ``per_shard`` section (one entry per physical shard scanned).
+    - same directory / ``merge_scan_failures.json``: only written if
+      one or more scenes raised an exception during candidate-building
+      (isolated per-scene, never crashes the batch) or one or more
+      physical shards could not be opened/parsed at all (isolated per
+      -shard, never crashes the whole multi-shard scan).
 
 ``--limit-scenes``/``--start-record`` apply to the TOTAL scan across
 all shards in this invocation, not per-shard: ``--limit-scenes N``
 stops after N scenes total, scanning shard by shard in the dataset
 config's sorted shard order (see ``iter_all_shards``).
+
+IMPORTANT -- avoiding summary collisions across separate scan runs
+(e.g. one training-shard scan and one validation-shard scan): the
+scan summary JSON is a small, separately-named artifact from the
+candidates CSV, so two runs that don't pass distinct summary
+locations will silently overwrite each other's summary (the
+candidates CSV is unaffected since ``--output`` already requires an
+explicit distinct path or ``--overwrite``). Always pass an explicit
+``--summary-dir`` (or rely on the ``--output``-parent fallback) that
+is unique per run, e.g.:
+
+    python scripts/extract_merge_scenes.py \\
+        --dataset-config outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml \\
+        --output outputs/phase1/training_10shard_pilot/merge_candidates_training_10shard.csv \\
+        --summary-dir outputs/phase1/training_10shard_pilot
+
+    python scripts/extract_merge_scenes.py \\
+        --dataset-config outputs/phase1/feature_reference_fix/dataset_validation_6shard.yaml \\
+        --output outputs/phase1/feature_reference_fix/merge_candidates_6shard_postfix.csv \\
+        --summary-dir outputs/phase1/feature_reference_fix
 
 Example:
     python scripts/extract_merge_scenes.py --limit-scenes 30 --overwrite
@@ -56,6 +78,29 @@ DEFAULT_OUTPUT = "data/manifests/merge_candidates.csv"
 DEFAULT_SUMMARY_DIR = "outputs/phase1/summaries"
 
 
+def resolve_summary_dir(summary_dir_arg, output_arg, output_path):
+    """Resolves the directory the scan summary (and failures) JSON is
+    written to, so two ``extract_merge_scenes.py`` invocations with
+    distinct ``--output`` paths (e.g. a training-shard scan and a
+    validation-shard scan) don't collide on a shared fixed summary
+    location.
+
+    Precedence:
+      1. ``--summary-dir``, if explicitly given -- always wins.
+      2. If ``--output`` was overridden from ``DEFAULT_OUTPUT``,
+         default to ``output_path``'s parent directory (i.e. co-locate
+         the summary with the candidates CSV it describes).
+      3. Otherwise (both left at defaults), fall back to
+         ``DEFAULT_SUMMARY_DIR`` for backward compatibility.
+    """
+
+    if summary_dir_arg is not None:
+        return Path(summary_dir_arg)
+    if output_arg != DEFAULT_OUTPUT:
+        return output_path.parent
+    return Path(DEFAULT_SUMMARY_DIR)
+
+
 def parse_args():
 
     parser = argparse.ArgumentParser(
@@ -77,6 +122,22 @@ def parse_args():
     parser.add_argument("--limit-scenes", type=int, default=None)
     parser.add_argument("--start-record", type=int, default=0)
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--summary-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory to write merge_scan_summary.json (and "
+            "merge_scan_failures.json, if any) into. Defaults to "
+            "outputs/phase1/summaries for backward compatibility "
+            "UNLESS --output was overridden from its default, in "
+            "which case it defaults to --output's parent directory "
+            "so two runs with distinct --output paths naturally get "
+            "distinct, non-colliding summary outputs. Pass this "
+            "explicitly to pin the summary location regardless of "
+            "--output."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
 
     return parser.parse_args()
@@ -249,12 +310,14 @@ def main():
     # already computed inside global_summary by
     # compute_summary_statistics (reused, not recomputed here).
 
-    summary_path = Path(DEFAULT_SUMMARY_DIR) / "merge_scan_summary.json"
+    summary_dir = resolve_summary_dir(args.summary_dir, args.output, output_path)
+
+    summary_path = summary_dir / "merge_scan_summary.json"
     write_summary_json(summary, summary_path)
     print(f"Wrote scan summary   : {summary_path}")
 
     if scene_failures or shard_failures:
-        failures_path = Path(DEFAULT_SUMMARY_DIR) / "merge_scan_failures.json"
+        failures_path = summary_dir / "merge_scan_failures.json"
         write_summary_json(
             {"scene_failures": scene_failures, "shard_failures": shard_failures},
             failures_path,
