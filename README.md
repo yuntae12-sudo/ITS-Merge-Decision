@@ -21,7 +21,20 @@ Behavior Decision
 비교 평가
 ```
 
-현재 Repository는 Phase 0 (환경 구성 및 기본 파이프라인 검증) 상태이다.
+## Phase Status
+
+| Phase | 내용 | 상태 |
+|---|---|---|
+| Phase 0 | Waymax/WOMD 환경 구성 및 기본 파이프라인(scene loading, state 추출, rollout) 검증 | **COMPLETE** |
+| Phase 1 | Merge scenario 탐지, 검증, training/validation pool 구성, feature reference materialization, 재현성 검증 | **COMPLETE** |
+| Phase 2 | PPO 환경 + State/Action/Reward 설계 및 학습 | **NOT STARTED** |
+
+Phase 1 종료 시점 최종 판정 (상세는 [Phase 1 Final Verdict](#phase-1-final-verdict) 참고):
+
+```
+PHASE1_EXIT: APPROVED
+NEXT: READY_FOR_PHASE2
+```
 
 ## Phase 0 Goal
 
@@ -169,8 +182,35 @@ WOMD 로그 데이터에서 "차선 합류(merge)" 상황을 자동으로 탐지
 transition에 대해 Phase 3 PPO/FSM 공통 상태(8D interaction feature)의 원형이 되는
 raw interaction feature(front/rear gap, relative speed, TTC, merge distance,
 traffic density 등)를 추출하여, Phase 2 PPO 개발에 사용할 학습 pool과
-초기 held-out 검증 pool을 구성하는 것이 Phase 1의 목표다. 이 문서는 Phase 1의
-최종(Stage C) 상태를 기록한다.
+초기 held-out 검증 pool을 구성하는 것이 Phase 1의 목표다. Phase 2(State/Action/
+Reward 설계 및 PPO 학습)는 이 문서 작성 시점 기준 아직 시작되지 않았다. 이 문서는
+Phase 1의 최종(Stage C) 상태를 기록한다.
+
+## Pipeline
+
+```
+WOMD Shards
+    ↓
+Scene Loading
+    ↓
+Stable Lane Transition Extraction
+    ↓
+Merge Candidate Detection (ACCEPT / REVIEW / REJECT)
+    ↓
+Visual Validation
+    ↓
+Physical Maneuver Grouping
+    ↓
+Unique Merge Scene Construction
+    ↓
+Feature Reference Materialization (merge_start_frame)
+    ↓
+Training / Validation Pool
+```
+
+Detector는 개별 **lane transition** 단위로 동작하지만, 최종 pool을 구성할 때는
+transition / maneuver / scene 세 단위를 절대 혼용하지 않는다 (자세한 정의는
+[Transition vs Maneuver vs Scene](#transition-vs-maneuver-vs-scene) 참고).
 
 ## Shards Used
 
@@ -313,21 +353,49 @@ python scripts/extract_merge_scenes.py \
 이 파일의 체크섬은 변경되지 않았다 (Stage C 최종 확인:
 md5=`1f0071fb436396767d8fb79319016fb1`).
 
-## Known Limitations / Deferred Phase 2 Items
+## Phase 1 Final Verdict
 
-다음 항목은 Phase 1에서 의도적으로 구현하지 않고 Phase 2로 이월한다:
+Stage C 종료 평가 결과:
 
-1. PPO state 전처리에서 음수 `front_gap_m`을 어떻게 다룰지 결정 필요 (clamp할지,
-   그대로 사용할지, 별도 피처로 인코딩할지).
-2. 음수 ego longitudinal speed가 관측된 1건(`...00009-of-01000#204`)의 의미를
+```
+MERGE_DETECTOR       VALID
+TRAINING_POOL        SUFFICIENT_FOR_INITIAL_PHASE2_DEVELOPMENT
+VALIDATION_POOL      USABLE_AS_INITIAL_HELD_OUT_SET
+FEATURE_REFERENCE    VALID
+REPRODUCIBILITY      CONFIRMED
+
+PHASE1_EXIT          APPROVED
+NEXT                 READY_FOR_PHASE2
+```
+
+`TRAINING_POOL: SUFFICIENT_FOR_INITIAL_PHASE2_DEVELOPMENT`는 157개 scene이
+**초기 Phase 2 개발을 시작하기에 충분**하다는 의미이며, 최종 PPO 성능이나
+논문 수준 통계적 결론을 보장한다는 의미가 아니다. 마찬가지로
+`VALIDATION_POOL: USABLE_AS_INITIAL_HELD_OUT_SET`은 현재 validation pool을
+초기 held-out 셋으로 사용할 수 있다는 의미일 뿐, 최종 논문 수준 통계적 결론에
+충분한 규모라는 의미는 아니다.
+
+## Phase 2 Handoff
+
+Phase 2는 이 문서 작성 시점 기준 **아직 구현되지 않았다**. 다음 작업은
+"Phase 2 — PPO Environment / State / Action / Reward Design"에서 시작한다.
+
+Phase 1에서 의도적으로 구현하지 않고 이월한 미해결(비차단) 항목:
+
+1. PPO state 전처리에서 음수 `front_gap_m`을 어떻게 다룰지 결정 (clamp할지,
+   그대로 사용할지, 별도 피처로 인코딩할지) — [Negative front_gap_m audit](#negative-front_gap_m-audit-stage-c) 참고.
+2. 음수 ego longitudinal speed가 관측된 1건
+   (`training_tfexample.tfrecord-00009-of-01000#204__t62__121_83`)의 의미를
    먼저 조사한 뒤 clamp 여부를 결정할 것 — 맹목적으로 clamp하지 말 것.
-3. 논문 수준 최종 FSM-vs-PPO 평가 전에 validation pool 확장을 고려할 것 (현재
+3. PPO State representation을 구체적으로 정의할 것.
+4. Merge 행동 결정을 위한 PPO Action space를 정의할 것.
+5. Reward term 및 safety penalty를 설계할 것.
+6. 학습 episode/reset/scenario sampling 정책을 정의할 것.
+7. 논문 수준 최종 FSM-vs-PPO 평가 전에 validation pool 확장을 고려할 것 (현재
    6-shard/1755-scene pool은 초기 개발용).
-4. Training yield(예: ACCEPT/100)와 validation yield(예: ACCEPT/100)를 직접
+8. Training yield(예: ACCEPT/100)와 validation yield(예: ACCEPT/100)를 직접
    비교 가능한 통계적 비율로 해석하지 말 것 — training pool 구성 시 사용된
    분모는 "transition이 존재하는 scene 수" 근사치이며, validation의
    "스캔된 WOMD scene 수"와 동일한 정의가 아니다.
 
-## Next Phase
-
-**Phase 2: PPO Policy Development** (not started)
+이 항목들은 Phase 1에서 구현하지 않으며, Phase 2 착수 시 참고용 메모다.
