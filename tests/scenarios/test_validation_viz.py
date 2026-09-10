@@ -252,3 +252,67 @@ def test_case_l_sanitized_filenames_stay_collision_free_across_shards():
     filename_b = sanitize_candidate_id_for_filename(row_b["candidate_id"]) + ".png"
 
     assert filename_a != filename_b
+
+
+# ---------------------------------------------------------------------
+# Fix commit regression: render_merge_validation.py must fail loudly
+# (before building any Waymax config or loading any scenario) when a
+# candidate row's source_split disagrees with the supplied dataset
+# expansion config's split -- resolved via the shared
+# resolve_physical_shard, never a hardcoded data/womd/<split>/<file>
+# convention.
+# ---------------------------------------------------------------------
+
+
+def test_renderer_split_mismatch_fails_before_loading(tmp_path):
+    from src.scenarios.scenario_loader import (
+        DatasetExpansionConfig,
+        resolve_physical_shard,
+    )
+
+    fake_shard = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    fake_shard.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(fake_shard)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    # Row claims source_split="training" -- disagrees with the
+    # expansion config's split="validation".
+    with pytest.raises(ValueError, match="source_split mismatch"):
+        resolve_physical_shard(
+            expansion_config,
+            source_shard="validation_tfexample.tfrecord-00000-of-00150",
+            source_split="training",
+        )
+
+
+def test_renderer_unknown_shard_no_hardcoded_fallback(tmp_path):
+    from src.scenarios.scenario_loader import (
+        DatasetExpansionConfig,
+        resolve_physical_shard,
+    )
+
+    fake_shard = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    fake_shard.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(fake_shard)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    with pytest.raises(ValueError, match="Unknown shard"):
+        resolve_physical_shard(
+            expansion_config,
+            source_shard="some_other_shard.tfrecord-00001-of-00150",
+            source_split="validation",
+        )

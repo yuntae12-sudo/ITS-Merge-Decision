@@ -25,6 +25,8 @@ from src.scenarios.scenario_loader import (
     DatasetExpansionConfig,
     build_waymax_config,
     load_dataset_config,
+    resolve_physical_shard,
+    select_single_shard_for_inspection,
 )
 
 
@@ -312,3 +314,264 @@ def test_case_b_identical_transition_metadata_different_shards_distinct_candidat
     assert candidate_id_a != candidate_id_b
     assert candidate_id_a == "validation_tfexample.tfrecord-00000-of-00150#28__t50__485_344"
     assert candidate_id_b == "validation_tfexample.tfrecord-00005-of-00150#28__t50__485_344"
+
+
+
+# ---------------------------------------------------------------------
+# resolve_physical_shard (fix commit: harden multi-shard inspection and
+# shard reload safety). All multi-shard cases here are SYNTHETIC --
+# only one real physical WOMD shard exists locally
+# (data/womd/validation/validation_tfexample.tfrecord-00000-of-00150),
+# so multi-shard resolution is exercised via in-memory
+# DatasetExpansionConfig construction, never by copying the real 770MB
+# file.
+# ---------------------------------------------------------------------
+
+
+def test_resolve_one_shard_config_no_split_filter(tmp_path):
+    fake_shard = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    fake_shard.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(fake_shard)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    resolved = resolve_physical_shard(
+        expansion_config,
+        source_shard="validation_tfexample.tfrecord-00000-of-00150",
+    )
+    assert resolved == str(fake_shard)
+
+
+def test_resolve_multi_shard_exact_match(tmp_path):
+    shard_a = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    shard_b = tmp_path / "validation_tfexample.tfrecord-00005-of-00150"
+    shard_a.write_text("fake")
+    shard_b.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(shard_a), str(shard_b)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    resolved = resolve_physical_shard(
+        expansion_config,
+        source_shard="validation_tfexample.tfrecord-00005-of-00150",
+    )
+    assert resolved == str(shard_b)
+
+
+def test_resolve_multi_shard_no_match_raises_no_fallback(tmp_path):
+    shard_a = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    shard_a.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(shard_a)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    with pytest.raises(ValueError, match="Unknown shard"):
+        resolve_physical_shard(
+            expansion_config,
+            source_shard="validation_tfexample.tfrecord-00099-of-00150",
+        )
+
+
+def test_resolve_duplicate_basename_raises_ambiguous(tmp_path):
+    dir_a = tmp_path / "A"
+    dir_b = tmp_path / "B"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    path_a = dir_a / "foo.tfrecord"
+    path_b = dir_b / "foo.tfrecord"
+    path_a.write_text("fake")
+    path_b.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(path_a), str(path_b)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    with pytest.raises(ValueError, match="Ambiguous shard"):
+        resolve_physical_shard(expansion_config, source_shard="foo.tfrecord")
+
+
+def test_resolve_split_mismatch_raises_before_path_work(tmp_path):
+    # Deliberately reference a shard basename that does not exist
+    # anywhere in shard_paths -- if the split check did NOT fire first,
+    # this would instead raise the "Unknown shard" error. Asserting the
+    # split-mismatch message proves the split check runs before any
+    # path matching is attempted.
+    fake_shard = tmp_path / "training_tfexample.tfrecord-00000-of-01000"
+    fake_shard.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(fake_shard)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    with pytest.raises(ValueError, match="source_split mismatch"):
+        resolve_physical_shard(
+            expansion_config,
+            source_shard="this_basename_does_not_exist_anywhere.tfrecord",
+            source_split="training",
+        )
+
+
+def test_resolve_custom_arbitrary_path_no_hardcoded_convention():
+    """Proves resolve_physical_shard uses ONLY expansion_config.shard_paths
+    -- never a hardcoded data/womd/<split>/<file> convention. Uses a
+    fabricated path that does not exist on disk (pure path-matching
+    logic; resolve_physical_shard never touches the filesystem itself,
+    only DatasetExpansionConfig.shard_paths as already-resolved
+    in-memory strings)."""
+
+    custom_path = "/mnt/custom/location/training_tfexample.tfrecord-00003-of-01000"
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="training",
+        shard_paths=[custom_path],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    resolved = resolve_physical_shard(
+        expansion_config,
+        source_shard="training_tfexample.tfrecord-00003-of-01000",
+        source_split="training",
+    )
+    assert resolved == custom_path
+
+
+# ---------------------------------------------------------------------
+# select_single_shard_for_inspection (shared CLI shard-selection
+# helper used by inspect_lane_geometry.py / inspect_ego_lane_sequence.py
+# / inspect_merge_candidate.py).
+# ---------------------------------------------------------------------
+
+
+def test_select_single_shard_auto_selects_when_only_one_configured(tmp_path):
+    fake_shard = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    fake_shard.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(fake_shard)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    resolved = select_single_shard_for_inspection(expansion_config)
+    assert resolved == str(fake_shard)
+
+
+def test_select_single_shard_explicit_source_shard_multi_config(tmp_path):
+    shard_a = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    shard_b = tmp_path / "validation_tfexample.tfrecord-00005-of-00150"
+    shard_a.write_text("fake")
+    shard_b.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(shard_a), str(shard_b)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    resolved = select_single_shard_for_inspection(
+        expansion_config,
+        source_shard="validation_tfexample.tfrecord-00005-of-00150",
+    )
+    assert resolved == str(shard_b)
+
+
+def test_select_single_shard_multi_config_no_source_shard_raises_ambiguous(tmp_path):
+    shard_a = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    shard_b = tmp_path / "validation_tfexample.tfrecord-00005-of-00150"
+    shard_a.write_text("fake")
+    shard_b.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(shard_a), str(shard_b)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    with pytest.raises(ValueError, match="ambiguous") as exc_info:
+        select_single_shard_for_inspection(expansion_config, record_index=28)
+
+    message = str(exc_info.value)
+    assert "validation_tfexample.tfrecord-00000-of-00150" in message
+    assert "validation_tfexample.tfrecord-00005-of-00150" in message
+
+
+def test_select_single_shard_unknown_source_shard_raises(tmp_path):
+    fake_shard = tmp_path / "validation_tfexample.tfrecord-00000-of-00150"
+    fake_shard.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(fake_shard)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    with pytest.raises(ValueError, match="Unknown shard"):
+        select_single_shard_for_inspection(
+            expansion_config, source_shard="does_not_exist.tfrecord"
+        )
+
+
+def test_select_single_shard_duplicate_basename_raises(tmp_path):
+    dir_a = tmp_path / "A"
+    dir_b = tmp_path / "B"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    path_a = dir_a / "foo.tfrecord"
+    path_b = dir_b / "foo.tfrecord"
+    path_a.write_text("fake")
+    path_b.write_text("fake")
+
+    expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(path_a), str(path_b)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    with pytest.raises(ValueError, match="Ambiguous shard"):
+        select_single_shard_for_inspection(expansion_config, source_shard="foo.tfrecord")

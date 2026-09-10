@@ -226,6 +226,140 @@ def load_dataset_config(config_path: str) -> DatasetExpansionConfig:
     )
 
 
+def resolve_physical_shard(
+    expansion_config: "DatasetExpansionConfig",
+    source_shard: str,
+    source_split: Optional[str] = None,
+) -> str:
+    """Resolves a stable shard filename to its exact configured physical path.
+
+    This is the ONLY place shard-filename matching logic should live.
+    Every caller that needs to turn a stored ``source_shard`` basename
+    (e.g. from a candidates/manifest CSV row) back into a real physical
+    file must go through this function -- never re-implement path
+    -guessing/matching (e.g. a hardcoded ``data/womd/<split>/<file>``
+    convention) elsewhere.
+
+    Args:
+        expansion_config: DatasetExpansionConfig -- the authority for
+            what physical files are available
+            (``expansion_config.shard_paths``).
+        source_shard: the stable basename identity (e.g.
+            "validation_tfexample.tfrecord-00003-of-00150") to resolve
+            -- NEVER an absolute path; this is the machine-independent
+            candidate identity stored in CSVs.
+        source_split: if given, must match ``expansion_config.split``,
+            else raise immediately (before any path resolution) -- this
+            protects against materializing/rendering a "training"
+            candidate row against a "validation" expansion config or
+            vice versa.
+
+    Returns:
+        The exact resolved physical path (str) from
+        ``expansion_config.shard_paths`` whose basename equals
+        ``source_shard``.
+
+    Raises:
+        ValueError: if ``source_split`` is given and disagrees with
+            ``expansion_config.split`` (checked FIRST, before touching
+            paths).
+        ValueError: if zero paths in ``expansion_config.shard_paths``
+            have that basename (unknown shard -- no fallback to any
+            local-layout convention like ``data/womd/<split>/<filename>``
+            is ever attempted).
+        ValueError: if more than one path shares that basename
+            (ambiguous duplicate basename -- does NOT silently pick the
+            first).
+    """
+
+    if source_split is not None and source_split != expansion_config.split:
+        raise ValueError(
+            f"source_split mismatch: candidate row has "
+            f"source_split={source_split!r} but the supplied dataset "
+            f"expansion config has split={expansion_config.split!r}. "
+            "Refusing to resolve a shard path across mismatched splits."
+        )
+
+    matches = [
+        path
+        for path in expansion_config.shard_paths
+        if Path(path).name == source_shard
+    ]
+
+    if not matches:
+        available = sorted(
+            Path(path).name for path in expansion_config.shard_paths
+        )
+        raise ValueError(
+            f"Unknown shard: source_shard={source_shard!r} does not "
+            "match the basename of any physical path in this dataset "
+            f"expansion config's shard_paths. Available shard(s): "
+            f"{available}. No fallback to any local-layout convention "
+            "(e.g. data/womd/<split>/<filename>) is attempted."
+        )
+
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous shard: source_shard={source_shard!r} matches "
+            f"{len(matches)} distinct physical paths in "
+            f"expansion_config.shard_paths: {sorted(matches)}. Refusing "
+            "to silently pick one."
+        )
+
+    return matches[0]
+
+
+def select_single_shard_for_inspection(
+    expansion_config: DatasetExpansionConfig,
+    source_shard: Optional[str] = None,
+    record_index: Optional[int] = None,
+) -> str:
+    """Shared CLI shard-selection policy for single-scene inspection tools
+    (``inspect_lane_geometry.py``, ``inspect_ego_lane_sequence.py``,
+    ``inspect_merge_candidate.py``).
+
+    Policy (identical across all three scripts -- implemented once here
+    so it is not triplicated in each CLI):
+
+    - Config resolves to exactly 1 physical shard AND ``source_shard``
+      omitted -> use that one shard automatically (backward compatible
+      with the legacy single-shard config/CLI usage).
+    - Config resolves to multiple shards AND ``source_shard`` given ->
+      resolve via ``resolve_physical_shard``, use it.
+    - Config resolves to multiple shards AND ``source_shard`` omitted
+      -> FAIL LOUDLY listing all available shard basenames.
+    - ``source_shard`` given but doesn't match any configured shard ->
+      error via ``resolve_physical_shard``'s unknown-shard ValueError.
+    - Multiple resolved paths share the same basename -> ambiguity
+      error via ``resolve_physical_shard``.
+
+    Returns:
+        The exact resolved physical shard path (str).
+
+    Raises:
+        ValueError: ambiguous record_index selection (multiple shards,
+            no --source-shard given), or any error raised by
+            ``resolve_physical_shard``.
+    """
+
+    if source_shard is None:
+        if len(expansion_config.shard_paths) == 1:
+            return expansion_config.shard_paths[0]
+
+        available = sorted(
+            Path(path).name for path in expansion_config.shard_paths
+        )
+        idx_str = "<idx>" if record_index is None else str(record_index)
+        raise ValueError(
+            f"Dataset config contains {len(expansion_config.shard_paths)} "
+            f"physical shards. --record-index={idx_str} is ambiguous "
+            "because record_index is shard-local. Pass --source-shard "
+            "with one of:\n  " + "\n  ".join(available)
+        )
+
+    return resolve_physical_shard(expansion_config, source_shard=source_shard)
+
+
 def build_waymax_config(
     expansion_config: DatasetExpansionConfig, physical_shard_path: str
 ) -> waymax_config.DatasetConfig:

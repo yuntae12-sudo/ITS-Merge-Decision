@@ -60,10 +60,10 @@ from src.scenarios.lane_assignment import load_lane_assignment_config
 from src.scenarios.merge_detector import detect_merge, load_merge_topology_config
 from src.scenarios.scenario_features import load_agent_selection_config
 from src.scenarios.scenario_loader import (
-    DatasetExpansionConfig,
     build_waymax_config,
     iter_scenarios,
     load_dataset_config,
+    resolve_physical_shard,
 )
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
@@ -309,25 +309,6 @@ def _to_float_or_blank(value):
     return float(value)
 
 
-def _default_shard_path(source_split: str, source_shard: str) -> str:
-    """Derives the physical shard file path for a (source_split,
-    source_shard) pair recorded in a candidates/manifest CSV row.
-
-    This mirrors this study's single local data layout
-    (``data/womd/<split>/<shard file>``, see ``configs/dataset.yaml``
-    and README.md) -- generalized from one hardcoded split/file to any
-    (split, filename) pair actually referenced by the input CSV. This
-    is deliberately simple (no new CLI flag / expansion-config file
-    needed to reload an arbitrary shard): the manifest builder only
-    ever needs to reconstruct a shard whose (split, filename) already
-    appears in a CSV row it read, and this layout is exactly what
-    ``scenario_loader``'s own legacy single-path config and the new
-    ``shards``/``shard_glob`` schema already assume.
-    """
-
-    return str(Path("data") / "womd" / source_split / source_shard)
-
-
 def materialize_confirmed_rows(
     candidate_rows,
     confirmed_ids,
@@ -344,27 +325,37 @@ def materialize_confirmed_rows(
     record_index alone -- since two different physical shards can
     legitimately share the same record_index. For each distinct
     (source_split, source_shard) pair referenced by any confirmed
-    candidate, the exact physical shard file is reconstructed (via
-    ``_default_shard_path`` + ``build_waymax_config``) and iterated in
-    isolation, so a candidate from shard A can never be matched against
-    a same-numbered record_index loaded from shard B.
+    candidate, the exact physical shard path is resolved via
+    ``resolve_physical_shard`` (the single source of truth for
+    basename -> physical path resolution -- never a hardcoded
+    ``data/womd/<split>/<file>`` convention) against ``dataset_config``
+    (a ``DatasetExpansionConfig``, the authority on which physical
+    files are actually configured/available), then iterated in
+    isolation via ``build_waymax_config``, so a candidate from shard A
+    can never be matched against a same-numbered record_index loaded
+    from shard B.
 
-    ``dataset_config`` is accepted for backward compatibility with
-    existing call sites/tests (kept as the fallback used only when a
-    row's own source_split/source_shard fields are absent -- i.e. an
-    older CSV predating this field) but is otherwise unused: each
-    confirmed row's own recorded (source_split, source_shard) is now
-    the authority on which physical shard to reload, not whatever
-    single dataset config the CLI happened to be invoked with.
+    ``dataset_config`` (the CLI's ``--dataset-config``, already loaded
+    via ``load_dataset_config``) is REQUIRED here -- it is the sole
+    authority for resolving each row's ``source_shard`` to a physical
+    path, and its ``split`` is checked against each row's own
+    ``source_split`` BEFORE any path/file access is attempted (see
+    ``resolve_physical_shard``'s split check, which fires first).
 
     Returns:
         dict candidate_id -> materialized feature dict (the
         ACCEPT-only field names, plus 'feature_materialization_source').
 
     Raises:
-        ValueError: if a transition cannot be reconstructed (drift), or
-            the recomputed detector decision/reason disagrees with the
-            stored CSV row's decision/reason.
+        ValueError: if a row's ``source_split`` disagrees with
+            ``dataset_config.split`` (checked before any path/file
+            access), if a row's ``source_shard`` does not match any
+            configured physical path (no fallback), if a row's
+            ``source_shard`` basename is ambiguous (matches more than
+            one configured path), if a transition cannot be
+            reconstructed (drift), or the recomputed detector
+            decision/reason disagrees with the stored CSV row's
+            decision/reason.
     """
 
     rows_by_id = {row["candidate_id"]: row for row in candidate_rows}
@@ -372,9 +363,7 @@ def materialize_confirmed_rows(
     by_shard_record = defaultdict(list)
     for candidate_id in confirmed_ids:
         row = rows_by_id[candidate_id]
-        source_split = row.get("source_split") or getattr(
-            dataset_config, "split", "validation"
-        )
+        source_split = row.get("source_split") or dataset_config.split
         source_shard = row.get("source_shard")
         if not source_shard:
             raise ValueError(
@@ -397,18 +386,14 @@ def materialize_confirmed_rows(
 
     for (source_split, source_shard), rows_by_record_index in by_shard.items():
 
-        shard_path = _default_shard_path(source_split, source_shard)
+        # Split-mismatch check fires FIRST, before any path/file access
+        # (see resolve_physical_shard's docstring/implementation).
+        shard_path = resolve_physical_shard(
+            dataset_config, source_shard=source_shard, source_split=source_split
+        )
         max_record_index = max(rows_by_record_index.keys())
 
-        shard_expansion_config = DatasetExpansionConfig(
-            dataset_name="WOMD",
-            split=source_split,
-            shard_paths=[shard_path],
-            max_num_objects=getattr(dataset_config, "max_num_objects", None),
-            repeat=1,
-            shuffle_seed=None,
-        )
-        shard_waymax_config = build_waymax_config(shard_expansion_config, shard_path)
+        shard_waymax_config = build_waymax_config(dataset_config, shard_path)
 
         for record in iter_scenarios(
             shard_waymax_config,
@@ -537,6 +522,19 @@ def build_manifest(
         if labels.get(row["candidate_id"], {}).get("manual_validation")
         == "CONFIRMED_MERGE"
     }
+
+    confirmed_splits = {
+        row.get("source_split")
+        for row in candidate_rows
+        if row["candidate_id"] in confirmed_ids
+    }
+    if len(confirmed_splits) > 1:
+        raise ValueError(
+            "Candidates CSV contains more than one distinct source_split "
+            f"value among its CONFIRMED_MERGE rows: {sorted(confirmed_splits)}. "
+            "One manifest invocation processes exactly one logical split "
+            "-- refusing to silently process a mixed-split CSV."
+        )
 
     materialized_by_id = materialize_confirmed_rows(
         candidate_rows,

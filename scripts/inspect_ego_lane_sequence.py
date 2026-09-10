@@ -19,7 +19,12 @@ from src.scenarios.lane_assignment import (
     load_lane_assignment_config,
 )
 from src.scenarios.lane_geometry import extract_lane_polylines
-from src.scenarios.scenario_loader import iter_scenarios, load_dataset_config
+from src.scenarios.scenario_loader import (
+    build_waymax_config,
+    iter_scenarios,
+    load_dataset_config,
+    select_single_shard_for_inspection,
+)
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
 DEFAULT_MERGE_CONFIG = "configs/phase1_merge.yaml"
@@ -62,6 +67,17 @@ def parse_args():
         help="Print every Nth frame (default 1: print all frames).",
     )
 
+    parser.add_argument(
+        "--source-shard",
+        type=str,
+        default=None,
+        help=(
+            "Basename of the physical shard to inspect. Required when "
+            "the dataset config resolves to multiple shards; optional "
+            "(and unused) when it resolves to exactly one."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -74,16 +90,28 @@ def main():
     print("Ego Lane Sequence Inspection")
     print("=" * 70)
 
-    dataset_config = load_dataset_config(args.config)
+    expansion_config = load_dataset_config(args.config)
     lane_assignment_config = load_lane_assignment_config(args.merge_config)
 
     print("\n[1] Loading scenario...")
     print(f"Record index: {args.record_index}")
 
+    shard_path = select_single_shard_for_inspection(
+        expansion_config,
+        source_shard=args.source_shard,
+        record_index=args.record_index,
+    )
+    dataset_config = build_waymax_config(expansion_config, shard_path)
+
+    print(f"Source shard: {Path(shard_path).name}")
+
     record = None
 
     for candidate in iter_scenarios(
-        dataset_config, limit=args.record_index + 1
+        dataset_config,
+        limit=args.record_index + 1,
+        source_dataset=expansion_config.dataset_name,
+        source_split=expansion_config.split,
     ):
         record = candidate
 

@@ -65,6 +65,7 @@ from src.scenarios.scenario_loader import (
     build_waymax_config,
     iter_scenarios,
     load_dataset_config,
+    resolve_physical_shard,
 )
 from src.scenarios.validation_viz import render_candidate_figure
 
@@ -203,19 +204,15 @@ def main():
     output_dir = Path(args.output_dir)
     rendered_counts = defaultdict(int)
 
-    # A shard referenced in the candidates CSV may not be one of the
-    # shards in the currently-configured dataset expansion config (e.g.
-    # rendering from an older combined CSV); resolve each shard's
-    # physical path the same way build_merge_manifest.py does.
-    shard_path_by_name = {
-        Path(p).name: p for p in expansion_config.shard_paths
-    }
-
     for (source_split, source_shard), rows_by_record_index in by_shard.items():
 
-        shard_path = shard_path_by_name.get(source_shard)
-        if shard_path is None:
-            shard_path = str(Path("data") / "womd" / source_split / source_shard)
+        # Split-mismatch check fires FIRST, before any Waymax config is
+        # built or any file is touched -- rendering a row whose
+        # source_split disagrees with the supplied dataset config's
+        # split is a hard failure, not a skip-with-warning.
+        shard_path = resolve_physical_shard(
+            expansion_config, source_shard=source_shard, source_split=source_split
+        )
 
         shard_waymax_config = build_waymax_config(expansion_config, shard_path)
         max_record_index = max(rows_by_record_index.keys())

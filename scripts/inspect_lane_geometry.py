@@ -18,7 +18,12 @@ from src.scenarios.lane_geometry import (
     nearest_lane_candidates,
     project_point_to_polyline,
 )
-from src.scenarios.scenario_loader import iter_scenarios, load_dataset_config
+from src.scenarios.scenario_loader import (
+    build_waymax_config,
+    iter_scenarios,
+    load_dataset_config,
+    select_single_shard_for_inspection,
+)
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
 OUTPUT_PATH = Path("outputs/phase1/summaries/lane_geometry.png")
@@ -54,6 +59,17 @@ def parse_args():
         help="Number of nearest lane candidates to report.",
     )
 
+    parser.add_argument(
+        "--source-shard",
+        type=str,
+        default=None,
+        help=(
+            "Basename of the physical shard to inspect. Required when "
+            "the dataset config resolves to multiple shards; optional "
+            "(and unused) when it resolves to exactly one."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -66,15 +82,27 @@ def main():
     print("Lane Geometry Inspection")
     print("=" * 70)
 
-    dataset_config = load_dataset_config(args.config)
+    expansion_config = load_dataset_config(args.config)
 
     print("\n[1] Loading scenario...")
     print(f"Record index: {args.record_index}")
 
+    shard_path = select_single_shard_for_inspection(
+        expansion_config,
+        source_shard=args.source_shard,
+        record_index=args.record_index,
+    )
+    dataset_config = build_waymax_config(expansion_config, shard_path)
+
+    print(f"Source shard: {Path(shard_path).name}")
+
     record = None
 
     for candidate in iter_scenarios(
-        dataset_config, limit=args.record_index + 1
+        dataset_config,
+        limit=args.record_index + 1,
+        source_dataset=expansion_config.dataset_name,
+        source_split=expansion_config.split,
     ):
         record = candidate
 

@@ -42,6 +42,7 @@ from src.scenarios.scenario_loader import (
     build_waymax_config,
     iter_scenarios,
     load_dataset_config,
+    select_single_shard_for_inspection,
 )
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
@@ -70,6 +71,14 @@ def parse_args():
         "--record-index", type=int, default=0,
         help="0-based scenario index to inspect.",
     )
+    parser.add_argument(
+        "--source-shard", type=str, default=None,
+        help=(
+            "Basename of the physical shard to inspect. Required when "
+            "the dataset config resolves to multiple shards; optional "
+            "(and unused) when it resolves to exactly one."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -88,11 +97,18 @@ def main():
     merge_topology_config = load_merge_topology_config(args.merge_config)
     agent_selection_config = load_agent_selection_config(args.merge_config)
 
-    # This CLI inspects a single shard (the first one in the dataset
-    # expansion config) -- multi-shard scanning is handled by
-    # extract_merge_scenes.py's iter_all_shards.
-    shard_path = expansion_config.shard_paths[0]
+    # Multi-shard scanning is handled by extract_merge_scenes.py's
+    # iter_all_shards; this CLI inspects exactly one physical shard,
+    # selected via the shared --source-shard/--record-index policy
+    # (see select_single_shard_for_inspection).
+    shard_path = select_single_shard_for_inspection(
+        expansion_config,
+        source_shard=args.source_shard,
+        record_index=args.record_index,
+    )
     dataset_config = build_waymax_config(expansion_config, shard_path)
+
+    print(f"Source shard: {Path(shard_path).name}")
 
     record = None
     for candidate in iter_scenarios(

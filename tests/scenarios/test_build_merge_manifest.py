@@ -32,6 +32,8 @@ from src.scenarios.merge_detector import (
 )
 from src.scenarios.scenario_features import AgentSelectionConfig
 
+from src.scenarios.scenario_loader import DatasetExpansionConfig
+
 from scripts.build_merge_manifest import (
     build_manifest,
     materialize_confirmed_rows,
@@ -240,6 +242,30 @@ def _build_merge_scene(
     return record
 
 
+def _fake_expansion_config(tmp_path, split, shard_names):
+    """Builds a real (fully-resolved, existing-on-disk) synthetic
+    DatasetExpansionConfig for the given shard basenames, so
+    resolve_physical_shard's real path-matching logic runs (rather
+    than being bypassed) even though iter_scenarios itself is
+    monkeypatched to yield synthetic scenes instead of real WOMD data.
+    """
+
+    paths = []
+    for name in shard_names:
+        path = tmp_path / name
+        path.write_text("fake")
+        paths.append(str(path))
+
+    return DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split=split,
+        shard_paths=paths,
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+
 @pytest.fixture(scope="module")
 def merge_scene():
     return _build_merge_scene()
@@ -392,7 +418,7 @@ def test_case_b_c_review_confirmed_merge_materializes_full_row(merge_scene, reco
     assert features["rear_ttc_s"] == float("inf")
 
 
-def test_case_b_via_materialize_confirmed_rows_end_to_end(monkeypatch, merge_scene, reconstructed):
+def test_case_b_via_materialize_confirmed_rows_end_to_end(monkeypatch, tmp_path, merge_scene, reconstructed):
     """End-to-end through build_merge_manifest.materialize_confirmed_rows,
     with the stored CSV row's decision/reason forced to REVIEW (as if a
     human confirmed a REVIEW candidate) -- monkeypatches iter_scenarios
@@ -431,10 +457,14 @@ def test_case_b_via_materialize_confirmed_rows_end_to_end(monkeypatch, merge_sce
         bmm, "iter_scenarios", lambda dataset_config, limit=None, **kw: iter([merge_scene])
     )
 
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", [merge_scene.source_shard]
+    )
+
     materialized = materialize_confirmed_rows(
         candidate_rows,
         {candidate_id},
-        dataset_config=None,
+        dataset_config=fake_expansion_config,
         lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
         merge_topology_config=MERGE_TOPOLOGY_CONFIG,
         agent_selection_config=AGENT_SELECTION_CONFIG,
@@ -706,7 +736,7 @@ def test_case_j_valid_row_passes():
 # ---------------------------------------------------------------------
 
 
-def test_case_k_detector_drift_raises(monkeypatch, merge_scene, reconstructed):
+def test_case_k_detector_drift_raises(monkeypatch, tmp_path, merge_scene, reconstructed):
     transition = reconstructed[0]
     candidate_id = make_candidate_id(
         merge_scene.scene_key, transition.transition_frame,
@@ -735,11 +765,15 @@ def test_case_k_detector_drift_raises(monkeypatch, merge_scene, reconstructed):
         bmm, "iter_scenarios", lambda dataset_config, limit=None, **kw: iter([merge_scene])
     )
 
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", [merge_scene.source_shard]
+    )
+
     with pytest.raises(ValueError, match="Detector drift"):
         materialize_confirmed_rows(
             candidate_rows,
             {candidate_id},
-            dataset_config=None,
+            dataset_config=fake_expansion_config,
             lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
             merge_topology_config=MERGE_TOPOLOGY_CONFIG,
             agent_selection_config=AGENT_SELECTION_CONFIG,
@@ -751,7 +785,7 @@ def test_case_k_detector_drift_raises(monkeypatch, merge_scene, reconstructed):
 # ---------------------------------------------------------------------
 
 
-def test_case_l_repeated_build_is_deterministic(monkeypatch, merge_scene, reconstructed):
+def test_case_l_repeated_build_is_deterministic(monkeypatch, tmp_path, merge_scene, reconstructed):
     transition = reconstructed[0]
     candidate_id = make_candidate_id(
         merge_scene.scene_key, transition.transition_frame,
@@ -785,15 +819,19 @@ def test_case_l_repeated_build_is_deterministic(monkeypatch, merge_scene, recons
         bmm, "iter_scenarios", lambda dataset_config, limit=None, **kw: iter([merge_scene])
     )
 
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", ["fake_shard.tfrecord"]
+    )
+
     rows_1 = build_manifest(
         candidate_rows, labels,
-        dataset_config=None, lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+        dataset_config=fake_expansion_config, lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
         merge_topology_config=MERGE_TOPOLOGY_CONFIG,
         agent_selection_config=AGENT_SELECTION_CONFIG,
     )
     rows_2 = build_manifest(
         candidate_rows, labels,
-        dataset_config=None, lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+        dataset_config=fake_expansion_config, lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
         merge_topology_config=MERGE_TOPOLOGY_CONFIG,
         agent_selection_config=AGENT_SELECTION_CONFIG,
     )
@@ -859,7 +897,7 @@ def _make_shard_dispatching_iter_scenarios(scenes_by_shard_name):
 
 
 def test_case_j_materialization_reloads_correct_shard(
-    monkeypatch, merge_scene, reconstructed, merge_scene_shard_b, reconstructed_shard_b
+    monkeypatch, tmp_path, merge_scene, reconstructed, merge_scene_shard_b, reconstructed_shard_b
 ):
     transition_a = reconstructed[0]
     transition_b = reconstructed_shard_b[0]
@@ -912,10 +950,15 @@ def test_case_j_materialization_reloads_correct_shard(
         ),
     )
 
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation",
+        [merge_scene.source_shard, merge_scene_shard_b.source_shard],
+    )
+
     materialized = materialize_confirmed_rows(
         candidate_rows,
         {candidate_id_a, candidate_id_b},
-        dataset_config=None,
+        dataset_config=fake_expansion_config,
         lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
         merge_topology_config=MERGE_TOPOLOGY_CONFIG,
         agent_selection_config=AGENT_SELECTION_CONFIG,
@@ -1003,3 +1046,435 @@ def test_case_j_materialize_confirmed_rows_groups_by_shard_and_record_index(
     assert (
         "validation", merge_scene_shard_b.source_shard, 0
     ) in by_shard_record
+
+
+# ---------------------------------------------------------------------
+# Fix commit regressions: wrong-split and unknown-shard, both via the
+# common resolve_physical_shard helper (fail BEFORE any scenario
+# loading is attempted). Synthetic multi-shard/dataset-config only.
+# ---------------------------------------------------------------------
+
+
+def test_wrong_split_regression_raises_before_scenario_loading(
+    monkeypatch, tmp_path, merge_scene, reconstructed
+):
+    """A candidate row with source_split="training" against a
+    dataset_config with split="validation" must raise clearly BEFORE
+    any scenario loading is attempted -- iter_scenarios is monkeypatched
+    to blow up if ever called, so this test fails loudly (rather than
+    silently passing) if the split check is ever bypassed.
+    """
+
+    transition = reconstructed[0]
+    candidate_id = make_candidate_id(
+        merge_scene.scene_key, transition.transition_frame,
+        transition.source_lane_id, transition.target_lane_id,
+    )
+    candidate_rows = [
+        {
+            "candidate_id": candidate_id,
+            "scene_key": merge_scene.scene_key,
+            "source_split": "training",  # mismatched vs. config split below
+            "source_shard": merge_scene.source_shard,
+            "record_index": "0",
+            "source_lane_id": str(transition.source_lane_id),
+            "target_lane_id": str(transition.target_lane_id),
+            "transition_frame": str(transition.transition_frame),
+            "decision": "accept",
+            "reason": "",
+        }
+    ]
+
+    import scripts.build_merge_manifest as bmm
+
+    def _explode(*args, **kwargs):
+        raise AssertionError(
+            "iter_scenarios must never be called when source_split "
+            "disagrees with the dataset config's split -- the split "
+            "check must fire first."
+        )
+
+    monkeypatch.setattr(bmm, "iter_scenarios", _explode)
+
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", [merge_scene.source_shard]
+    )
+
+    with pytest.raises(ValueError, match="source_split mismatch"):
+        materialize_confirmed_rows(
+            candidate_rows,
+            {candidate_id},
+            dataset_config=fake_expansion_config,
+            lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+            merge_topology_config=MERGE_TOPOLOGY_CONFIG,
+            agent_selection_config=AGENT_SELECTION_CONFIG,
+        )
+
+
+def test_unknown_shard_regression_no_fallback(
+    monkeypatch, tmp_path, merge_scene, reconstructed
+):
+    """A candidate row referencing a source_shard the dataset config
+    does not know about (config only knows shard_A, candidate
+    references shard_B) must raise via resolve_physical_shard's
+    unknown-shard error -- no fallback to any local-layout convention.
+    """
+
+    transition = reconstructed[0]
+    candidate_id = make_candidate_id(
+        merge_scene.scene_key, transition.transition_frame,
+        transition.source_lane_id, transition.target_lane_id,
+    )
+    candidate_rows = [
+        {
+            "candidate_id": candidate_id,
+            "scene_key": merge_scene.scene_key,
+            "source_split": "validation",
+            "source_shard": "shard_b_never_configured.tfrecord",
+            "record_index": "0",
+            "source_lane_id": str(transition.source_lane_id),
+            "target_lane_id": str(transition.target_lane_id),
+            "transition_frame": str(transition.transition_frame),
+            "decision": "accept",
+            "reason": "",
+        }
+    ]
+
+    import scripts.build_merge_manifest as bmm
+
+    def _explode(*args, **kwargs):
+        raise AssertionError(
+            "iter_scenarios must never be called for an unresolvable "
+            "shard -- resolve_physical_shard must fail first."
+        )
+
+    monkeypatch.setattr(bmm, "iter_scenarios", _explode)
+
+    # Config only knows shard_A ("merge_scene.source_shard"); the
+    # candidate row above references an entirely different, never
+    # -configured shard basename.
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", [merge_scene.source_shard]
+    )
+
+    with pytest.raises(ValueError, match="Unknown shard"):
+        materialize_confirmed_rows(
+            candidate_rows,
+            {candidate_id},
+            dataset_config=fake_expansion_config,
+            lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+            merge_topology_config=MERGE_TOPOLOGY_CONFIG,
+            agent_selection_config=AGENT_SELECTION_CONFIG,
+        )
+
+
+def test_mixed_split_csv_rejected_by_build_manifest(
+    monkeypatch, tmp_path, merge_scene, reconstructed
+):
+    """build_manifest must fail clearly if the candidates being
+    processed contain more than one distinct source_split value among
+    their CONFIRMED_MERGE rows -- one manifest invocation is one
+    logical split; a hand-edited/concatenated mixed-split CSV must be
+    rejected rather than silently processed.
+    """
+
+    transition = reconstructed[0]
+    candidate_id_a = make_candidate_id(
+        merge_scene.scene_key, transition.transition_frame,
+        transition.source_lane_id, transition.target_lane_id,
+    )
+    candidate_rows = [
+        {
+            "candidate_id": candidate_id_a,
+            "scene_key": merge_scene.scene_key,
+            "source_dataset": "WOMD",
+            "source_split": "validation",
+            "source_shard": merge_scene.source_shard,
+            "record_index": "0",
+            "source_lane_id": str(transition.source_lane_id),
+            "target_lane_id": str(transition.target_lane_id),
+            "transition_frame": str(transition.transition_frame),
+            "decision": "accept",
+            "reason": "",
+        },
+        {
+            "candidate_id": "other_split_candidate",
+            "scene_key": "training_shard.tfrecord#0",
+            "source_dataset": "WOMD",
+            "source_split": "training",  # different split -- must be rejected
+            "source_shard": "training_shard.tfrecord",
+            "record_index": "0",
+            "source_lane_id": "1",
+            "target_lane_id": "2",
+            "transition_frame": "5",
+            "decision": "accept",
+            "reason": "",
+        },
+    ]
+    labels = {
+        candidate_id_a: {
+            "candidate_id": candidate_id_a,
+            "manual_validation": "CONFIRMED_MERGE",
+            "manual_note": "",
+        },
+        "other_split_candidate": {
+            "candidate_id": "other_split_candidate",
+            "manual_validation": "CONFIRMED_MERGE",
+            "manual_note": "",
+        },
+    }
+
+    import scripts.build_merge_manifest as bmm
+    monkeypatch.setattr(
+        bmm, "iter_scenarios", lambda dataset_config, limit=None, **kw: iter([merge_scene])
+    )
+
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", [merge_scene.source_shard]
+    )
+
+    with pytest.raises(ValueError, match="more than one distinct source_split"):
+        build_manifest(
+            candidate_rows, labels,
+            dataset_config=fake_expansion_config,
+            lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+            merge_topology_config=MERGE_TOPOLOGY_CONFIG,
+            agent_selection_config=AGENT_SELECTION_CONFIG,
+        )
+
+
+# ---------------------------------------------------------------------
+# Fix commit regressions: harden multi-shard inspection and shard
+# reload safety. materialize_confirmed_rows must resolve source_shard
+# via resolve_physical_shard against the authoritative dataset_config's
+# shard_paths -- never a hardcoded data/womd/<split>/<file> convention
+# -- and must fail fast on a source_split mismatch BEFORE any scenario
+# loading is attempted.
+# ---------------------------------------------------------------------
+
+
+def test_manifest_resolves_custom_configured_path_not_hardcoded_convention(
+    monkeypatch, tmp_path, merge_scene, reconstructed
+):
+    """The candidate's source_shard resolves to whatever physical path
+    is actually configured in dataset_config.shard_paths -- including a
+    path that does NOT follow the data/womd/<split>/<file> convention
+    -- proving build_merge_manifest.py no longer synthesizes a path
+    from that convention.
+    """
+
+    transition = reconstructed[0]
+    candidate_id = make_candidate_id(
+        merge_scene.scene_key, transition.transition_frame,
+        transition.source_lane_id, transition.target_lane_id,
+    )
+    candidate_rows = [
+        {
+            "candidate_id": candidate_id,
+            "scene_key": merge_scene.scene_key,
+            "source_split": "validation",
+            "source_shard": merge_scene.source_shard,
+            "record_index": "0",
+            "source_lane_id": str(transition.source_lane_id),
+            "target_lane_id": str(transition.target_lane_id),
+            "transition_frame": str(transition.transition_frame),
+            "decision": "accept",
+            "reason": "",
+        }
+    ]
+
+    # A custom, non-conventional directory layout: NOT data/womd/validation/.
+    custom_dir = tmp_path / "some" / "unconventional" / "layout"
+    custom_dir.mkdir(parents=True)
+    custom_shard_path = custom_dir / merge_scene.source_shard
+    custom_shard_path.write_text("fake")
+
+    fake_expansion_config = DatasetExpansionConfig(
+        dataset_name="WOMD",
+        split="validation",
+        shard_paths=[str(custom_shard_path)],
+        max_num_objects=64,
+        repeat=1,
+        shuffle_seed=None,
+    )
+
+    seen_paths = []
+
+    import scripts.build_merge_manifest as bmm
+
+    def fake_iter_scenarios(dataset_config, limit=None, **kw):
+        seen_paths.append(dataset_config.path)
+        return iter([merge_scene])
+
+    monkeypatch.setattr(bmm, "iter_scenarios", fake_iter_scenarios)
+
+    materialized = materialize_confirmed_rows(
+        candidate_rows,
+        {candidate_id},
+        dataset_config=fake_expansion_config,
+        lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+        merge_topology_config=MERGE_TOPOLOGY_CONFIG,
+        agent_selection_config=AGENT_SELECTION_CONFIG,
+    )
+
+    assert candidate_id in materialized
+    # The exact custom configured path was used -- not a synthesized
+    # data/womd/validation/<file> convention path.
+    assert seen_paths == [str(custom_shard_path)]
+
+
+def test_manifest_wrong_split_fails_before_scenario_loading(
+    monkeypatch, tmp_path, merge_scene, reconstructed
+):
+    """A candidate row with source_split='training' fed against a
+    dataset_config whose split='validation' must raise BEFORE any
+    scenario loading is attempted (iter_scenarios must never be
+    called).
+    """
+
+    transition = reconstructed[0]
+    candidate_id = make_candidate_id(
+        merge_scene.scene_key, transition.transition_frame,
+        transition.source_lane_id, transition.target_lane_id,
+    )
+    candidate_rows = [
+        {
+            "candidate_id": candidate_id,
+            "scene_key": merge_scene.scene_key,
+            "source_split": "training",  # mismatches the config below
+            "source_shard": merge_scene.source_shard,
+            "record_index": "0",
+            "source_lane_id": str(transition.source_lane_id),
+            "target_lane_id": str(transition.target_lane_id),
+            "transition_frame": str(transition.transition_frame),
+            "decision": "accept",
+            "reason": "",
+        }
+    ]
+
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", [merge_scene.source_shard]
+    )
+
+    import scripts.build_merge_manifest as bmm
+
+    call_count = 0
+
+    def fake_iter_scenarios(dataset_config, limit=None, **kw):
+        nonlocal call_count
+        call_count += 1
+        return iter([merge_scene])
+
+    monkeypatch.setattr(bmm, "iter_scenarios", fake_iter_scenarios)
+
+    with pytest.raises(ValueError, match="source_split mismatch"):
+        materialize_confirmed_rows(
+            candidate_rows,
+            {candidate_id},
+            dataset_config=fake_expansion_config,
+            lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+            merge_topology_config=MERGE_TOPOLOGY_CONFIG,
+            agent_selection_config=AGENT_SELECTION_CONFIG,
+        )
+
+    assert call_count == 0, (
+        "iter_scenarios must never be called when source_split "
+        "mismatches dataset_config.split"
+    )
+
+
+def test_manifest_unknown_shard_raises_no_fallback(
+    monkeypatch, tmp_path, merge_scene, reconstructed
+):
+    """A candidate referencing a source_shard absent from
+    dataset_config.shard_paths must raise (unknown shard), never fall
+    back to any local-layout convention.
+    """
+
+    transition = reconstructed[0]
+    candidate_id = make_candidate_id(
+        merge_scene.scene_key, transition.transition_frame,
+        transition.source_lane_id, transition.target_lane_id,
+    )
+    candidate_rows = [
+        {
+            "candidate_id": candidate_id,
+            "scene_key": merge_scene.scene_key,
+            "source_split": "validation",
+            "source_shard": "shard_b_unknown.tfrecord",
+            "record_index": "0",
+            "source_lane_id": str(transition.source_lane_id),
+            "target_lane_id": str(transition.target_lane_id),
+            "transition_frame": str(transition.transition_frame),
+            "decision": "accept",
+            "reason": "",
+        }
+    ]
+
+    # Config only knows shard_A -- not shard_b_unknown.tfrecord.
+    fake_expansion_config = _fake_expansion_config(
+        tmp_path, "validation", ["shard_a_known.tfrecord"]
+    )
+
+    import scripts.build_merge_manifest as bmm
+    monkeypatch.setattr(
+        bmm, "iter_scenarios", lambda dataset_config, limit=None, **kw: iter([merge_scene])
+    )
+
+    with pytest.raises(ValueError, match="Unknown shard"):
+        materialize_confirmed_rows(
+            candidate_rows,
+            {candidate_id},
+            dataset_config=fake_expansion_config,
+            lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+            merge_topology_config=MERGE_TOPOLOGY_CONFIG,
+            agent_selection_config=AGENT_SELECTION_CONFIG,
+        )
+
+
+def test_build_manifest_mixed_split_confirmed_rows_raises():
+    """If the candidates CSV contains more than one distinct
+    source_split among its CONFIRMED_MERGE rows, build_manifest must
+    fail clearly rather than silently processing a mixed-split CSV.
+    """
+
+    candidate_rows = [
+        {
+            "candidate_id": "shardA#0__t10__1_2",
+            "scene_key": "shardA#0",
+            "source_split": "validation",
+            "source_shard": "shardA.tfrecord",
+            "record_index": "0",
+            "decision": "accept",
+            "reason": "",
+        },
+        {
+            "candidate_id": "shardB#0__t10__3_4",
+            "scene_key": "shardB#0",
+            "source_split": "training",
+            "source_shard": "shardB.tfrecord",
+            "record_index": "0",
+            "decision": "accept",
+            "reason": "",
+        },
+    ]
+    labels = {
+        "shardA#0__t10__1_2": {
+            "candidate_id": "shardA#0__t10__1_2",
+            "manual_validation": "CONFIRMED_MERGE",
+            "manual_note": "",
+        },
+        "shardB#0__t10__3_4": {
+            "candidate_id": "shardB#0__t10__3_4",
+            "manual_validation": "CONFIRMED_MERGE",
+            "manual_note": "",
+        },
+    }
+
+    with pytest.raises(ValueError, match="more than one distinct source_split"):
+        build_manifest(
+            candidate_rows, labels,
+            dataset_config=None, lane_assignment_config=LANE_ASSIGNMENT_CONFIG,
+            merge_topology_config=MERGE_TOPOLOGY_CONFIG,
+            agent_selection_config=AGENT_SELECTION_CONFIG,
+        )
