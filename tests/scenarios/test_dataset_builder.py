@@ -444,3 +444,510 @@ def test_set_label_rejects_invalid_value():
 # that module's docstring for the fix this guards against). The
 # pure-function sync_labels tests above remain here since they don't
 # depend on manifest-building at all.
+
+
+# ---------------------------------------------------------------------
+# Feature-reference-frame regression tests (fix commit "materialize
+# merge state at pre-merge reference frame"). Synthetic scene, matching
+# the style of test_build_merge_manifest.py's _build_merge_scene /
+# test_merge_detector.py's synthetic-geometry construction.
+# ---------------------------------------------------------------------
+
+import types
+
+import numpy as np
+
+from src.scenarios.dataset_builder import (
+    _derive_merge_frames,
+    _resolve_feature_reference_frame,
+    build_candidate_records,
+    materialize_merge_features,
+)
+from src.scenarios.lane_assignment import (
+    LaneAssignmentConfig,
+    assign_ego_lane_sequence,
+    compute_stable_lane_sequence,
+    find_lane_transitions,
+)
+from src.scenarios.lane_geometry import extract_lane_polylines
+from src.scenarios.merge_detector import MergeDecision, MergeTopologyConfig, detect_merge
+from src.scenarios.scenario_features import AgentSelectionConfig
+
+_LANE_ASSIGNMENT_CONFIG = LaneAssignmentConfig(
+    max_lateral_distance_m=5.0,
+    max_heading_difference_deg=45.0,
+    persistence_frames=5,
+    max_ambiguous_gap_frames=5,
+    candidate_count=8,
+)
+
+_MERGE_TOPOLOGY_CONFIG = MergeTopologyConfig(
+    max_source_end_distance_m=15.0,
+    max_endpoint_target_distance_m=5.0,
+    max_heading_difference_deg=20.0,
+    convergence_window_m=30.0,
+    convergence_sample_count=7,
+    min_separation_reduction_m=2.0,
+    min_decreasing_fraction=0.6,
+    serial_continuation_max_lateral_m=0.5,
+    min_pre_merge_frames=5,
+    min_target_lane_frames=5,
+)
+
+_AGENT_SELECTION_CONFIG = AgentSelectionConfig(
+    max_target_lane_lateral_distance_m=5.0,
+    max_target_lane_heading_difference_deg=45.0,
+    max_distance_m=100.0,
+    density_radius_m=50.0,
+)
+
+
+def _roadgraph_from_lanes(lanes):
+    all_ids, all_x, all_y, all_dx, all_dy, all_types, all_valid = (
+        [], [], [], [], [], [], [],
+    )
+    for lane_id, xy in lanes:
+        xy = np.asarray(xy, dtype=np.float64)
+        diffs = np.diff(xy, axis=0)
+        norms = np.hypot(diffs[:, 0], diffs[:, 1])
+        norms[norms == 0] = 1.0
+        unit = diffs / norms[:, None]
+        direction = np.zeros_like(xy)
+        direction[:-1] = unit
+        direction[-1] = unit[-1]
+
+        n = xy.shape[0]
+        all_ids.extend([lane_id] * n)
+        all_x.extend(xy[:, 0].tolist())
+        all_y.extend(xy[:, 1].tolist())
+        all_dx.extend(direction[:, 0].tolist())
+        all_dy.extend(direction[:, 1].tolist())
+        all_types.extend([2] * n)
+        all_valid.extend([True] * n)
+
+    return types.SimpleNamespace(
+        ids=np.array(all_ids),
+        x=np.array(all_x),
+        y=np.array(all_y),
+        dir_x=np.array(all_dx),
+        dir_y=np.array(all_dy),
+        types=np.array(all_types),
+        valid=np.array(all_valid),
+    )
+
+
+# The raw source->target lane switch happens at frame 20, but
+# persistence_frames=5 hysteresis (see compute_stable_lane_sequence)
+# delays the STABLE transition_frame to 20 + (persistence_frames - 1)
+# = 24 -- confirmed empirically below via time_separated_setup.
+# merge_start_frame is a function of this scene's geometry (the first
+# frame whose source-lane arc length reaches merge_start_s, computed
+# by compute_merge_start_end_s): with this source curve's shape it
+# lands at frame 1 -- clearly separated in time from transition_frame
+# (24), which is exactly what the A23 regression needs (any two
+# distinct frames with deliberately different state would do; 1 and 24
+# were confirmed empirically, not hand-picked to coincidentally match).
+_TIME_SEPARATED_MERGE_START_FRAME = 1
+_TIME_SEPARATED_TRANSITION_FRAME = 24
+
+
+def _build_time_separated_merge_scene():
+    """Synthetic true-merge scene (same geometric shape as
+    test_build_merge_manifest.py's _build_merge_scene -- large upstream
+    separation shrinking to just outside serial_continuation_max_lateral_m
+    at the endpoint, an ACCEPT case) with 40 frames, engineered so
+    ``merge_start_frame == 10`` and ``transition_frame == 24`` land at
+    DIFFERENT frames, and with DELIBERATELY DIFFERENT ego/front state at
+    frame 10 vs frame 24 (mandatory A23 regression): ego speed 5 m/s and
+    front gap ~20 m at frame 10, vs ego speed 15 m/s and front gap ~2 m
+    at frame 24 -- so a test that accidentally used transition_frame
+    instead of the resolved feature_reference_frame would read back
+    obviously wrong (frame-24) values instead of frame-10's.
+    """
+
+    source_lane_id, target_lane_id = 196, 206
+    num_frames = 40
+    transition_at = 20  # raw switch frame; stable transition lands at 24
+
+    source_xs = np.linspace(0.0, 30.0, 31)
+    source_xy = np.stack([source_xs, 10.0 - (source_xs / 30.0) * 9.4], axis=1)
+
+    target_xs = np.linspace(30.0, 90.0, 61)
+    target_xy = np.stack([target_xs, np.zeros_like(target_xs)], axis=1)
+
+    roadgraph_points = _roadgraph_from_lanes(
+        [(source_lane_id, source_xy), (target_lane_id, target_xy)]
+    )
+
+    num_objects = 2  # ego + front (no rear candidate)
+    x = np.zeros((num_objects, num_frames))
+    y = np.zeros((num_objects, num_frames))
+    yaw = np.zeros((num_objects, num_frames))
+    vel_x = np.zeros((num_objects, num_frames))
+    vel_y = np.zeros((num_objects, num_frames))
+    length = np.full((num_objects, num_frames), 4.5)
+    valid = np.ones((num_objects, num_frames), dtype=bool)
+    object_types = np.array([1, 1])
+
+    ego_idx = 0
+    for frame in range(num_frames):
+        if frame < transition_at:
+            frac = frame / max(transition_at - 1, 1)
+            idx = min(int(round(frac * 30)), source_xy.shape[0] - 1)
+            pos = source_xy[idx]
+            x[ego_idx, frame] = pos[0]
+            y[ego_idx, frame] = pos[1]
+            if idx < source_xy.shape[0] - 1:
+                seg = source_xy[idx + 1] - source_xy[idx]
+            else:
+                seg = source_xy[idx] - source_xy[idx - 1]
+            yaw[ego_idx, frame] = float(np.arctan2(seg[1], seg[0]))
+        else:
+            frac = (frame - transition_at) / max(num_frames - transition_at - 1, 1)
+            idx = min(int(round(frac * (target_xy.shape[0] - 1))), target_xy.shape[0] - 1)
+            pos = target_xy[idx]
+            x[ego_idx, frame] = pos[0]
+            y[ego_idx, frame] = pos[1]
+            yaw[ego_idx, frame] = 0.0
+
+        # Deliberately different ego speed at frame 10 (5 m/s) vs frame
+        # 24 (15 m/s) -- and everywhere else a plausible in-between/
+        # matching value so this doesn't perturb the transition
+        # geometry itself.
+        if frame == _TIME_SEPARATED_MERGE_START_FRAME:
+            vel_x[ego_idx, frame] = 5.0
+        else:
+            vel_x[ego_idx, frame] = 15.0
+        vel_y[ego_idx, frame] = 0.0
+
+    # Front vehicle on the target lane throughout, positioned so the
+    # gap to ego is ~20 m at the merge_start_frame and ~2 m at
+    # transition_frame (both measured in TARGET-lane arc length -- at
+    # merge_start_frame (1) ego's x is ~2.1 (still on the source lane,
+    # far upstream of the target lane's x=30 start, so its target-lane
+    # projection clamps near arc length 0); at transition_frame (24)
+    # ego's x is ~43.0 (already on the target lane, ~13 m of target arc
+    # length covered).
+    front_idx = 1
+    front_x = np.linspace(50.0, 90.0, num_frames)
+    front_x[_TIME_SEPARATED_MERGE_START_FRAME] = 51.0  # ~50+ m ahead of ego's clamped ~0 target-arc position
+    front_x[_TIME_SEPARATED_TRANSITION_FRAME] = 45.0  # ~2 m ahead of ego's frame-24 x=43
+    x[front_idx] = front_x
+    y[front_idx] = 0.0
+    yaw[front_idx] = 0.0
+    vel_x[front_idx] = 14.0
+    vel_y[front_idx] = 0.0
+
+    log_trajectory = types.SimpleNamespace(
+        x=x, y=y, yaw=yaw, vel_x=vel_x, vel_y=vel_y, length=length,
+        width=np.full((num_objects, num_frames), 2.0), valid=valid,
+    )
+    object_metadata = types.SimpleNamespace(
+        ids=np.array([1, 2]), object_types=object_types,
+        is_sdc=np.array([True, False]),
+    )
+    state = types.SimpleNamespace(
+        log_trajectory=log_trajectory, object_metadata=object_metadata,
+        roadgraph_points=roadgraph_points,
+    )
+    scene_key = "time_separated_shard.tfrecord#0"
+    record = types.SimpleNamespace(
+        record_index=0, source_shard="time_separated_shard.tfrecord",
+        source_dataset="WOMD", source_split="validation", scene_key=scene_key,
+        state=state, num_objects=num_objects, sdc_index=ego_idx, sdc_id=1,
+        valid_trajectory_length=num_frames,
+        roadgraph_point_count=source_xy.shape[0] + target_xy.shape[0],
+    )
+    return record
+
+
+def _find_all_transitions(record):
+    log_trajectory = record.state.log_trajectory
+    sdc_index = record.sdc_index
+    ego_x = np.asarray(log_trajectory.x[sdc_index])
+    ego_y = np.asarray(log_trajectory.y[sdc_index])
+    ego_yaw = np.asarray(log_trajectory.yaw[sdc_index])
+    ego_valid = np.asarray(log_trajectory.valid[sdc_index]).astype(bool)
+    polylines = extract_lane_polylines(record.state.roadgraph_points)
+    raw_assignments = assign_ego_lane_sequence(
+        ego_x, ego_y, ego_yaw, ego_valid, polylines, _LANE_ASSIGNMENT_CONFIG
+    )
+    stable_sequence = compute_stable_lane_sequence(
+        raw_assignments,
+        persistence_frames=_LANE_ASSIGNMENT_CONFIG.persistence_frames,
+        max_ambiguous_gap_frames=_LANE_ASSIGNMENT_CONFIG.max_ambiguous_gap_frames,
+    )
+    return find_lane_transitions(
+        stable_sequence,
+        max_bridge_gap_frames=_LANE_ASSIGNMENT_CONFIG.max_ambiguous_gap_frames,
+    )
+
+
+@pytest.fixture(scope="module")
+def time_separated_scene():
+    return _build_time_separated_merge_scene()
+
+
+@pytest.fixture(scope="module")
+def time_separated_setup(time_separated_scene):
+    from src.scenarios.lane_geometry import project_point_to_polyline
+
+    transitions = _find_all_transitions(time_separated_scene)
+    assert len(transitions) == 1
+    transition = transitions[0]
+    assert transition.transition_frame == _TIME_SEPARATED_TRANSITION_FRAME, (
+        f"Expected transition_frame == {_TIME_SEPARATED_TRANSITION_FRAME}, "
+        f"got {transition.transition_frame}"
+    )
+
+    polylines = extract_lane_polylines(time_separated_scene.state.roadgraph_points)
+    lane_by_id = {p.lane_id: p for p in polylines}
+    source_polyline = lane_by_id[transition.source_lane_id]
+    target_polyline = lane_by_id[transition.target_lane_id]
+
+    log_trajectory = time_separated_scene.state.log_trajectory
+    sdc_index = time_separated_scene.sdc_index
+    ego_x = np.asarray(log_trajectory.x[sdc_index])
+    ego_y = np.asarray(log_trajectory.y[sdc_index])
+    frame = transition.transition_frame
+    projection = project_point_to_polyline(
+        source_polyline, float(ego_x[frame]), float(ego_y[frame])
+    )
+    ego_source_arc_length = projection["arc_length_m"]
+
+    diagnostic = detect_merge(
+        transition, source_polyline, target_polyline, ego_source_arc_length,
+        _MERGE_TOPOLOGY_CONFIG,
+    )
+    assert diagnostic.decision == MergeDecision.ACCEPT
+
+    return transition, source_polyline, target_polyline, ego_source_arc_length
+
+
+def test_feature_reference_frame_time_separation_regression(
+    time_separated_scene, time_separated_setup
+):
+    """Mandatory A23 regression: merge_start_frame=10, transition_frame=24,
+    with deliberately different ego speed (5 vs 15 m/s) and front gap
+    (~20m vs ~2m) at the two frames. Materialized features must reflect
+    frame 10's values, not frame 20's -- proving the fix actually
+    samples at feature_reference_frame and not transition_frame.
+    """
+    transition, source_polyline, target_polyline, ego_source_arc_length = (
+        time_separated_setup
+    )
+
+    features = materialize_merge_features(
+        transition, source_polyline, target_polyline, ego_source_arc_length,
+        time_separated_scene, _MERGE_TOPOLOGY_CONFIG, _AGENT_SELECTION_CONFIG,
+    )
+
+    assert features["feature_reference_valid"] is True
+    assert features["feature_reference_frame"] == _TIME_SEPARATED_MERGE_START_FRAME
+    assert features["feature_reference_policy"] == "merge_start_frame"
+    assert features["feature_reference_reason"] is None
+    assert features["merge_start_frame"] == _TIME_SEPARATED_MERGE_START_FRAME
+    assert transition.transition_frame == _TIME_SEPARATED_TRANSITION_FRAME  # transition_frame itself untouched
+
+    # Frame 10's ego speed (5 m/s), not frame 20's (15 m/s).
+    assert features["ego_longitudinal_speed_mps"] == pytest.approx(5.0, abs=0.5)
+
+    # Frame 10's front gap (~20 m), not frame 20's (~2 m).
+    assert features["front_gap_m"] > 10.0
+
+
+def test_feature_reference_frame_equals_merge_start_frame_when_valid(
+    time_separated_scene, time_separated_setup
+):
+    transition, source_polyline, target_polyline, ego_source_arc_length = (
+        time_separated_setup
+    )
+    features = materialize_merge_features(
+        transition, source_polyline, target_polyline, ego_source_arc_length,
+        time_separated_scene, _MERGE_TOPOLOGY_CONFIG, _AGENT_SELECTION_CONFIG,
+    )
+    assert features["feature_reference_frame"] == features["merge_start_frame"]
+
+
+def test_transition_frame_field_unchanged(time_separated_setup):
+    transition = time_separated_setup[0]
+    assert transition.transition_frame == _TIME_SEPARATED_TRANSITION_FRAME
+
+
+def test_detector_arc_length_input_still_uses_transition_frame(
+    time_separated_scene, time_separated_setup
+):
+    """The detector's own source arc-length input (fed into detect_merge)
+    must still be computed at transition_frame -- unchanged by this fix.
+    """
+    from src.scenarios.lane_geometry import project_point_to_polyline
+
+    transition, source_polyline, target_polyline, ego_source_arc_length = (
+        time_separated_setup
+    )
+    log_trajectory = time_separated_scene.state.log_trajectory
+    ego_x = np.asarray(log_trajectory.x[time_separated_scene.sdc_index])
+    ego_y = np.asarray(log_trajectory.y[time_separated_scene.sdc_index])
+
+    expected = project_point_to_polyline(
+        source_polyline,
+        float(ego_x[transition.transition_frame]),
+        float(ego_y[transition.transition_frame]),
+    )["arc_length_m"]
+
+    assert ego_source_arc_length == pytest.approx(expected)
+
+
+def test_missing_merge_start_frame_no_silent_fallback():
+    from src.scenarios.lane_assignment import LaneTransition
+
+    transition = LaneTransition(
+        source_lane_id=1, target_lane_id=2, transition_frame=20,
+        source_start_frame=0, source_end_frame=19,
+        target_start_frame=20, target_end_frame=29,
+    )
+    ego_valid = np.ones(40, dtype=bool)
+    frame, valid, reason = _resolve_feature_reference_frame(
+        transition, None, ego_valid
+    )
+    assert frame is None
+    assert valid is False
+    assert reason == "merge_start_frame_unavailable"
+
+
+def test_invalid_ego_frame_no_silent_fallback():
+    from src.scenarios.lane_assignment import LaneTransition
+
+    transition = LaneTransition(
+        source_lane_id=1, target_lane_id=2, transition_frame=20,
+        source_start_frame=0, source_end_frame=19,
+        target_start_frame=20, target_end_frame=29,
+    )
+    ego_valid = np.ones(40, dtype=bool)
+    ego_valid[10] = False  # merge_start_frame candidate is invalid
+    frame, valid, reason = _resolve_feature_reference_frame(
+        transition, 10, ego_valid
+    )
+    assert frame is None
+    assert valid is False
+    assert reason == "merge_start_frame_invalid_ego_frame"
+
+
+def test_merge_start_frame_after_transition_frame_no_silent_fallback():
+    from src.scenarios.lane_assignment import LaneTransition
+
+    transition = LaneTransition(
+        source_lane_id=1, target_lane_id=2, transition_frame=20,
+        source_start_frame=0, source_end_frame=19,
+        target_start_frame=20, target_end_frame=29,
+    )
+    ego_valid = np.ones(40, dtype=bool)
+    frame, valid, reason = _resolve_feature_reference_frame(
+        transition, 25, ego_valid  # after transition_frame
+    )
+    assert frame is None
+    assert valid is False
+    assert reason == "merge_start_frame_after_transition_frame"
+
+
+def test_invalid_reference_leaves_feature_fields_blank(time_separated_scene):
+    """When the reference is invalid (no valid ego frame ever reaches
+    merge_start_s, so merge_start_frame comes back None), decision
+    -state feature fields must be None (blank), not silently computed
+    at transition_frame.
+    """
+    import copy
+    import types as _types
+
+    from src.scenarios.lane_geometry import extract_lane_polylines
+
+    transitions = _find_all_transitions(time_separated_scene)
+    transition = transitions[0]
+
+    polylines = extract_lane_polylines(time_separated_scene.state.roadgraph_points)
+    lane_by_id = {p.lane_id: p for p in polylines}
+    source_polyline = lane_by_id[transition.source_lane_id]
+    target_polyline = lane_by_id[transition.target_lane_id]
+
+    # Force merge_start_frame -> None by making ego invalid at every
+    # frame _derive_merge_frames would otherwise scan (source_start
+    # through target_end) -- no valid frame ever reaches merge_start_s,
+    # so _resolve_feature_reference_frame must return
+    # (None, False, "merge_start_frame_unavailable"), not fall back to
+    # transition_frame.
+    all_invalid_ego_valid = time_separated_scene.state.log_trajectory.valid.copy()
+    all_invalid_ego_valid[time_separated_scene.sdc_index, :] = False
+    tampered_log_trajectory = _types.SimpleNamespace(
+        **{
+            **vars(time_separated_scene.state.log_trajectory),
+            "valid": all_invalid_ego_valid,
+        }
+    )
+    tampered_state = _types.SimpleNamespace(
+        **{**vars(time_separated_scene.state), "log_trajectory": tampered_log_trajectory}
+    )
+    tampered_scene = _types.SimpleNamespace(
+        **{**vars(time_separated_scene), "state": tampered_state}
+    )
+
+    features = materialize_merge_features(
+        transition, source_polyline, target_polyline, None,
+        tampered_scene, _MERGE_TOPOLOGY_CONFIG, _AGENT_SELECTION_CONFIG,
+    )
+
+    assert features["feature_reference_valid"] is False
+    assert features["feature_reference_frame"] is None
+    assert features["feature_reference_reason"] == "merge_start_frame_unavailable"
+    assert features["merge_start_frame"] is None
+    assert features["ego_longitudinal_speed_mps"] is None
+    assert features["merge_distance_m"] is None
+    assert features["front_vehicle_id"] is None
+    assert features["front_ttc_s"] is None
+    assert features["traffic_density"] is None
+
+
+def test_accept_path_matches_direct_materialize_call(
+    time_separated_scene, time_separated_setup
+):
+    """The detector-ACCEPT dataset-scan path (build_candidate_records)
+    must produce identical feature-reference values to a direct
+    materialize_merge_features call -- single source of truth.
+    """
+    features_direct = materialize_merge_features(
+        *time_separated_setup, time_separated_scene,
+        _MERGE_TOPOLOGY_CONFIG, _AGENT_SELECTION_CONFIG,
+    )
+    records, error_info = build_candidate_records(
+        time_separated_scene, _LANE_ASSIGNMENT_CONFIG, _MERGE_TOPOLOGY_CONFIG,
+        _AGENT_SELECTION_CONFIG,
+    )
+    assert error_info is None
+    accept_records = [r for r in records if r.decision == "accept"]
+    assert len(accept_records) == 1
+    record = accept_records[0]
+
+    assert record.feature_reference_frame == features_direct["feature_reference_frame"]
+    assert record.feature_reference_valid == features_direct["feature_reference_valid"]
+    assert record.ego_longitudinal_speed_mps == pytest.approx(
+        features_direct["ego_longitudinal_speed_mps"]
+    )
+
+
+def test_csv_round_trip_preserves_new_fields(tmp_path, time_separated_scene, time_separated_setup):
+    records, error_info = build_candidate_records(
+        time_separated_scene, _LANE_ASSIGNMENT_CONFIG, _MERGE_TOPOLOGY_CONFIG,
+        _AGENT_SELECTION_CONFIG,
+    )
+    assert error_info is None
+    output_path = tmp_path / "candidates.csv"
+    write_candidates_csv(records, output_path)
+
+    with open(output_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    accept_rows = [r for r in rows if r["decision"] == "accept"]
+    assert len(accept_rows) == 1
+    row = accept_rows[0]
+    assert row["feature_reference_frame"] == str(_TIME_SEPARATED_MERGE_START_FRAME)
+    assert row["feature_reference_policy"] == "merge_start_frame"
+    assert row["feature_reference_valid"] == "True"
+    assert row["feature_reference_reason"] == ""

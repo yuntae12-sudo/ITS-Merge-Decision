@@ -45,6 +45,41 @@ ACCEPT-only fields for any manually-CONFIRMED_MERGE candidate whose
 original detector decision was REVIEW or REJECT (a human confirming a
 non-ACCEPT candidate as a genuine merge must still produce a complete,
 usable final-manifest row -- see that script's module docstring).
+
+Three distinct frame concepts (fix commit "materialize merge state at
+pre-merge reference frame")
+----------------------------------------------------------------------
+This module -- and the CandidateRecord schema -- deliberately keeps
+THREE separate frame fields, never overwriting one with another:
+
+  - ``transition_frame`` (``LaneTransition.transition_frame``): where
+    the stable target-lane run begins. This is the detector's own
+    anchor and is used, completely unchanged, for every
+    ``merge_detector.detect_merge`` gate exactly as before this fix
+    (including the source-lane-arc-length input the detector itself
+    computes at this frame).
+  - ``merge_start_frame`` (``_derive_merge_frames``): the first valid
+    ego frame where ego's source-lane arc length reaches
+    ``merge_start_s`` -- a geometry-inferred "merge region begins"
+    point, offline-derived exactly as before this fix.
+  - ``feature_reference_frame`` (NEW, ``_resolve_feature_reference_frame``):
+    the single frame at which ALL decision-state features (ego speed,
+    d_m, front/rear gap/relative-speed/TTC, traffic density) are
+    JOINTLY sampled. Preferred policy: equal to ``merge_start_frame``
+    when valid (see ``_resolve_feature_reference_frame``); before this
+    fix, ``materialize_merge_features`` sampled everything at
+    ``transition_frame`` instead, which is at/near merge completion
+    rather than a pre-merge decision point -- the root cause this
+    fix addresses (54/56 real ACCEPT rows previously showed
+    merge_distance_m < 1m as a direct result).
+
+Offline/online causality note: using logged future trajectory to
+locate ``merge_start_frame``/``feature_reference_frame`` is legitimate
+for OFFLINE dataset construction (Phase 1), but a future online
+PPO/FSM policy (Phase 3) must compute its own state causally from
+information available at-or-before the current simulation time --
+this offline reference-frame selection must never be read as a
+template for how an online policy would pick "when to look".
 """
 
 import csv
@@ -126,6 +161,14 @@ CANDIDATE_FIELDS = [
     "merge_end_s",
     "merge_start_frame",
     "merge_complete_frame",
+    # Feature-reference-frame schema (fix commit "materialize merge
+    # state at pre-merge reference frame") -- see module docstring
+    # "Three distinct frame concepts". Populated for every ACCEPT row
+    # (both valid and invalid references), never blank there.
+    "feature_reference_frame",
+    "feature_reference_policy",
+    "feature_reference_valid",
+    "feature_reference_reason",
     "ego_longitudinal_speed_mps",
     "merge_distance_m",
     "front_vehicle_id",
@@ -138,6 +181,19 @@ CANDIDATE_FIELDS = [
     "rear_ttc_s",
     "traffic_density",
 ]
+
+# The only feature-reference policy currently implemented (recorded on
+# every ACCEPT CandidateRecord even when the reference turns out to be
+# invalid -- it names which policy was ATTEMPTED, not whether it
+# succeeded).
+FEATURE_REFERENCE_POLICY_MERGE_START_FRAME = "merge_start_frame"
+
+# feature_reference_reason values (see _resolve_feature_reference_frame).
+FEATURE_REFERENCE_REASON_UNAVAILABLE = "merge_start_frame_unavailable"
+FEATURE_REFERENCE_REASON_INVALID_EGO_FRAME = "merge_start_frame_invalid_ego_frame"
+FEATURE_REFERENCE_REASON_AFTER_TRANSITION_FRAME = (
+    "merge_start_frame_after_transition_frame"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,6 +235,10 @@ class CandidateRecord:
     merge_end_s: Optional[float] = None
     merge_start_frame: Optional[int] = None
     merge_complete_frame: Optional[int] = None
+    feature_reference_frame: Optional[int] = None
+    feature_reference_policy: Optional[str] = None
+    feature_reference_valid: Optional[bool] = None
+    feature_reference_reason: Optional[str] = None
     ego_longitudinal_speed_mps: Optional[float] = None
     merge_distance_m: Optional[float] = None
     front_vehicle_id: Optional[int] = None
@@ -275,6 +335,48 @@ def _derive_merge_frames(
     return merge_start_frame, merge_complete_frame
 
 
+def _resolve_feature_reference_frame(
+    transition: LaneTransition,
+    merge_start_frame: Optional[int],
+    ego_valid: np.ndarray,
+) -> Tuple[Optional[int], bool, Optional[str]]:
+    """Resolves the single frame at which ALL decision-state features
+    (ego speed, d_m, front/rear gap/relative-speed/TTC, traffic
+    density) are jointly sampled (see module docstring "Three distinct
+    frame concepts").
+
+    Policy: ``feature_reference_frame = merge_start_frame`` when valid.
+    Valid iff ALL of:
+        - ``merge_start_frame is not None``
+        - it is a valid index into ``ego_valid``
+          (``0 <= merge_start_frame < len(ego_valid)``) AND
+          ``ego_valid[merge_start_frame]`` is True
+        - ``merge_start_frame <= transition.transition_frame`` (the
+          reference must be at-or-before merge completion, never
+          after)
+
+    No silent fallback: when invalid, returns ``(None, False, reason)``
+    -- callers must leave the decision-state feature fields blank
+    rather than falling back to ``transition_frame``.
+
+    Returns:
+        (feature_reference_frame_or_None, valid, reason_or_None)
+    """
+
+    if merge_start_frame is None:
+        return None, False, FEATURE_REFERENCE_REASON_UNAVAILABLE
+
+    if not (0 <= merge_start_frame < ego_valid.shape[0]) or not ego_valid[
+        merge_start_frame
+    ]:
+        return None, False, FEATURE_REFERENCE_REASON_INVALID_EGO_FRAME
+
+    if merge_start_frame > transition.transition_frame:
+        return None, False, FEATURE_REFERENCE_REASON_AFTER_TRANSITION_FRAME
+
+    return merge_start_frame, True, None
+
+
 def materialize_merge_features(
     transition: LaneTransition,
     source_polyline,
@@ -308,6 +410,18 @@ def materialize_merge_features(
         merge_topology_config: thresholds for merge_start_s/merge_end_s.
         agent_selection_config: thresholds for Front/Rear selection.
 
+    Note (fix commit "materialize merge state at pre-merge reference
+    frame"): ``ego_source_arc_length_m`` is the DETECTOR's own
+    source-lane arc-length input (computed at ``transition_frame`` by
+    the caller, fed into ``detect_merge`` -- unchanged by this
+    function). It is used here only to compute ``merge_start_s``/
+    ``merge_end_s`` (geometry constants, not frame-dependent) via
+    ``compute_merge_start_end_s``, which does not depend on
+    ``ego_source_arc_length_m`` at all. ``d_m`` and every other
+    decision-state feature below are instead (re)computed at the
+    resolved ``feature_reference_frame`` -- see module docstring
+    "Three distinct frame concepts".
+
     Returns:
         A dict with exactly the ACCEPT-only CandidateRecord field names
         as keys, ready to be splatted into a CandidateRecord/manifest
@@ -330,7 +444,6 @@ def materialize_merge_features(
     merge_start_s, merge_end_s = compute_merge_start_end_s(
         source_polyline, target_polyline, merge_topology_config
     )
-    d_m = compute_remaining_merge_distance(merge_end_s, ego_source_arc_length_m)
 
     merge_start_frame, merge_complete_frame = _derive_merge_frames(
         transition,
@@ -342,7 +455,57 @@ def materialize_merge_features(
         merge_end_s,
     )
 
-    frame = transition.transition_frame
+    (
+        feature_reference_frame,
+        feature_reference_valid,
+        feature_reference_reason,
+    ) = _resolve_feature_reference_frame(transition, merge_start_frame, ego_valid)
+
+    base = dict(
+        merge_start_s=merge_start_s,
+        merge_end_s=merge_end_s,
+        merge_start_frame=merge_start_frame,
+        merge_complete_frame=merge_complete_frame,
+        feature_reference_frame=feature_reference_frame,
+        feature_reference_policy=FEATURE_REFERENCE_POLICY_MERGE_START_FRAME,
+        feature_reference_valid=feature_reference_valid,
+        feature_reference_reason=feature_reference_reason,
+    )
+
+    if not feature_reference_valid:
+        # No silent fallback to transition_frame: every decision-state
+        # feature is left blank/None, an explicit "could not compute a
+        # valid pre-merge snapshot" state (see module docstring and
+        # _resolve_feature_reference_frame).
+        base.update(
+            ego_longitudinal_speed_mps=None,
+            merge_distance_m=None,
+            front_vehicle_id=None,
+            front_gap_m=None,
+            front_relative_speed_mps=None,
+            front_ttc_s=None,
+            rear_vehicle_id=None,
+            rear_gap_m=None,
+            rear_relative_speed_mps=None,
+            rear_ttc_s=None,
+            traffic_density=None,
+        )
+        return base
+
+    frame = feature_reference_frame
+
+    # Fresh source-lane projection AT feature_reference_frame -- a NEW
+    # projection, separate from the detector's own arc-length input
+    # (computed at transition_frame and never touched by this
+    # function). d_m must come from THIS projection, not the
+    # detector's.
+    reference_source_projection = project_point_to_polyline(
+        source_polyline, float(ego_x[frame]), float(ego_y[frame])
+    )
+    reference_ego_source_arc_length_m = reference_source_projection["arc_length_m"]
+    d_m = compute_remaining_merge_distance(
+        merge_end_s, reference_ego_source_arc_length_m
+    )
 
     features = extract_interaction_features(
         frame_index=frame,
@@ -366,11 +529,7 @@ def materialize_merge_features(
         config=agent_selection_config,
     )
 
-    return dict(
-        merge_start_s=merge_start_s,
-        merge_end_s=merge_end_s,
-        merge_start_frame=merge_start_frame,
-        merge_complete_frame=merge_complete_frame,
+    base.update(
         ego_longitudinal_speed_mps=features.ego_longitudinal_speed_mps,
         merge_distance_m=features.merge_distance_m,
         front_vehicle_id=features.front_vehicle_id,
@@ -383,6 +542,7 @@ def materialize_merge_features(
         rear_ttc_s=features.rear_ttc_s,
         traffic_density=features.traffic_density,
     )
+    return base
 
 
 def reconstruct_transition(

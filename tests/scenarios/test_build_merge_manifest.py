@@ -689,6 +689,8 @@ def test_case_j_front_rear_inconsistency_raises():
         "merge_start_s": "1.0",
         "merge_end_s": "2.0",
         "merge_complete_frame": "10",
+        "feature_reference_valid": "True",
+        "feature_reference_reason": "",
         "ego_longitudinal_speed_mps": "10.0",
         "merge_distance_m": "5.0",
         "traffic_density": "0",
@@ -716,6 +718,8 @@ def test_case_j_valid_row_passes():
         "merge_start_s": "1.0",
         "merge_end_s": "2.0",
         "merge_complete_frame": "10",
+        "feature_reference_valid": "True",
+        "feature_reference_reason": "",
         "ego_longitudinal_speed_mps": "10.0",
         "merge_distance_m": "5.0",
         "traffic_density": "0",
@@ -729,6 +733,40 @@ def test_case_j_valid_row_passes():
         "rear_ttc_s": float("inf"),
     }
     validate_manifest_row(row)  # must not raise
+
+
+def test_case_j_invalid_feature_reference_raises():
+    """A row with feature_reference_valid=False must fail loudly (fix
+    commit "materialize merge state at pre-merge reference frame") --
+    a CONFIRMED_MERGE candidate must never silently enter the final
+    manifest with an invalid pre-merge feature reference.
+    """
+    row = {
+        "candidate_id": "shard#0__t10__1_2",
+        "scene_key": "shard#0",
+        "record_index": "0",
+        "source_lane_id": "1",
+        "target_lane_id": "2",
+        "transition_frame": "10",
+        "merge_start_s": "1.0",
+        "merge_end_s": "2.0",
+        "merge_complete_frame": "10",
+        "feature_reference_valid": "False",
+        "feature_reference_reason": "merge_start_frame_unavailable",
+        "ego_longitudinal_speed_mps": "10.0",
+        "merge_distance_m": "5.0",
+        "traffic_density": "0",
+        "front_vehicle_id": "",
+        "front_gap_m": "",
+        "front_relative_speed_mps": "",
+        "front_ttc_s": float("inf"),
+        "rear_vehicle_id": "",
+        "rear_gap_m": "",
+        "rear_relative_speed_mps": "",
+        "rear_ttc_s": float("inf"),
+    }
+    with pytest.raises(ValueError, match="feature_reference_valid is not True"):
+        validate_manifest_row(row)
 
 
 # ---------------------------------------------------------------------

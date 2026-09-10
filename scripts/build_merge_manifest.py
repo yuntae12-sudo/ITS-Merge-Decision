@@ -109,6 +109,10 @@ MANIFEST_FIELDS = [
     "transition_frame",
     "merge_start_frame",
     "merge_complete_frame",
+    "feature_reference_frame",
+    "feature_reference_policy",
+    "feature_reference_valid",
+    "feature_reference_reason",
     "merge_start_s",
     "merge_end_s",
     "ego_longitudinal_speed_mps",
@@ -276,9 +280,10 @@ def validate_manifest_row(row: dict) -> None:
     Raises:
         ValueError: a clear, structured error naming the candidate_id
             and which field(s) failed, if any required field is
-            missing/invalid, or the front/rear consistency invariant
-            (see module docstring) is violated. Never silently drops
-            or pads a row.
+            missing/invalid, the feature-reference-frame is invalid
+            (see below), or the front/rear consistency invariant (see
+            module docstring) is violated. Never silently drops or
+            pads a row.
     """
 
     candidate_id = row.get("candidate_id", "<unknown>")
@@ -291,6 +296,21 @@ def validate_manifest_row(row: dict) -> None:
         raise ValueError(
             f"Incomplete manifest row for candidate_id={candidate_id}: "
             f"missing/blank required field(s): {missing}"
+        )
+
+    # feature_reference_valid required-field-style check (fix commit
+    # "materialize merge state at pre-merge reference frame"): a
+    # CONFIRMED_MERGE row must fail loudly rather than silently write
+    # an incomplete/invalid-reference row into the final manifest.
+    feature_reference_valid = row.get("feature_reference_valid")
+    if str(feature_reference_valid) != "True":
+        reason = row.get("feature_reference_reason") or "<unknown>"
+        raise ValueError(
+            f"Refusing to write manifest row for candidate_id={candidate_id}: "
+            f"feature_reference_valid is not True (reason={reason!r}) -- "
+            "a CONFIRMED_MERGE candidate must have a valid pre-merge "
+            "feature reference frame before it can enter the final "
+            "manifest."
         )
 
     errors: list = []
@@ -566,6 +586,10 @@ def build_manifest(
             "transition_frame": row["transition_frame"],
             "merge_start_frame": features["merge_start_frame"],
             "merge_complete_frame": features["merge_complete_frame"],
+            "feature_reference_frame": features["feature_reference_frame"],
+            "feature_reference_policy": features["feature_reference_policy"],
+            "feature_reference_valid": features["feature_reference_valid"],
+            "feature_reference_reason": features["feature_reference_reason"],
             "merge_start_s": features["merge_start_s"],
             "merge_end_s": features["merge_end_s"],
             "ego_longitudinal_speed_mps": features["ego_longitudinal_speed_mps"],
