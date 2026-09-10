@@ -558,6 +558,104 @@ def test_overlapping_gap_not_clamped_and_ttc_zero():
     assert features.front_ttc_s == pytest.approx(0.0)
 
 
+def test_target_rear_ordering_before_polyline_start():
+    """Stage B-0 fix: ego and a real rear vehicle both project before
+    the target polyline's own start (a realistic early pre-merge
+    scenario, per the Stage A/B-0 diagnostic finding that
+    merge_start_frame consistently lands here). Both points sit
+    exactly on the polyline's own extended centerline (y=0) so
+    project_point_to_polyline's nearest-point lateral-distance
+    measurement at the boundary segment stays within
+    ``max_target_lane_lateral_distance_m`` for both -- isolating the
+    longitudinal-ordering bug this fix targets from that unrelated
+    boundary lateral-distance quirk.
+
+    Before the fix, both ego (-3.0) and the rear candidate (-4.0)
+    clamped to the identical arc_length_m=0.0, making relative_s
+    exactly 0.0 for both -- neither > 0 nor < 0 -- so the rear vehicle
+    was silently dropped. After the fix
+    (project_point_to_polyline_signed), their true 1 m longitudinal
+    separation is preserved and rear is found.
+    """
+
+    target = _make_straight_target()
+
+    # ego 3 m before the target lane's start (x=0), on-centerline.
+    ego_s_m = -3.0
+
+    (
+        object_ids, x, y, yaw, vel_x, vel_y, length, object_types, valid,
+    ) = _agents(
+        [
+            (2, -4.0, 0.0, 0.0, 20.0, 0.0, 4.5, 1, True),  # true rear, 1m behind ego
+            (3, 20.0, 0.0, 0.0, 15.0, 0.0, 4.5, 1, True),  # true front, well ahead
+        ]
+    )
+
+    front_id, front_s, rear_id, rear_s = find_target_lane_front_rear(
+        target,
+        ego_s_m=ego_s_m,
+        ego_id=1,
+        frame_index=0,
+        object_ids=object_ids,
+        object_types=object_types,
+        valid=valid,
+        x=x,
+        y=y,
+        yaw=yaw,
+        config=DEFAULT_CONFIG,
+    )
+
+    assert rear_id == 2
+    assert rear_s == pytest.approx(-4.0, abs=1e-3)
+    assert front_id == 3
+    assert front_s == pytest.approx(20.0, abs=1e-3)
+
+
+def test_ego_signed_projection_used_end_to_end():
+    """extract_interaction_features must use the SIGNED target-lane
+    projection for ego (not the clamped one) when computing
+    front/rear gaps, so a pre-polyline-start ego still gets a
+    physically correct bumper-to-bumper gap rather than one computed
+    against an artificially-clamped ego_s=0."""
+
+    target = _make_straight_target()
+
+    (
+        object_ids, x, y, yaw, vel_x, vel_y, length, object_types, valid,
+    ) = _agents(
+        [
+            (2, -4.0, 0.0, 0.0, 20.0, 0.0, 4.5, 1, True),  # rear
+        ]
+    )
+
+    features = extract_interaction_features(
+        frame_index=0,
+        target_polyline=target,
+        merge_distance_m=0.0,
+        ego_id=1,
+        ego_x=-3.0,
+        ego_y=0.0,
+        ego_vel_x=10.0,
+        ego_vel_y=0.0,
+        ego_length_m=4.5,
+        object_ids=object_ids,
+        object_types=object_types,
+        valid=valid,
+        x=x,
+        y=y,
+        yaw=yaw,
+        vel_x=vel_x,
+        vel_y=vel_y,
+        length=length,
+        config=DEFAULT_CONFIG,
+    )
+
+    assert features.rear_vehicle_id == 2
+    # bumper-to-bumper: (ego_s - rear_s) - 0.5*(4.5+4.5) = (-3 - -4) - 4.5 = -3.5
+    assert features.rear_gap_m == pytest.approx(-3.5, abs=1e-3)
+
+
 def test_non_vehicle_type_excluded():
 
     target = _make_straight_target()

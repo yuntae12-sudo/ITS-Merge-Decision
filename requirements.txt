@@ -1,5 +1,5 @@
 jax[cuda12]
-git+https://github.com/waymo-research/waymax.git@main#egg=waymo-waymax
+git+https://github.com/waymo-research/waymax.git@a64dfec9be8576b60d9cecc94f406d9812d4a7d0#egg=waymo-waymax
 tensorflow
 numpy
 matplotlib

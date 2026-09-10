@@ -16,6 +16,7 @@ from src.scenarios.lane_geometry import (
     extract_lane_polylines,
     nearest_lane_candidates,
     project_point_to_polyline,
+    project_point_to_polyline_signed,
 )
 
 
@@ -300,3 +301,100 @@ def test_project_point_to_polyline_requires_two_points():
 
     with pytest.raises(ValueError):
         project_point_to_polyline(polyline, x=0.0, y=0.0)
+
+
+# --- Stage B-0 fix: project_point_to_polyline_signed ---
+#
+# project_point_to_polyline CLAMPS arc_length_m to the polyline's own
+# domain [0, total_length] -- correct for merge_detector.py's
+# endpoint/d_m measurements, but wrong for relative front/rear
+# ordering: two physically distinct points both upstream (or both
+# downstream) of the polyline collapse to the SAME clamped arc
+# length, making their difference exactly 0.0 instead of reflecting
+# their true relative order. project_point_to_polyline_signed fixes
+# this by extending the boundary segment's own local tangent instead
+# of clamping.
+
+
+def test_signed_projection_matches_clamped_for_interior_point():
+
+    roadgraph_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    clamped = project_point_to_polyline(polyline, x=5.0, y=2.0)
+    signed = project_point_to_polyline_signed(polyline, x=5.0, y=2.0)
+
+    assert signed["arc_length_m"] == pytest.approx(
+        clamped["arc_length_m"], abs=1e-6
+    )
+    assert signed["lateral_distance_m"] == pytest.approx(
+        clamped["lateral_distance_m"], abs=1e-6
+    )
+    assert signed["heading_rad"] == pytest.approx(
+        clamped["heading_rad"], abs=1e-6
+    )
+
+
+def test_signed_projection_goes_negative_before_polyline_start():
+
+    roadgraph_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    # 5 m before the polyline's own start (x=0), still on the lane's
+    # centerline extended backward.
+    clamped = project_point_to_polyline(polyline, x=-5.0, y=0.0)
+    signed = project_point_to_polyline_signed(polyline, x=-5.0, y=0.0)
+
+    assert clamped["arc_length_m"] == pytest.approx(0.0, abs=1e-6)
+    assert signed["arc_length_m"] == pytest.approx(-5.0, abs=1e-3)
+
+
+def test_signed_projection_exceeds_length_past_polyline_end():
+
+    roadgraph_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    clamped = project_point_to_polyline(polyline, x=15.0, y=0.0)
+    signed = project_point_to_polyline_signed(polyline, x=15.0, y=0.0)
+
+    assert clamped["arc_length_m"] == pytest.approx(10.0, abs=1e-6)
+    assert signed["arc_length_m"] == pytest.approx(15.0, abs=1e-3)
+
+
+def test_signed_projection_preserves_relative_order_before_start():
+    """The exact bug this fix targets: two points both upstream of the
+    polyline's start must NOT both collapse to arc_length_m=0.0 --
+    their true relative order (5 m apart) must be preserved."""
+
+    roadgraph_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    near = project_point_to_polyline(polyline, x=-2.0, y=0.0)
+    far = project_point_to_polyline(polyline, x=-7.0, y=0.0)
+    assert near["arc_length_m"] == far["arc_length_m"] == pytest.approx(
+        0.0, abs=1e-6
+    )  # the bug: both clamp to the same value
+
+    near_signed = project_point_to_polyline_signed(polyline, x=-2.0, y=0.0)
+    far_signed = project_point_to_polyline_signed(polyline, x=-7.0, y=0.0)
+    assert near_signed["arc_length_m"] > far_signed["arc_length_m"]
+    assert near_signed["arc_length_m"] - far_signed["arc_length_m"] == (
+        pytest.approx(5.0, abs=1e-3)
+    )
+
+
+def test_signed_projection_requires_two_points():
+
+    roadgraph_points = _make_roadgraph_points({1: [(0.0, 0.0)]})
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    with pytest.raises(ValueError):
+        project_point_to_polyline_signed(polyline, x=0.0, y=0.0)

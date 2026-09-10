@@ -400,3 +400,124 @@ def project_point_to_polyline(polyline: LanePolyline, x: float, y: float):
         "heading_rad": heading,
         "segment_index": segment_index,
     }
+
+
+def project_point_to_polyline_signed(polyline: LanePolyline, x: float, y: float):
+    """Projects a point onto a polyline with an UNCLAMPED longitudinal
+    coordinate that may fall outside ``[0, polyline.arc_length[-1]]``.
+
+    ``project_point_to_polyline`` clamps its returned ``arc_length_m``
+    to the polyline's own domain (``t_clamped = clip(t, 0, 1)`` per
+    segment), which is correct for its existing callers -- e.g.
+    ``merge_detector.py``'s endpoint-distance/``d_m`` measurements,
+    which are specifically about the polyline's own physical extent.
+
+    That same clamp is wrong for RELATIVE-ORDERING use (Stage B-0
+    fix): when a query point's true nearest position on the polyline's
+    infinite tangent line falls before the first point or after the
+    last, clamping BOTH ego's own projection and any candidate
+    vehicle's projection to the same boundary arc length (0.0 or the
+    polyline's total length) collapses their relative order --
+    ``relative_s = candidate_s - ego_s`` becomes exactly 0.0 for two
+    physically distinct vehicles that are both upstream (or both
+    downstream) of the polyline, silently excluding a real rear (or
+    front) vehicle from ``find_target_lane_front_rear``'s selection
+    (see Stage A/B-0 diagnostic: this pinned ``ego_s=0`` for 20/20
+    sampled ACCEPT candidates at ``merge_start_frame``, even at only
+    1.27 m lateral distance from the lane).
+
+    This function keeps the existing, uninterpolated per-point
+    ``direction`` vectors already reconstructed by
+    ``extract_lane_polylines`` -- the boundary segment's OWN local
+    tangent, not a separately-invented backward-extension line -- and
+    linearly extrapolates the longitudinal coordinate along that
+    tangent past the boundary. It reuses the nearest-segment search
+    used by ``project_point_to_polyline`` and only diverges in how the
+    arc length at the two boundary segments is computed. Interior
+    segments are unaffected (behave identically to
+    ``project_point_to_polyline``), since a point whose nearest segment
+    is interior always has ``t`` already in ``[0, 1]``.
+
+    Args:
+        polyline: the lane to project onto.
+        x: query point x.
+        y: query point y.
+
+    Returns:
+        A dict with the same keys as ``project_point_to_polyline``,
+        except ``arc_length_m`` is signed and may be negative (before
+        the polyline start) or exceed the polyline's total length
+        (after its end).
+    """
+
+    xy = polyline.xy
+
+    if xy.shape[0] < 2:
+        raise ValueError(
+            f"Polyline {polyline.lane_id} has fewer than 2 points; "
+            "cannot project onto a segment."
+        )
+
+    seg_start = xy[:-1]
+    seg_end = xy[1:]
+    seg_vec = seg_end - seg_start
+    seg_len_sq = np.einsum("ij,ij->i", seg_vec, seg_vec)
+    seg_len_sq = np.where(seg_len_sq == 0.0, 1e-12, seg_len_sq)
+
+    point = np.array([x, y], dtype=np.float64)
+    to_point = point[None, :] - seg_start
+
+    t = np.einsum("ij,ij->i", to_point, seg_vec) / seg_len_sq
+    t_clamped = np.clip(t, 0.0, 1.0)
+
+    projected = seg_start + t_clamped[:, None] * seg_vec
+    distances = np.hypot(
+        point[0] - projected[:, 0],
+        point[1] - projected[:, 1],
+    )
+
+    segment_index = int(np.argmin(distances))
+    num_segments = seg_vec.shape[0]
+
+    seg_direction = seg_vec[segment_index]
+    seg_direction_norm = np.linalg.norm(seg_direction)
+
+    if seg_direction_norm == 0.0:
+        heading = 0.0
+        lateral_sign = 1.0
+    else:
+        unit_direction = seg_direction / seg_direction_norm
+        heading = float(np.arctan2(unit_direction[1], unit_direction[0]))
+        perpendicular = np.array([-unit_direction[1], unit_direction[0]])
+        offset = point - projected[segment_index]
+        lateral_sign = np.sign(np.dot(offset, perpendicular)) or 1.0
+
+    arc_start = polyline.arc_length[segment_index]
+    arc_end = polyline.arc_length[segment_index + 1]
+
+    is_first_segment = segment_index == 0
+    is_last_segment = segment_index == num_segments - 1
+    t_raw = float(t[segment_index])
+
+    if is_first_segment and t_raw < 0.0:
+        # Before the polyline start: extend backward along this
+        # segment's own local tangent, matching heading/lateral_sign
+        # convention (unit_direction points from xy[0] toward xy[1]).
+        arc_length_m = arc_start + t_raw * (arc_end - arc_start)
+    elif is_last_segment and t_raw > 1.0:
+        # Past the polyline end: extend forward along this segment's
+        # own local tangent.
+        arc_length_m = arc_start + t_raw * (arc_end - arc_start)
+    else:
+        arc_length_m = arc_start + t_clamped[segment_index] * (
+            arc_end - arc_start
+        )
+
+    return {
+        "arc_length_m": float(arc_length_m),
+        "lateral_distance_m": float(
+            lateral_sign * distances[segment_index]
+        ),
+        "heading_rad": heading,
+        "segment_index": segment_index,
+    }
