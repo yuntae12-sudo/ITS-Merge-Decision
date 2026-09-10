@@ -37,6 +37,45 @@ BLEND_DISTANCE_M = 8.0
 # reproducible given the same two polylines and ego position.
 BLEND_SAMPLE_COUNT = 9
 
+# Stage B-1.5 (Section A4) fix: minimum longitudinal window the
+# reference must span in SOURCE-lane arc length before it switches to
+# tracking the TARGET lane directly instead. Real-data robustness
+# testing found that whenever `source_remaining_m` (the source lane's
+# remaining length ahead of ego) shrank toward zero -- either at
+# episode start (a merge_start_frame already near the source lane's
+# own end) or mid-episode (ego approaching the source lane's end under
+# nominal cruise) -- every blend sample's SOURCE-side point collapsed
+# to nearly the same clamped endpoint (`_interpolate_polyline_xy`
+# intentionally clamps, so it cannot extrapolate past the
+# reconstructed source geometry). Blending a near-duplicate source
+# point against a genuinely-advancing target point is ill-conditioned
+# for the finite-difference heading computation below: neighboring
+# blended points barely differ in position but can swing in direction,
+# producing an oscillating reference heading that saturates steering
+# (observed directly: a representative TRAIN-split sample had 4/7
+# maneuvers reach `failure_offroad` with steering pinned at or near
+# MAX_STEERING_CURVATURE exactly when `d_m` approached 0).
+#
+# An earlier version of this fix (still Stage B-1.5) tried to sample a
+# bounded window along the TARGET lane's own arc length once past this
+# threshold -- but that reintroduced the identical bug on the target
+# side: a CHAINED maneuver whose ego travels far enough along the
+# target lane (e.g. cruising well past the transition boundary before
+# the next chain-advance) drives `ego_target_s` past the target
+# polyline's own reconstructed length, so that windowed sample
+# degenerated exactly the same way (observed directly: MAN_0062 and
+# MAN_0071, both 2-transition chained maneuvers, reached
+# `failure_collision` with steering suddenly pinned at
+# MAX_STEERING_CURVATURE many frames after `d_m` first reached 0, i.e.
+# well past the transition, not at it). The general fix does not
+# construct any bounded sample window at all below this threshold: it
+# hands the low-level controller the TARGET polyline directly, which
+# already spans its own complete reconstructed geometry (Phase 1's
+# ``extract_lane_polylines`` output) and is tracked by
+# ``project_point_to_polyline`` exactly like any other reference lane
+# -- there is no shorter, separately-bounded window left to degenerate.
+MIN_SOURCE_BLEND_WINDOW_M = 3.0
+
 
 @dataclasses.dataclass(frozen=True)
 class MergeReference:
@@ -71,12 +110,17 @@ def build_merge_reference(
     the same early-pre-merge situation that motivated the Stage B-0
     fix in the first place).
 
-    The blend window is capped by whichever of the source lane's
-    remaining length (from ego's position) or the target lane's own
-    total length is shorter (bug found in real-data smoke testing,
-    Stage B-1: a short target-lane segment, e.g. ~12 m total, made
-    later blend samples all project past the target polyline's own
-    end, clamping to nearly the same terminal point and producing a
+    Once ego's remaining distance on the source lane drops below
+    ``MIN_SOURCE_BLEND_WINDOW_M``, this returns the TARGET polyline
+    directly (no sampled/blended window at all -- see the constant's
+    docstring for why a second bounded window on the target side
+    reintroduces the identical degeneracy). Otherwise the blend window
+    is capped by whichever of the source lane's remaining length (from
+    ego's position) or the target lane's own total length is shorter
+    (bug found in real-data smoke testing, Stage B-1: a short
+    target-lane segment, e.g. ~12 m total, made later blend samples
+    all project past the target polyline's own end, clamping to
+    nearly the same terminal point and producing a
     degenerate/oscillating reference heading that saturated the
     steering command and caused a spurious collision). Without this
     cap, the fixed BLEND_DISTANCE_M could exceed either lane's actual
@@ -88,24 +132,29 @@ def build_merge_reference(
     )["arc_length_m"]
 
     source_remaining_m = max(source_polyline.arc_length[-1] - ego_source_s, 0.0)
+
+    if source_remaining_m < MIN_SOURCE_BLEND_WINDOW_M:
+        return MergeReference(polyline=target_polyline)
+
     target_total_m = target_polyline.arc_length[-1]
+    sample_fractions = np.linspace(0.0, 1.0, BLEND_SAMPLE_COUNT)
+    points = np.empty((BLEND_SAMPLE_COUNT, 2), dtype=np.float64)
+
     effective_blend_distance_m = max(
         min(BLEND_DISTANCE_M, source_remaining_m, target_total_m),
         1.0,  # never degenerate to a zero-length window
     )
-
-    sample_fractions = np.linspace(0.0, 1.0, BLEND_SAMPLE_COUNT)
     sample_source_s = ego_source_s + sample_fractions * effective_blend_distance_m
 
-    points = np.empty((BLEND_SAMPLE_COUNT, 2), dtype=np.float64)
     for i, (fraction, source_s) in enumerate(
         zip(sample_fractions, sample_source_s)
     ):
         source_xy = _interpolate_polyline_xy(source_polyline, source_s)
 
-        # Project that source-lane point onto the target lane to find
-        # the corresponding target-lane point at (approximately) the
-        # same longitudinal progress, then blend toward it.
+        # Project that source-lane point onto the target lane to
+        # find the corresponding target-lane point at
+        # (approximately) the same longitudinal progress, then
+        # blend toward it.
         target_projection = project_point_to_polyline(
             target_polyline, source_xy[0], source_xy[1]
         )

@@ -11,6 +11,12 @@ data/*
 data/manifests/*
 !data/manifests/.gitkeep
 
+# Phase 2 Stage B-1.5: the maneuver_id -> scene_key -> split assignment
+# is a frozen research decision (controller/FSM threshold tuning must
+# never see validation-split scenes), not a regeneratable dataset
+# artifact -- tracked deliberately, unlike the other manifests above.
+!data/manifests/phase2_dataset_split.csv
+
 # Generated outputs
 outputs/*
 !outputs/.gitkeep
