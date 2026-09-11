@@ -138,20 +138,31 @@ class FsmDecision:
 
 def _target_gap_safe(observation) -> bool:
     """True if EITHER the target-lane front slot or the target-lane
-    rear slot is absent, or -- when present -- both TTC and gap clear
+    rear slot is absent, or -- when present -- BOTH TTC and gap clear
     their safety thresholds. Both front and rear must independently be
-    safe for MERGE to be proposed."""
+    safe for MERGE to be proposed.
+
+    Stage B-2.6 semantic correction: this predicate used to accept a
+    slot as safe if EITHER TTC OR gap cleared its threshold. That is
+    unsound given ``observation_builder``'s TTC encoding: a present,
+    non-closing (or diverging) vehicle is reported at the
+    ``TTC_CAP_S`` (100s) sentinel regardless of how physically close it
+    is (see ``_encode_vehicle_slot``), so the OR form judged a vehicle
+    2m away "safe" purely because it wasn't currently closing --
+    confirmed empirically during the Stage B-2.5 audit. Requiring BOTH
+    conditions (AND) keeps the intended physical meaning: don't merge
+    next to a vehicle that is both close AND not opening distance."""
 
     front_present = observation[_TARGET_FRONT_PRESENT] == 1.0
     front_safe = (not front_present) or (
         observation[_TARGET_FRONT_TTC] >= TTC_SAFE_S
-        or observation[_TARGET_FRONT_GAP] >= GAP_SAFE_M
+        and observation[_TARGET_FRONT_GAP] >= GAP_SAFE_M
     )
 
     rear_present = observation[_TARGET_REAR_PRESENT] == 1.0
     rear_safe = (not rear_present) or (
         observation[_TARGET_REAR_TTC] >= TTC_SAFE_S
-        or observation[_TARGET_REAR_GAP] >= GAP_SAFE_M
+        and observation[_TARGET_REAR_GAP] >= GAP_SAFE_M
     )
 
     return front_safe and rear_safe

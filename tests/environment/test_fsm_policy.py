@@ -83,15 +83,52 @@ def test_unsafe_target_rear_prevents_merge():
     assert decision.action != BehaviorAction.MERGE
 
 
-def test_safe_target_gap_by_ttc_merges_despite_close_gap():
-    """Gap alone below threshold is still safe if TTC clears (not
-    closing) -- the two conditions are OR'd (Section: `_target_gap_safe`)."""
+def test_close_gap_prevents_merge_even_when_not_closing():
+    """Stage B-2.6: gap alone below threshold is UNSAFE even if TTC
+    clears (not closing) -- the two conditions are AND'd
+    (`_target_gap_safe`). A present, non-closing/diverging vehicle is
+    reported at the TTC_CAP_S sentinel regardless of true proximity
+    (see ``observation_builder._encode_vehicle_slot``), so TTC alone
+    cannot certify safety when the vehicle is physically close."""
 
     obs = make_observation(
         target_front_present=1.0,
         target_front_gap=GAP_SAFE_M - 1.0,
         target_front_ttc=TTC_CAP_S,
     )
+    decision = FSM.decide(obs)
+    assert decision.action != BehaviorAction.MERGE
+
+
+def test_close_ttc_prevents_merge_even_with_ample_gap():
+    """Stage B-2.6: TTC alone below threshold is UNSAFE even if the
+    instantaneous gap clears -- a closing vehicle 11m away that will
+    reach the gap in 1s is not safe to merge in front of/behind."""
+
+    obs = make_observation(
+        target_front_present=1.0,
+        target_front_gap=GAP_SAFE_M + 1.0,
+        target_front_ttc=TTC_SAFE_S - 3.0,
+    )
+    decision = FSM.decide(obs)
+    assert decision.action != BehaviorAction.MERGE
+
+
+def test_both_gap_and_ttc_clear_merges():
+    """Stage B-2.6: both conditions clearing their thresholds is still
+    sufficient for a present slot to be judged safe."""
+
+    obs = make_observation(
+        target_front_present=1.0,
+        target_front_gap=GAP_SAFE_M + 1.0,
+        target_front_ttc=TTC_SAFE_S + 1.0,
+    )
+    decision = FSM.decide(obs)
+    assert decision.action == BehaviorAction.MERGE
+
+
+def test_absent_slot_is_still_safe():
+    obs = make_observation(target_front_present=0.0)
     decision = FSM.decide(obs)
     assert decision.action == BehaviorAction.MERGE
 

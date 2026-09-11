@@ -88,10 +88,10 @@ def _classify_reset_state(observation) -> dict:
 
     merge_safe = _target_gap_safe(observation)
     target_front_blocking = target_front_present and not (
-        target_front_ttc >= TTC_SAFE_S or target_front_gap >= GAP_SAFE_M
+        target_front_ttc >= TTC_SAFE_S and target_front_gap >= GAP_SAFE_M
     )
     target_rear_blocking = target_rear_present and not (
-        target_rear_ttc >= TTC_SAFE_S or target_rear_gap >= GAP_SAFE_M
+        target_rear_ttc >= TTC_SAFE_S and target_rear_gap >= GAP_SAFE_M
     )
     stop_margin_state = d_m < STOP_MARGIN_M
     source_front_relevant = source_front_present
