@@ -42,8 +42,18 @@ class EpisodeContext:
     single-candidate maneuver this is exactly [source, target]."""
 
     merge_start_frame: int
-    """Episode start reference (Stage A, unchanged): the FIRST
-    candidate's merge_start_frame."""
+    """The FIRST candidate's merge_start_frame -- Phase 1's canonical
+    physical merge-region reference. NOT the simulation/episode start
+    (see ``decision_start_frame`` below, Stage B-2.8); kept unchanged
+    for merge-region geometry and as the causal-success progress
+    reference maneuver tables already store it as."""
+
+    decision_start_frame: int
+    """Phase 2 Stage B-2.8: the actual simulation/policy episode start
+    frame (``src.environment.decision_window.compute_decision_start_
+    frame``'s result) -- the earliest causal frame at which the raw
+    lane assignment already matches the source lane. Always
+    <= merge_start_frame for a resolvable maneuver."""
 
     active_transition_index: int = 0
     """Which (source, target) pair in the chain is currently active.

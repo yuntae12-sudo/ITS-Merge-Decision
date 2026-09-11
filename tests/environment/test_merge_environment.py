@@ -370,22 +370,31 @@ def test_horizon_truncation_fires_when_nothing_else_terminates(monkeypatch):
     reaches the configured horizon, if no other termination condition
     (success/collision/offroad) fires first.
 
-    Uses a monkeypatched, deliberately short horizon (3 steps) rather
-    than the real MAX_EPISODE_HORIZON_FRAMES=100: real ACCEPT
-    candidates' merge_start_frame is, by construction, already close
-    to their eventual transition_frame (Phase 1 Stage B: median gap
-    16 frames, max 52) -- direct rollout testing found EVERY real
+    Uses a monkeypatched, deliberately short base horizon
+    (``MAX_EPISODE_HORIZON_FRAMES=3``) rather than the real 100: real
+    ACCEPT candidates' merge_start_frame is, by construction, already
+    close to their eventual transition_frame (Phase 1 Stage B: median
+    gap 16 frames, max 52) -- direct rollout testing found EVERY real
     maneuver tried reaches success, collision, or offroad well before
     100 steps under simple KEEP/STOP actions, since even a decelerating
     or holding vehicle's forward momentum is often enough to complete a
     already-close, already-converging real merge geometry. Reaching
     the horizon specifically requires a scenario where nothing else
-    happens for 100 steps, which real ACCEPT candidates are not
+    happens for the full horizon, which real ACCEPT candidates are not
     selected to have -- so this test verifies the wiring/mechanism
     directly (already covered in isolation by
     test_termination.py::test_termination_truncation_at_horizon)
-    rather than depending on finding a real scene that survives 100
-    steps completely uneventfully.
+    rather than depending on finding a real scene that survives the
+    full horizon completely uneventfully.
+
+    Stage B-2.8: the environment's EFFECTIVE horizon is no longer the
+    bare ``MAX_EPISODE_HORIZON_FRAMES`` constant -- ``_resolve_episode_
+    horizon`` extends it by ``merge_start_frame - decision_start_frame``
+    so starting the episode earlier (at the causal decision_start_frame)
+    doesn't shrink the old absolute post-merge-start opportunity (see
+    ``_resolve_episode_horizon`` docstring). This test reads the actual
+    effective horizon back from ``info["episode_horizon"]`` rather than
+    assuming it equals the bare monkeypatched constant.
     """
 
     import src.environment.merge_environment as merge_environment_module
@@ -395,18 +404,19 @@ def test_horizon_truncation_fires_when_nothing_else_terminates(monkeypatch):
     )
 
     env = MergeEnvironment(dataset_config_path=DATASET_CONFIG_PATH)
-    env.reset(SINGLE_MANEUVER)
+    _, reset_info = env.reset(SINGLE_MANEUVER)
+    effective_horizon = reset_info["episode_horizon"]
 
     steps_taken = 0
     truncated = False
     info = None
-    for _ in range(10):
+    for _ in range(effective_horizon + 5):
         _, _, terminated, truncated, info = env.step(BehaviorAction.KEEP)
         steps_taken += 1
         if terminated or truncated:
             break
 
-    assert steps_taken <= 3
+    assert steps_taken <= effective_horizon
     if info["termination_reason"] not in ("success", "failure_collision", "failure_offroad"):
         assert truncated is True
         assert info["termination_reason"] == "truncation_horizon"

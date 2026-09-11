@@ -38,6 +38,10 @@ from waymax.env.planning_agent_environment import PlanningAgentEnvironment
 
 from src.environment.behavior_action import BehaviorAction, BehaviorExecutor
 from src.environment.decision_state import DecisionState
+from src.environment.decision_window import (
+    DecisionStartUnresolvedError,
+    compute_decision_start_frame,
+)
 from src.environment.episode_context import (
     EpisodeContext,
     parse_candidate_ids,
@@ -163,6 +167,7 @@ class MergeEnvironment:
         self._polylines_by_id = None
         self._merge_end_s: Optional[float] = None
         self._steps_elapsed: int = 0
+        self._episode_horizon: int = MAX_EPISODE_HORIZON_FRAMES
 
     # ------------------------------------------------------------------
     # reset
@@ -170,8 +175,10 @@ class MergeEnvironment:
 
     def reset(self, maneuver: ManeuverSpec, seed: Optional[int] = None):
         """Loads the maneuver's scene, initializes Waymax simulation
-        state at the maneuver's merge_start_frame, and returns the
-        initial (observation, info) pair.
+        state at the maneuver's ``decision_start_frame`` (Stage B-2.8;
+        the earliest causal frame, not ``merge_start_frame`` -- see
+        ``decision_window.py``), and returns the initial (observation,
+        info) pair.
 
         ``seed`` is accepted for interface compatibility but this
         environment has no stochastic component (deterministic scene
@@ -209,12 +216,15 @@ class MergeEnvironment:
             for polyline in extract_lane_polylines(record.state.roadgraph_points)
         }
 
+        decision_start_frame = self._resolve_decision_start_frame(record, maneuver)
+
         self._episode_context = EpisodeContext(
             maneuver_id=maneuver.maneuver_id,
             scene_key=record.scene_key,
             candidate_ids=maneuver.candidate_ids,
             lane_chain=maneuver.lane_chain,
             merge_start_frame=maneuver.merge_start_frame,
+            decision_start_frame=decision_start_frame,
         )
         self._decision_state = DecisionState()
         self._merge_end_s = self._compute_active_merge_end_s()
@@ -223,15 +233,16 @@ class MergeEnvironment:
         # controllable simulation at timestep = init_steps - 1 (Stage
         # B-1 investigation of the installed source: init_steps
         # defaults to 11, WOMD's fixed 10-warmup + 1-current
-        # convention). To start controllable simulation exactly AT
-        # the maneuver's own merge_start_frame (Stage A, unchanged
-        # episode-start decision) rather than a fixed frame 10, this
-        # environment passes a PER-EPISODE init_steps =
-        # merge_start_frame + 1, which Waymax's own config explicitly
-        # supports as a plain parameter (not hardcoded in the
-        # library) -- confirmed by reading config.py before writing
-        # this.
-        init_steps = maneuver.merge_start_frame + 1
+        # convention). Stage B-2.8: controllable simulation now starts
+        # at ``decision_start_frame`` (the earliest CAUSAL frame at
+        # which the maneuver's source lane is already raw-identifiable
+        # -- Stage B-2.7's diagnostic finding, productionized) rather
+        # than ``merge_start_frame`` (which remains the physical
+        # merge-region reference, unchanged). Waymax's own config
+        # explicitly supports per-episode init_steps as a plain
+        # parameter (not hardcoded in the library) -- confirmed by
+        # reading config.py before writing this (Stage B-1).
+        init_steps = decision_start_frame + 1
         env_config = waymax_config.EnvironmentConfig(
             max_num_objects=self._max_num_objects,
             init_steps=init_steps,
@@ -245,6 +256,7 @@ class MergeEnvironment:
 
         self._state = self._waymax_env.reset(record.state)
         self._steps_elapsed = 0
+        self._episode_horizon = self._resolve_episode_horizon(record, decision_start_frame)
 
         observation = self._build_observation()
         info = self._build_info(
@@ -314,7 +326,7 @@ class MergeEnvironment:
                 collision=bool(collision),
                 offroad=bool(offroad),
                 steps_elapsed=self._steps_elapsed,
-                max_episode_horizon=MAX_EPISODE_HORIZON_FRAMES,
+                max_episode_horizon=self._episode_horizon,
             )
         )
 
@@ -344,6 +356,60 @@ class MergeEnvironment:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _resolve_decision_start_frame(self, record, maneuver: "ManeuverSpec") -> int:
+        """Stage B-2.8: computes the production ``decision_start_frame``
+        from the SCENE's logged trajectory (never a simulated one --
+        this runs before any Waymax reset/step this episode). Never
+        falls back to ``merge_start_frame`` silently: an unresolved
+        maneuver is a hard error, surfaced to the caller (Section 6)."""
+
+        log_trajectory = record.state.log_trajectory
+        ego_x = np.asarray(log_trajectory.x[self._sdc_index])
+        ego_y = np.asarray(log_trajectory.y[self._sdc_index])
+        ego_yaw = np.asarray(log_trajectory.yaw[self._sdc_index])
+        ego_valid = np.asarray(log_trajectory.valid[self._sdc_index]).astype(bool)
+
+        try:
+            result = compute_decision_start_frame(
+                ego_x,
+                ego_y,
+                ego_yaw,
+                ego_valid,
+                list(self._polylines_by_id.values()),
+                self._lane_assignment_config,
+                source_lane_id=maneuver.lane_chain[0],
+                merge_start_frame=maneuver.merge_start_frame,
+            )
+        except DecisionStartUnresolvedError as exc:
+            raise DecisionStartUnresolvedError(
+                f"maneuver_id={maneuver.maneuver_id}: {exc}"
+            ) from exc
+
+        return result.decision_start_frame
+
+    def _resolve_episode_horizon(self, record, decision_start_frame: int) -> int:
+        """Stage B-2.8 Section 7: preserves the OLD absolute terminal
+        opportunity (``MAX_EPISODE_HORIZON_FRAMES`` steps counted from
+        ``merge_start_frame``) now that the episode starts earlier, at
+        ``decision_start_frame``. The naive fix is ``MAX_EPISODE_
+        HORIZON_FRAMES + start_shift``, but this is hard-capped by the
+        scenario's own logged length: Waymax has no frames beyond the
+        scene's last logged timestep, so a scenario cannot be stepped
+        past ``num_logged_frames - 1``. When the naive target exceeds
+        that bound, the cap applies -- this can never make the episode
+        SHORTER than the old scheme already was (the old scheme was
+        itself bound by the same scenario length), only ensures the
+        new, earlier start doesn't consume horizon that used to be
+        available for the post-merge-start portion of the episode."""
+
+        start_shift = self._episode_context.merge_start_frame - decision_start_frame
+        target_horizon = MAX_EPISODE_HORIZON_FRAMES + max(start_shift, 0)
+
+        num_logged_frames = int(np.asarray(record.state.log_trajectory.x).shape[-1])
+        max_steps_available = (num_logged_frames - 1) - decision_start_frame
+
+        return min(target_horizon, max_steps_available)
 
     def _current_ego_pose_and_speed(self):
         traj = self._state.current_sim_trajectory
@@ -479,7 +545,7 @@ class MergeEnvironment:
             target_lane_id=target_lane_id,
             polylines=list(self._polylines_by_id.values()),
             lane_assignment_config=self._lane_assignment_config,
-            episode_start_frame=self._episode_context.merge_start_frame,
+            episode_start_frame=self._episode_context.decision_start_frame,
         )
         return target_lane_id if success else None
 
@@ -519,7 +585,7 @@ class MergeEnvironment:
             target_lane_id=self._episode_context.final_target_lane_id,
             polylines=list(self._polylines_by_id.values()),
             lane_assignment_config=self._lane_assignment_config,
-            episode_start_frame=self._episode_context.merge_start_frame,
+            episode_start_frame=self._episode_context.decision_start_frame,
         )
 
     def _sim_trajectory_history(self):
@@ -528,7 +594,7 @@ class MergeEnvironment:
         requirement, Stage B-0 Section 6/8)."""
 
         current_timestep = int(self._state.timestep)
-        start = self._episode_context.merge_start_frame
+        start = self._episode_context.decision_start_frame
         traj = self._state.sim_trajectory
 
         x = np.asarray(traj.x)[self._sdc_index, start : current_timestep + 1]
@@ -565,6 +631,9 @@ class MergeEnvironment:
             "active_source_lane_id": self._episode_context.active_source_lane_id,
             "active_target_lane_id": self._episode_context.active_target_lane_id,
             "final_target_lane_id": self._episode_context.final_target_lane_id,
+            "decision_start_frame": self._episode_context.decision_start_frame,
+            "merge_start_frame": self._episode_context.merge_start_frame,
+            "episode_horizon": self._episode_horizon,
             "chain_advanced": chain_advanced,
             "reference_speed_mps": (
                 objective.reference_speed_mps if objective else None
