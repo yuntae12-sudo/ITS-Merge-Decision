@@ -438,7 +438,18 @@ class MergeEnvironment:
         """Checks the ACTIVE target lane (not the final one) for
         stable entry and advances episode_context if it's an
         intermediate target (Stage B-1 Section 1's chained-maneuver
-        model)."""
+        model).
+
+        Stage B-2.5 fix: gated on ``self._decision_state.is_committed``
+        -- see ``_check_final_success`` below for why. Without this
+        gate, a policy that never selects MERGE could still have its
+        chain silently "advance" purely from incidental lane-keeping
+        geometry, which is exactly the same causality violation as the
+        final-success check.
+        """
+
+        if not self._decision_state.is_committed:
+            return False
 
         traj = self._state.current_sim_trajectory
         current_lane_id = self._current_stable_target_check(
@@ -473,6 +484,30 @@ class MergeEnvironment:
         return target_lane_id if success else None
 
     def _check_final_success(self) -> bool:
+        """Stage B-2.5 fix (Section 9): ``check_online_causal_merge_
+        success`` is a purely GEOMETRIC lane-assignment check -- its
+        own docstring (termination.py) already documents that it is
+        "only meaningful once the episode is in MERGE_COMMITTED
+        phase", but this precondition was never actually enforced
+        here. A real bug was found via direct trace: a policy that
+        NEVER selects MERGE (e.g. AlwaysKeep) could still have this
+        check spuriously return True purely from incidental
+        lane-keeping drift, whenever the source and target lane
+        centerlines are close/converging near the merge point (as they
+        necessarily are, by definition of a merge scenario) -- ego's
+        stable lane assignment can cross into the target lane's
+        geometric envelope without the policy ever having chosen to
+        merge. Confirmed directly on MAN_0001: pure KEEP reached
+        ``termination_reason=success`` at frame 13 while
+        ``decision_phase`` stayed "decision" and ``merge_committed``
+        stayed False the entire episode. Guarding on
+        ``is_committed`` restores the documented precondition: success
+        can only be evaluated -- let alone reported -- once the policy
+        has actually committed to MERGE.
+        """
+
+        if not self._decision_state.is_committed:
+            return False
         if not self._episode_context.is_on_final_transition:
             return False
         history = self._sim_trajectory_history()
