@@ -27,7 +27,7 @@ the last verified-complete Stage.
 |---|---|---|
 | 3-A Reference/Geometry | COMPLETE | `95ab85c92ab63f74cac036bc46f660826061369a` |
 | 3-B Frenet Core | COMPLETE | `d4b77312639ecf87908a703cfa5db588258ea2e0` |
-| 3-C BehaviorAction Execution Mapping | COMPLETE | `PENDING` |
+| 3-C BehaviorAction Execution Mapping | COMPLETE | `aafbc2f` |
 | 3-D LTV-MPC | NOT STARTED | — |
 | 3-E Waymax Adapter / Common Downstream | NOT STARTED | — |
 | 3-F MergeEnvironment Integration | NOT STARTED | — |
@@ -204,4 +204,4 @@ Full suite: `PYTHONPATH=. pytest tests/ -q` -> **357 passed, 0 failed, 0 errors*
 - The collision check's circular-proxy simplification (design decision 4 above) is a documented, deliberate simplification for THIS stage's correctness bar; if Stage 3-D/E's MPC layer needs tighter collision geometry, that is a natural place to introduce an oriented-bounding-box check without changing `candidate_evaluator.py`'s external status contract.
 - `frenet_planner.py` is standalone and NOT wired into `MergeEnvironment` yet (by design -- Stage 3-F's job).
 
-**Commit:** `PENDING`
+**Commit:** `aafbc2f`
