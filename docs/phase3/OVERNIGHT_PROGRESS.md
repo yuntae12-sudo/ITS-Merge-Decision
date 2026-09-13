@@ -30,7 +30,7 @@ the last verified-complete Stage.
 | 3-C BehaviorAction Execution Mapping | COMPLETE | `aafbc2f` |
 | 3-D LTV-MPC | COMPLETE | `a367451` |
 | 3-E Waymax Adapter / Common Downstream | COMPLETE | `4fd2c0e` |
-| 3-F MergeEnvironment Integration | COMPLETE | (pending, see below) |
+| 3-F MergeEnvironment Integration | COMPLETE | `78a9faa` |
 | 3-G Robustness/Regression | NOT STARTED | — |
 
 ## Log
@@ -514,6 +514,6 @@ out of Stage 3-F's own scope (wiring `CommonDownstream` into
   `downstream_mode` (or tolerate `None`) rather than assume these
   fields are always populated.
 
-**Commit:** (recorded in a follow-up commit after this doc is committed, per prior stages' pattern)
+**Commit:** `78a9faa`
 
 **Next stage: 3-G** (robustness/regression).
