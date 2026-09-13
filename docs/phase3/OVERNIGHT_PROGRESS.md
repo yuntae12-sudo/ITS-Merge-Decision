@@ -25,7 +25,7 @@ the last verified-complete Stage.
 
 | Stage | Status | Commit SHA |
 |---|---|---|
-| 3-A Reference/Geometry | COMPLETE | _pending, see below_ |
+| 3-A Reference/Geometry | COMPLETE | `95ab85c92ab63f74cac036bc46f660826061369a` |
 | 3-B Frenet Core | NOT STARTED | — |
 | 3-C BehaviorAction Execution Mapping | NOT STARTED | — |
 | 3-D LTV-MPC | NOT STARTED | — |
@@ -96,4 +96,4 @@ Full suite: `python3 -m pytest tests/ -q` → **298 passed, 0 failed, 0 errors**
 
 **Note on measurement provenance:** the module docstring in `reference.py` was first written against a smaller preliminary sample (38 maneuvers / 2957 segments) before the full 85-maneuver gate audit ran; it has been updated in this commit to cite the full gate-run numbers above (min segment length 0.394 m, not the earlier preliminary 0.487 m — both are consistent with "near-uniform ~1 m spacing, no real near-duplicates," the correction is one of measurement precision, not a change in conclusion).
 
-**Commit:** `<PENDING — see next log entry for SHA>`
+**Commit:** `95ab85c92ab63f74cac036bc46f660826061369a`
