@@ -29,7 +29,7 @@ the last verified-complete Stage.
 | 3-B Frenet Core | COMPLETE | `d4b77312639ecf87908a703cfa5db588258ea2e0` |
 | 3-C BehaviorAction Execution Mapping | COMPLETE | `aafbc2f` |
 | 3-D LTV-MPC | COMPLETE | `a367451` |
-| 3-E Waymax Adapter / Common Downstream | NOT STARTED | — |
+| 3-E Waymax Adapter / Common Downstream | COMPLETE | `<pending>` |
 | 3-F MergeEnvironment Integration | NOT STARTED | — |
 | 3-G Robustness/Regression | NOT STARTED | — |
 
@@ -255,3 +255,42 @@ Full suite: `PYTHONPATH=. pytest tests/ -q` -> **357 passed, 0 failed, 0 errors*
 **Commit:** `a367451`
 
 **Next stage: 3-E** (wire Stage 3-C's `CartesianTrajectory` planner output into this MPC controller).
+
+### Stage 3-E: Common Downstream / Waymax Adapter
+
+**Date:** 2026-09-14
+
+**Files added:**
+- `src/environment/common_downstream.py` -- `CommonDownstream` (`step`, `reset`), `DownstreamRequest`, `DownstreamResult`, `DownstreamStatus`. Composes Stage 3-C's `frenet_planner.plan` and Stage 3-D's `LtvMpcController.solve` into one entry point. Does NOT wire into `MergeEnvironment` (explicitly Stage 3-F).
+- `tests/environment/test_common_downstream.py` -- 12 new tests.
+
+**Key design decisions:**
+
+1. **No fallback command on failure (locked for this stage, deferred to 3-F).** When either the planner (`PlannerStatus != OK`) or the controller (`ControllerStatus != OK`) reports a failure, `CommonDownstream.step` returns `command=None` and an explicit non-OK `DownstreamStatus` -- it never invents a bounded-braking or hold-last-command fallback. Rationale: `MergeEnvironment`/Waymax's actual numerical-liveness requirements (does `waymax_env.step` need SOME physical action every call, even on a failure step?) are Stage 3-F's decision to make deliberately, with the real Waymax stepping loop in front of it -- inventing a fallback shape here, before that need is proven, risks quietly building exactly the kind of policy-blind "silent substitution" the Stage 3-0 fairness audit repeatedly flags. If Stage 3-F needs a placeholder command to keep stepping alive, it should choose and justify that design against the real integration constraints, not inherit an untested guess from this stage.
+2. **Status wrapping/propagation.** `DownstreamStatus` (OK / INVALID_REFERENCE / PLANNER_INFEASIBLE / COLLISION_BLOCKED / CONTROLLER_FAILURE) is a direct 1:1 wrap of Stage 3-C's `PlannerStatus` (three non-OK values map straight across) plus a single `CONTROLLER_FAILURE` that collapses BOTH of Stage 3-D's `ControllerStatus.INVALID_INPUT`/`SOLVER_FAILURE` (the specific upstream value is preserved in `DownstreamResult.diagnostics["controller"]["status"]` for diagnostics, but Stage 3-E itself does not need to distinguish the two for its own control flow -- both mean "no command available this step"). The planner is always tried first; the MPC's `solve()` is called ONLY when `plan()` returned `OK` -- verified directly by three separate spy-based tests (`test_collision_blocked_propagates_and_mpc_never_invoked`, `test_planner_infeasible_propagates_and_mpc_never_invoked`, `test_invalid_reference_propagates_and_mpc_never_invoked`) that monkeypatch `LtvMpcController.solve` with a call-counting spy and assert zero invocations.
+3. **MPC reference-horizon construction.** Stage 3-C's `CartesianTrajectory` places index 0 at the ego's CURRENT state (`t[0] == 0.0`, confirmed empirically against a real `plan()` call before writing this module), while Stage 3-D's `LtvMpcController.solve` wants exactly `mpc_config.horizon` FUTURE `ReferencePoint`s. `common_downstream.py` therefore slices trajectory indices `[1, horizon]` inclusive (skipping index 0) to build the MPC reference list, and returns `CONTROLLER_FAILURE` explicitly (rather than crashing or silently padding/truncating) if the planner's trajectory has fewer than `horizon + 1` samples -- covered by `test_controller_failure_via_genuinely_non_finite_reference_horizon_precondition`. With the shipped `configs/phase3_downstream.yaml` (planner `trajectory_horizon_s=3.0s`/`dt_s=0.1s` -> 31 samples; MPC `horizon_steps=20`), this precondition always holds in normal operation.
+4. **No policy-type dependency.** `CommonDownstream.__init__`/`step`, `DownstreamRequest`, and `DownstreamResult` were audited (both by direct code inspection while writing the module, and by an automated structural test, `test_no_policy_type_parameter_anywhere_in_public_api`, that inspects `inspect.signature`/`dataclasses.fields` for any parameter/attribute name containing a policy-origin-like substring such as "policy"/"fsm"/"ppo"/"origin") to confirm no such parameter exists anywhere in the public API. `DownstreamRequest`'s field set is asserted to be EXACTLY `{behavior_action, objective, ego_state, source_reference, target_reference, follow_inputs, surrounding_agents, dt_s}` -- nothing else.
+5. **Determinism.** Verified by `test_determinism_identical_input_produces_byte_identical_output`: identical `DownstreamRequest` fed to two INDEPENDENTLY-constructed `CommonDownstream` instances (each owning its own fresh `LtvMpcController`, so no warm-start state is shared) produces byte-identical `ControllerCommand` values (`==` on both float fields, not just `np.isclose`). Additionally verified that the SAME instance, after an explicit `reset()` (which delegates to `LtvMpcController.reset()`, clearing `_warm_start`/`_previous_command`), reproduces the identical first-call result -- confirming the only state `CommonDownstream` depends on is the MPC's own warm-start, and that `reset()` fully clears it.
+
+**Commands run:**
+- `python3 -m pytest tests/environment/test_common_downstream.py -q` -> 12 passed (~0.5s).
+- Full suite: `python3 -m pytest tests/ -q` -> **430 passed, 0 failed, 0 errors** in 1563.75s (26m03s), confirming exactly 418 (Stage 3-A/B/C/D baseline) + 12 (new Stage 3-E) = 430, i.e. zero regressions.
+
+**Gate verification:**
+
+| Criterion | Result |
+|---|---|
+| (1) Determinism test passes | Confirmed -- `test_determinism_identical_input_produces_byte_identical_output` |
+| (2) No-policy-type-dependency check passes | Confirmed -- `test_no_policy_type_parameter_anywhere_in_public_api` |
+| (3) All four `BehaviorAction`s accepted, coherent (status, optional-command) result | Confirmed -- `test_all_four_behavior_actions_produce_coherent_result` (parametrized over KEEP/FOLLOW/MERGE/STOP) |
+| (4) Planner failure propagates, MPC never invoked | Confirmed -- 3 spy-based tests (collision/infeasible/invalid-reference), zero `solve()` calls in each |
+| (5) Controller failure propagates as `CONTROLLER_FAILURE` | Confirmed -- `test_controller_failure_propagates_as_controller_failure_status` (forced `INVALID_INPUT`) and `test_controller_failure_via_genuinely_non_finite_reference_horizon_precondition` (too-short trajectory) |
+| (6) Command physical units/shape correct, unmangled through the wrapper | Confirmed -- `test_successful_command_within_waymax_physical_bounds` checks `[-6.0, 6.0]`/`[-0.3, 0.3]` bounds and cross-checks the value is reproduced exactly across an independent re-solve |
+| (7) Full existing test suite still passes | 430/430 passed (1563.75s) |
+| (8) No Phase 2/3-A/3-B/3-C/3-D file modified | Confirmed -- `git status --porcelain` showed only the two new untracked files before staging |
+
+**Known issues / follow-ups for Stage 3-F:**
+- `CommonDownstream` is standalone and NOT wired into `MergeEnvironment` yet (by design -- Stage 3-F's job). Stage 3-F will need to: (a) decide whether a failure-step fallback command is actually necessary to keep `waymax_env.step` callable, and if so, design it deliberately rather than inheriting a guess from this stage (see design decision 1 above); (b) construct `DownstreamRequest.ego_state`/`source_reference`/`target_reference`/`surrounding_agents`/`follow_inputs` from `MergeEnvironment`'s existing per-step state (`EpisodeContext`, `MergeReference`, the 14D observation's causal fields, etc.); (c) own one `CommonDownstream` instance per episode and call `reset()` at episode boundaries, exactly mirroring `LtvMpcController`'s own documented per-episode-instance pattern; (d) convert the resulting `ControllerCommand` into the exact `WaymaxAction` construction already used in `merge_environment.py:273-354` (`np.array([command.acceleration_mps2, command.steering_curvature], dtype=np.float32)`, `valid=np.array([True], dtype=bool)`).
+- `DownstreamResult.diagnostics` is a plain nested dict (`{"planner": ..., "controller": ...}` or `{"planner": ..., "error": ...}`), not a frozen dataclass -- kept simple since Stage 3-E has no consumer of this data yet beyond tests; Stage 3-F/logging code may want a more structured diagnostics type if it needs to aggregate these across an episode.
+
+**Commit:** `<pending>`
