@@ -29,7 +29,7 @@ the last verified-complete Stage.
 | 3-B Frenet Core | COMPLETE | `d4b77312639ecf87908a703cfa5db588258ea2e0` |
 | 3-C BehaviorAction Execution Mapping | COMPLETE | `aafbc2f` |
 | 3-D LTV-MPC | COMPLETE | `a367451` |
-| 3-E Waymax Adapter / Common Downstream | COMPLETE | `<pending>` |
+| 3-E Waymax Adapter / Common Downstream | COMPLETE | `4fd2c0e` |
 | 3-F MergeEnvironment Integration | NOT STARTED | — |
 | 3-G Robustness/Regression | NOT STARTED | — |
 
@@ -293,4 +293,4 @@ Full suite: `PYTHONPATH=. pytest tests/ -q` -> **357 passed, 0 failed, 0 errors*
 - `CommonDownstream` is standalone and NOT wired into `MergeEnvironment` yet (by design -- Stage 3-F's job). Stage 3-F will need to: (a) decide whether a failure-step fallback command is actually necessary to keep `waymax_env.step` callable, and if so, design it deliberately rather than inheriting a guess from this stage (see design decision 1 above); (b) construct `DownstreamRequest.ego_state`/`source_reference`/`target_reference`/`surrounding_agents`/`follow_inputs` from `MergeEnvironment`'s existing per-step state (`EpisodeContext`, `MergeReference`, the 14D observation's causal fields, etc.); (c) own one `CommonDownstream` instance per episode and call `reset()` at episode boundaries, exactly mirroring `LtvMpcController`'s own documented per-episode-instance pattern; (d) convert the resulting `ControllerCommand` into the exact `WaymaxAction` construction already used in `merge_environment.py:273-354` (`np.array([command.acceleration_mps2, command.steering_curvature], dtype=np.float32)`, `valid=np.array([True], dtype=bool)`).
 - `DownstreamResult.diagnostics` is a plain nested dict (`{"planner": ..., "controller": ...}` or `{"planner": ..., "error": ...}`), not a frozen dataclass -- kept simple since Stage 3-E has no consumer of this data yet beyond tests; Stage 3-F/logging code may want a more structured diagnostics type if it needs to aggregate these across an episode.
 
-**Commit:** `<pending>`
+**Commit:** `4fd2c0e`
