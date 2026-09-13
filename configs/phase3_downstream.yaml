@@ -1,0 +1,88 @@
+# Phase 3 Stage 3-C: common Frenet behavior-execution planner config.
+#
+# These constants parameterize src/planning/candidate_generator.py and
+# src/planning/candidate_evaluator.py. Values are either (a) reused
+# directly from an existing, already-justified constant elsewhere in
+# this repo (cited below), or (b) a documented, reasoned choice for
+# this stage -- never an arbitrary unexplained number. Nothing here
+# encodes a "should this action be taken" decision; these are pure
+# kinematic/comfort/feasibility bounds for EXECUTING an already-chosen
+# BehaviorAction.
+
+planner:
+  dt_s: 0.1
+  # Matches Phase 3's locked MPC dt (see docs/phase3/OVERNIGHT_PROGRESS.md
+  # locked decision #2) and Waymax's own simulation dt 1:1.
+
+  trajectory_horizon_s: 3.0
+  # Length of the generated candidate trajectory. 3.0 s is long enough
+  # to express a full quintic/quartic maneuver (lane-change-scale
+  # lateral shift, or a stop-distance-scale longitudinal profile) at
+  # highway speeds while staying short enough to replan every step
+  # against fresh current-frame information (this planner is invoked
+  # every environment step, not once per maneuver).
+
+  comfortable_deceleration_mps2: 2.0
+  # STOP's braking-distance formula input. Locked design decision
+  # (docs/phase3/OVERNIGHT_PROGRESS.md, decision #4): s_stop =
+  # s_current + v_current^2 / (2 * comfortable_deceleration).
+
+feasibility:
+  max_longitudinal_accel_mps2: 6.0
+  # Reused directly from InvertibleBicycleModel's default max_accel,
+  # already adopted in this repo as MAX_ACCEL_MPS2 in
+  # src/environment/low_level_controller.py. Using the same bound
+  # here means a trajectory this planner marks OK is also physically
+  # realizable by the shared downstream controller/dynamics model --
+  # not a second, independently-invented limit.
+
+  max_curvature_per_m: 0.3
+  # Reused directly from InvertibleBicycleModel's default
+  # max_steering, already adopted in this repo as
+  # MAX_STEERING_CURVATURE in src/environment/low_level_controller.py.
+  # Same rationale as above: consistency with the one dynamics model
+  # this trajectory will actually be executed on.
+
+  max_longitudinal_jerk_mps3: 20.0
+  # Not directly borrowed from an existing repo constant (no prior
+  # jerk bound exists here) -- reasoned from the two bounds above: a
+  # trajectory that ramps from 0 to max_longitudinal_accel_mps2 (6.0
+  # m/s^2) over one MPC control step (dt_s = 0.1 s) already implies a
+  # jerk on the order of 6.0/0.1 = 60 m/s^3 for that single transition;
+  # 20 m/s^3 is comfortably below that (rejects genuinely violent
+  # jerk spikes across the whole 3s trajectory) while still well above
+  # what any of the four actions' smooth quintic/quartic profiles
+  # produce in practice (verified empirically in
+  # tests/planning/test_candidate_evaluator.py), so it acts as a
+  # smoothness backstop, not a binding constraint on normal maneuvers.
+
+  min_forward_progress_s_dot_mps: -0.1
+  # Epsilon below zero (not exactly 0.0) purely to tolerate float
+  # solver noise right at a near-stationary STOP terminal state;
+  # anything more negative than this is rejected as requiring the
+  # vehicle to move backward, which no BehaviorAction here calls for.
+
+collision:
+  ego_radius_m: 1.5
+  # Simplification (Stage 3-C scope, documented in
+  # candidate_evaluator.py): both ego and other agents are checked as
+  # circles rather than oriented rectangles, for a fast conservative
+  # collision proxy. 1.5 m approximates a typical passenger-vehicle
+  # half-diagonal (~4.5m x 2.0m bounding box has a half-diagonal of
+  # about 2.5m; 1.5m is deliberately smaller than the full half-
+  # diagonal, matching the half-WIDTH-plus-margin scale that dominates
+  # a merge/lane-change collision geometry, where the risk is
+  # primarily lateral proximity, not bumper-to-bumper alignment) --
+  # see candidate_evaluator.py's module docstring for the full
+  # rationale and its documented conservativeness direction.
+
+  agent_radius_default_m: 1.5
+  # Same circular-proxy simplification, used when a specific agent's
+  # own half-length is not provided by the caller.
+
+  collision_margin_m: 0.5
+  # Added to the sum of the two radii before comparing to
+  # center-to-center distance; a small conservative buffer so a
+  # near-tangent circle contact is still flagged, given the
+  # circle-vs-rectangle approximation is otherwise the only source of
+  # margin.
