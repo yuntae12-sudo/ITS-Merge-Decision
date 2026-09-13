@@ -499,25 +499,67 @@ def project_point_to_polyline_signed(polyline: LanePolyline, x: float, y: float)
     is_last_segment = segment_index == num_segments - 1
     t_raw = float(t[segment_index])
 
-    if is_first_segment and t_raw < 0.0:
-        # Before the polyline start: extend backward along this
-        # segment's own local tangent, matching heading/lateral_sign
-        # convention (unit_direction points from xy[0] toward xy[1]).
-        arc_length_m = arc_start + t_raw * (arc_end - arc_start)
-    elif is_last_segment and t_raw > 1.0:
-        # Past the polyline end: extend forward along this segment's
-        # own local tangent.
+    extrapolating = (is_first_segment and t_raw < 0.0) or (
+        is_last_segment and t_raw > 1.0
+    )
+
+    if extrapolating:
+        # Before the polyline start (first segment, t_raw < 0) or past
+        # its end (last segment, t_raw > 1): extend along this
+        # segment's own local tangent. arc_length_m already used the
+        # UNCLAMPED t_raw for this (see below, unchanged from before
+        # this fix). lateral_distance_m must ALSO be derived from the
+        # unclamped projection, not the clamped one:
+        #
+        # Bug fixed here (found during Stage 3-G's chained-maneuver
+        # investigation, see docs/phase3/OVERNIGHT_PROGRESS.md Stage
+        # 3-G entry): `distances[segment_index]` (used below for the
+        # non-extrapolating branch) is the Euclidean distance from the
+        # query point to the CLAMPED projection point (`t_clamped`,
+        # i.e. the segment's own boundary endpoint) -- not the true
+        # perpendicular distance to the segment's infinite tangent
+        # line. When a query point is far along the tangent direction
+        # outside the polyline's domain, that Euclidean-to-endpoint
+        # distance is dominated by the large along-tangent
+        # (extrapolation) distance, not genuine lateral offset --
+        # e.g. a query point only ~1m off the extended lane line but
+        # ~45m before its start was previously reported as having a
+        # ~45m "lateral_distance_m" (conflating the two), when the
+        # correct perpendicular lateral offset was ~1m. This was never
+        # a deliberate design choice (the function's own docstring only
+        # documents `arc_length_m` as differing from the clamped
+        # `project_point_to_polyline`; it says nothing about
+        # `lateral_distance_m` being distance-to-clamped-endpoint) and
+        # no existing test exercises this specific far-extrapolation +
+        # off-centerline combination (confirmed before making this
+        # change) -- it surfaced only once Stage 3-C's MERGE
+        # target-frame projection (`cartesian_to_frenet`, the sole
+        # production consumer of this field) started querying a lane
+        # from far outside its own domain, which is the normal case at
+        # the start of a chained maneuver before any lateral progress
+        # toward a short intermediate lane has been made.
+        #
+        # Fix: recompute the UNCLAMPED projected point (t_raw instead
+        # of t_clamped) and take the perpendicular component of the
+        # offset from THAT point -- consistent with how
+        # arc_length_m/lateral_sign are already computed relative to
+        # the same infinite tangent line.
+        unclamped_projected = seg_start[segment_index] + t_raw * seg_vec[segment_index]
+        offset_from_unclamped = point - unclamped_projected
+        if seg_direction_norm == 0.0:
+            lateral_distance_m = 0.0
+        else:
+            lateral_distance_m = float(np.dot(offset_from_unclamped, perpendicular))
         arc_length_m = arc_start + t_raw * (arc_end - arc_start)
     else:
         arc_length_m = arc_start + t_clamped[segment_index] * (
             arc_end - arc_start
         )
+        lateral_distance_m = float(lateral_sign * distances[segment_index])
 
     return {
         "arc_length_m": float(arc_length_m),
-        "lateral_distance_m": float(
-            lateral_sign * distances[segment_index]
-        ),
+        "lateral_distance_m": lateral_distance_m,
         "heading_rad": heading,
         "segment_index": segment_index,
     }

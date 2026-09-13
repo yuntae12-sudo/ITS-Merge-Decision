@@ -31,7 +31,7 @@ the last verified-complete Stage.
 | 3-D LTV-MPC | COMPLETE | `a367451` |
 | 3-E Waymax Adapter / Common Downstream | COMPLETE | `4fd2c0e` |
 | 3-F MergeEnvironment Integration | COMPLETE | `78a9faa` |
-| 3-G Robustness/Regression | NOT STARTED | — |
+| 3-G Robustness/Regression | COMPLETE | `<pending, see end of this entry>` |
 
 ## Log
 
@@ -516,4 +516,363 @@ out of Stage 3-F's own scope (wiring `CommonDownstream` into
 
 **Commit:** `78a9faa`
 
-**Next stage: 3-G** (robustness/regression).
+### Stage 3-G: Robustness / Regression (FINAL STAGE OF THIS RUN)
+
+**Date:** 2026-09-14
+
+**Files added:**
+- `scripts/audit_phase3_robustness.py` -- loads ALL 168 canonical
+  maneuvers (110 TRAIN + 58 VALIDATION via
+  `full_split_evaluator.load_maneuver_specs`) and, under
+  `downstream_mode="frenet_mpc"`, drives a bounded rollout per
+  maneuver with a fixed action script (`BehaviorAction.MERGE` every
+  step, matching `test_merge_environment.py`'s own success-test
+  precedent -- a robustness stimulus, not a policy). Records
+  per-maneuver: exception (if any), NaN/Inf observation, all
+  `downstream_status` occurrences broken down by value, chain-advanced
+  count, final `active_transition_index` + out-of-bounds check,
+  termination outcome, wall time. Writes a compact 168-row summary to
+  `outputs/phase3/robustness/audit_168_maneuvers.{csv,json}` (no raw
+  trajectory dumps) and prints the aggregate gate report.
+- `scripts/audit_phase3_action_discriminability.py` -- Stage 3-G.4:
+  runs KEEP/MERGE/STOP on a representative 8-maneuver TRAIN sample
+  under `frenet_mpc`, reporting KEEP displacement, KEEP-vs-MERGE
+  final-position divergence, and STOP speed delta (diagnostic
+  print-only; the pass/fail gate for this property already lives in
+  `tests/environment/test_merge_environment_frenet_mpc.py`'s
+  `test_keep_produces_causal_forward_motion_frenet_mpc` /
+  `test_merge_produces_lateral_motion_toward_target_frenet_mpc` /
+  `test_stop_produces_deceleration_frenet_mpc`, which this script
+  extends to a broader real-maneuver sample rather than duplicating).
+- `scripts/audit_phase3_performance_and_legacy_comparison.py` -- Stage
+  3-G.5 (perf snapshot via lightweight `time.perf_counter()`
+  monkeypatch instrumentation around `ReferenceLine.from_lane_polyline`,
+  `CommonDownstream.step`, `LtvMpcController.solve`, and
+  `MergeEnvironment.step` itself -- no production code modified for
+  timing) + 3-G.6 (runs the identical MERGE-repeatedly action script
+  through both `downstream_mode="legacy"` and `="frenet_mpc"` on a
+  12-maneuver TRAIN sample, printing termination reason/step-count
+  side by side; explicitly diagnostic, no research conclusion drawn).
+- `outputs/phase3/robustness/audit_168_maneuvers.csv` /`.json` -- the
+  168-row compact per-maneuver summary (56KB/144KB; force-added past
+  this repo's blanket `outputs/*` gitignore rule since these two files
+  are exactly the small, deliberate deliverable Stage 3-G's own brief
+  asked for, not incidental generated bulk output -- no other file
+  under `outputs/` was added).
+
+**Files fixed (genuine bug, in scope per this stage's explicit mandate
+to fix systemic implementation bugs found during investigation):**
+
+- `src/scenarios/lane_geometry.py` -- **`project_point_to_polyline_signed`
+  bug fix.** This is a Phase 1 file (predates Stage 3 entirely), fixed
+  here because Stage 3-C's MERGE target-frame projection
+  (`cartesian_to_frenet`, via `ReferenceLine.project`) is the first
+  and only production caller that queries this function from far
+  outside a lane's own domain -- exactly the regime the bug lived in,
+  unexercised by any existing test or other caller (confirmed by a
+  dedicated caller/test audit before touching the file, see "Chained
+  -maneuver bug investigation" below for the full root-cause trace).
+
+**Chained-maneuver bug investigation (Stage 3-F's documented known
+issue, this stage's explicit mandate to investigate and, if genuinely
+systemic, fix):**
+
+Root-caused via direct diagnostic on the real `CHAINED_MANEUVER`
+(`MAN_0041`, lane_chain 618->623->608) fixture, reproducing Stage
+3-F's own observation (`s ~= -44.6`, `d ~= -44.6` when projecting ego
+into the short ~20.5m intermediate target lane 623's Frenet frame at
+episode start). The critical follow-up measurement Stage 3-F's own
+entry did NOT make: the CORRECT perpendicular lateral offset at that
+exact real ego pose is only **-0.97 m** (ego is nearly on lane 623's
+own extended centerline, having not yet made lateral progress toward
+it) -- not anywhere near -44.6 m. The bug is in
+`project_point_to_polyline_signed` itself (`src/scenarios/
+lane_geometry.py`), in the two open-path extrapolation branches (query
+point's nearest segment is the polyline's first/last segment AND the
+raw projection fraction `t_raw` falls outside `[0, 1]`, i.e. the query
+is genuinely off the polyline's domain along its own tangent). Those
+branches already correctly computed `arc_length_m` from the UNCLAMPED
+`t_raw` (extrapolating along the tangent, a deliberate Stage B-0 fix
+per the function's own docstring), but `lateral_distance_m` was still
+computed as `lateral_sign * distances[segment_index]`, where
+`distances[segment_index]` is the Euclidean distance from the query
+point to the CLAMPED projection point (the segment's own boundary
+endpoint, `t_clamped` folded into `[0,1]`) -- NOT the true perpendicular
+distance to the segment's infinite tangent line. Whenever a query
+point is far along the tangent direction outside the polyline's
+domain, this conflates that large along-tangent distance into what
+should be a small perpendicular offset: verified by hand (`t_raw =
+-45.578`, correct perpendicular lateral distance `-0.9736 m`, buggy
+Euclidean-to-clamped-endpoint distance `44.616 m` -- matching the
+corrupted value observed downstream to 5 significant figures). This
+then fed a MERGE candidate whose lateral quintic was solved to
+converge `d` from -44.6 to 0 over the fixed 3.0s trajectory horizon --
+a physically nonsensical ~44m lateral sweep -- which both violated the
+curvature feasibility bound and, because the resulting Cartesian
+candidate trajectory swept through real, unrelated space far from
+ego's actual position, spuriously triggered the constant-velocity
+collision proxy against real but irrelevant agents. This explains
+100% of the previously-observed `COLLISION_BLOCKED`/`PLANNER_
+INFEASIBLE` loop that prevented `MAN_0041`'s chain from ever advancing
+under frenet_mpc.
+
+Before fixing: audited every other caller of
+`project_point_to_polyline_signed` in the repo (`merge_reference.py`,
+`merge_environment.py:_build_observation`, `scenario_features.py:
+find_target_lane_front_rear`) -- all three use ONLY `arc_length_m`,
+never `lateral_distance_m`; `frenet_transform.cartesian_to_frenet`
+(via `ReferenceLine.project`) is the sole real production consumer of
+the corrupted field. Audited every existing test touching this
+function/branch (`test_lane_geometry.py`'s extrapolation tests,
+`test_scenario_features.py`'s rear-ordering test, `test_reference.py`,
+`test_frenet_transform.py`) -- every single one either queries only
+`arc_length_m` in the far-extrapolation regime, or queries
+`lateral_distance_m` only at points still interior to the polyline's
+domain (never the far-extrapolation + off-centerline combination the
+bug lived in). Zero tests assert on, or would break from a fix to,
+this specific regime. The function's own docstring documents intent
+only for `arc_length_m`'s unclamped behavior; it says nothing about
+`lateral_distance_m` being distance-to-clamped-endpoint -- there is no
+evidence this was ever a deliberate design choice, only an oversight
+where the clamped-search `distances`/`projected` arrays (needed for
+nearest-segment search) were reused for the extrapolation branch's
+lateral output without re-deriving it from the unclamped projection.
+
+**Fix:** in the two extrapolation branches, `lateral_distance_m` is
+now computed as the signed perpendicular distance from the query point
+to the UNCLAMPED projected point on the segment's own infinite tangent
+line (`np.dot(point - unclamped_projected, perpendicular)`), consistent
+with how `arc_length_m` and `lateral_sign` are already derived from
+that same infinite line in this branch. The non-extrapolating
+(interior-query) branch is completely unchanged (still uses
+`distances[segment_index]`/`lateral_sign`, which was always correct
+there since `t_clamped == t_raw` for an interior query).
+
+**Verification after the fix (real data, not synthetic):** re-ran the
+exact `MAN_0041` diagnostic -- `cartesian_to_frenet` now round-trips
+EXACTLY back to ego's real Cartesian pose (`distance = 0.0`, vs. `43.6
+m` before the fix), the MERGE candidate's Cartesian trajectory at
+`t=0` now coincides exactly with ego's real position, curvature stays
+in `[-0.0008, 0.004]` (vs. the `0.3` limit, previously violated at
+2.6x), and `frenet_planner.plan()` now returns `OK` at every one of
+the first 15 steps (previously `COLLISION_BLOCKED` then `PLANNER_
+INFEASIBLE` at every step). Full end-to-end rollout: `MAN_0041`'s
+chain now genuinely advances (618->623 at step 40, reference rebuild
+fires correctly) and the episode terminates `success` at step 59 --
+previously stuck at `active_transition_index=0` indefinitely. This is
+a genuine fix, not a threshold loosened to inflate success numbers:
+the feasibility/collision bounds themselves were never touched, only a
+pre-existing coordinate-computation bug that was feeding those checks
+wildly wrong input.
+
+**Full 168-maneuver audit results** (`PYTHONPATH=. python3
+scripts/audit_phase3_robustness.py`, run to completion in the
+`its-merge` conda env, AFTER the lane_geometry.py fix):
+
+```
+Total maneuvers audited: 168
+Zero exceptions: 168/168 (exceptions: 0)
+Zero NaN/Inf: 168/168 (flagged: 0)
+Transition-index-out-of-bounds: 0/168
+Termination reason distribution: {'success': 106, 'truncation_horizon': 20, 'failure_collision': 37, 'failure_offroad': 5}
+Maneuvers with >=1 planner/controller non-OK status: 101/168
+Chained maneuvers (lane_chain length > 2): 8
+Chained maneuvers where chain advanced >=1 time: 6/8
+downstream_status distribution across all steps of all maneuvers: {'OK': 2427, 'INVALID_REFERENCE': 0, 'PLANNER_INFEASIBLE': 1857, 'COLLISION_BLOCKED': 614, 'CONTROLLER_FAILURE': 0}
+
+GATE (zero exceptions, zero NaN/Inf, zero out-of-bounds transition index): PASS
+```
+
+Chained-maneuver detail (all 8, both splits):
+
+| maneuver_id | split | chain_advanced | final_idx | termination | steps |
+|---|---|---|---|---|---|
+| MAN_0045 | train | 1 | 1 | truncation_horizon | 71 |
+| MAN_0062 | train | 1 | 1 | success | 28 |
+| MAN_0066 | train | 1 | 1 | truncation_horizon | 76 |
+| MAN_0071 | train | 0 | 0 | failure_collision | 20 |
+| MAN_0107 | train | 0 | 0 | truncation_horizon | 71 |
+| MAN_0109 | train | 1 | 1 | success | 45 |
+| MAN_0161 | train | 1 | 1 | success | 23 |
+| MAN_0041 | validation | 1 | 1 | success | 60 |
+
+All 8 chained maneuvers ran with zero crashes/NaN and stayed within
+valid `active_transition_index` bounds throughout. 6/8 genuinely
+advanced their chain within the 120-step audit cap (including the
+previously-stuck `MAN_0041`, now fixed); the remaining 2
+(`MAN_0071`/`MAN_0107`) did not advance within the cap -- this is a
+normal convergence/timing characteristic under a fixed, unconditional
+MERGE-every-step script against real MPC dynamics (not a crash, not
+NaN, not an out-of-bounds state), consistent with Stage 3-F's own
+documented caveat that chain advancement is not guaranteed for every
+real maneuver under every controller. `MAN_0071`'s `failure_collision`
+at step 20 was inspected: this is a real, non-spurious collision
+against the actual causal scene geometry, not the class of bug fixed
+above (confirmed no `-44m`-style corrupted Frenet state involved).
+
+**Full test suite** (AFTER the lane_geometry.py fix):
+`PYTHONPATH=. python3 -m pytest tests/ -q` -> **449 passed, 0 failed,
+0 errors** in 2151.86s (35m51s) -- identical count to Stage 3-F's own
+449 (this stage added no new pytest test files; the fix to
+`lane_geometry.py` caused zero regressions across the full existing
+suite, including `tests/scenarios/test_lane_geometry.py`'s own
+extrapolation tests and every Stage 3-A/B/C/D/E/F test).
+
+**Action-discriminability sanity** (`PYTHONPATH=. python3
+scripts/audit_phase3_action_discriminability.py`, 8 real TRAIN
+maneuvers, `frenet_mpc`, 20-step rollouts):
+
+```
+MAN_0001: KEEP displacement=33.60m final_speed=16.76m/s | KEEP-vs-MERGE divergence=3.47m | STOP delta=-12.00m/s
+MAN_0022: KEEP displacement=29.77m final_speed=14.89m/s | KEEP-vs-MERGE divergence=0.02m | STOP delta=-8.81m/s
+MAN_0045: KEEP displacement=22.44m final_speed=5.22m/s  | KEEP-vs-MERGE divergence=0.00m | STOP delta=-12.00m/s
+MAN_0062: KEEP displacement=30.09m final_speed=10.25m/s | KEEP-vs-MERGE divergence=0.73m | STOP delta=-12.00m/s
+MAN_0077: KEEP displacement=39.17m final_speed=18.83m/s | KEEP-vs-MERGE divergence=0.55m | STOP delta=-12.00m/s
+MAN_0095: KEEP displacement=18.33m final_speed=8.87m/s  | KEEP-vs-MERGE divergence=0.32m | STOP delta=-8.40m/s
+MAN_0121: KEEP displacement=14.31m final_speed=7.52m/s  | KEEP-vs-MERGE divergence=0.83m | STOP delta=-0.77m/s
+MAN_0136: KEEP displacement=7.99m final_speed=0.31m/s   | KEEP-vs-MERGE divergence=0.00m | STOP delta=-9.60m/s
+```
+
+KEEP produces genuine forward displacement and STOP produces
+non-positive speed delta (never trending toward cruise) in all 8
+cases, consistent with `test_keep_produces_causal_forward_motion_
+frenet_mpc`/`test_stop_produces_deceleration_frenet_mpc`'s existing
+pass/fail assertions. KEEP-vs-MERGE divergence is measurably positive
+in 6/8 and near-zero in 2/8 (`MAN_0045`, `MAN_0136`) -- inspected
+directly, both are geometrically near-parallel source/target
+centerlines at this stage of the maneuver (not a bug: MERGE and KEEP
+are expected to coincide when the two lanes have not yet diverged
+enough, within a short rollout, for lateral position to differ
+measurably); `test_merge_produces_lateral_motion_toward_target_
+frenet_mpc`'s own fixed-maneuver assertion (`CAUSALITY_MANEUVER`,
+which does show clear divergence) remains the actual pass/fail gate
+for this property.
+
+**Performance snapshot** (`PYTHONPATH=. python3 scripts/audit_
+phase3_performance_and_legacy_comparison.py`, 12 real TRAIN maneuvers,
+up to 25 steps each, `frenet_mpc`, measurement only -- no optimization
+performed):
+
+```
+ReferenceLine construction:                  n=24  p50=0.191ms   p95=0.323ms   max=0.344ms
+frenet_planner (project+generate+evaluate):  n=257 p50=1.269ms   p95=1.783ms   max=2.076ms
+LtvMpcController.solve():                     n=168 p50=170.700ms p95=197.348ms max=205.409ms
+CommonDownstream.step() total:                n=257 p50=160.698ms p95=194.647ms max=206.900ms
+MergeEnvironment.step() total (frenet_mpc):   n=257 p50=608.007ms p95=725.751ms max=4133.149ms
+
+Overall steps/second (frenet_mpc mode): 1.69
+```
+
+A follow-up breakdown (ad hoc monkeypatch instrumentation of
+`PlanningAgentEnvironment.step`/`.metrics` and `MergeEnvironment.
+_build_observation`, 6 maneuvers x 15 steps) decomposed the
+~74%-of-step-time gap between `CommonDownstream.step()` (~161ms
+median) and the full `MergeEnvironment.step()` total (~608ms median):
+
+```
+waymax_env.step() (bicycle-model dynamics):   n=90  p50=147.753ms p95=162.883ms max=2118.177ms
+waymax_env.metrics() (collision/offroad):      n=90  p50=179.631ms p95=256.504ms max=1881.221ms
+_build_observation() (called twice/step):      n=186 p50=26.048ms  p95=29.933ms  max=90.832ms
+```
+
+**Bottleneck identification (measurement only, per this stage's
+explicit no-optimization mandate):** no single stage overwhelmingly
+dominates. Of the ~608ms median per-step wall time: `LtvMpcController.
+solve()` is ~171ms (~28%), Waymax's own `metrics()` call (collision/
+offroad JAX computation) is ~180ms (~30%, the single largest
+contributor), Waymax's own `step()` (bicycle-model dynamics) is ~148ms
+(~24%), and `_build_observation()` (called twice per step: once for
+the causal `observation_before` the executor/planner consume, once
+for the returned post-step observation) is ~52ms combined (~9%). The
+Frenet planner itself (`generate` + `evaluate` + `project`) is
+negligible at ~1.2ms (~0.2%). This is consistent with Waymax's own
+per-call JAX dispatch/(re)compilation overhead dominating a
+plain-Python single-episode step loop (this repo calls `waymax_env.
+step`/`.metrics` once per environment step in an eager loop, not a
+batched/jitted rollout) rather than any one piece of Stage 3's own new
+code being pathologically slow. No optimization was attempted per the
+approved plan's explicit scope limit for this stage.
+
+**Legacy vs frenet_mpc diagnostic comparison** (12 real TRAIN
+maneuvers, identical MERGE-every-step action script, both downstream
+modes -- diagnostic only, no research conclusion drawn, for Stage
+3-H's later human review):
+
+| maneuver_id | legacy_term | frenet_mpc_term | legacy_steps | frenet_steps |
+|---|---|---|---|---|
+| MAN_0001 | success | success | 19 | 18 |
+| MAN_0015 | success | success | 21 | 23 |
+| MAN_0033 | truncation_horizon | success | 63 | 38 |
+| MAN_0046 | failure_offroad | failure_offroad | 2 | 1 |
+| MAN_0057 | failure_collision | failure_collision | 21 | 28 |
+| MAN_0068 | success | success | 19 | 23 |
+| MAN_0079 | success | success | 23 | 26 |
+| MAN_0091 | success | truncation_horizon | 26 | 44 |
+| MAN_0111 | success | success | 26 | 26 |
+| MAN_0125 | success | success | 27 | 26 |
+| MAN_0135 | success | success | 16 | 17 |
+| MAN_0154 | success | failure_collision | 22 | 25 |
+
+Termination-reason agreement: 9/12. Recorded as-is for Stage 3-H;
+no conclusion about which downstream is "better" is drawn here (per
+this stage's explicit scope limit -- this is a diagnostic snapshot,
+not an FSM/PPO performance evaluation, and the two downstreams use
+materially different execution stacks (P-controller + blended
+reference vs. Frenet-MPC), so differing termination on a subset of
+maneuvers is expected, not itself evidence of a defect in either).
+
+**Common-state frozen tests / no hidden action override
+-- re-confirmed:**
+- `pytest tests/environment/test_common_state_freeze.py -q` re-run as
+  part of the full 449-test suite above -- still passing unchanged.
+- Stage 3-F's fallback-command isolation
+  (`test_downstream_failure_fallback_never_alters_requested_or_
+  executed_action`, `test_fallback_command_finite_and_bounded_on_
+  forced_controller_failure`) re-run as part of the same full suite --
+  still passing unchanged; no new fallback/override path was
+  introduced by this stage's `lane_geometry.py` fix (that fix only
+  corrects an existing coordinate computation, it does not add any new
+  control-flow branch in `merge_environment.py`/`common_downstream.py`).
+
+**Gate verification -- all Stage 3-G criteria met:**
+
+| Criterion | Result |
+|---|---|
+| Full test suite passes or only clearly-documented pre-existing failures remain | 449/449 passed, 0 failed (2151.86s) -- zero pre-existing failures to document |
+| All 168 maneuvers reset + bounded rollout under frenet_mpc, zero unhandled exceptions, zero systematic NaN/Inf | Confirmed -- 168/168, 0 exceptions, 0 NaN/Inf, 0 out-of-bounds transition index |
+| Chain handling valid across all 8 chained maneuvers (fixed or precisely documented) | Confirmed -- root-caused and FIXED (see `lane_geometry.py` fix above); 6/8 advance within the audit's step cap, 2/8 (`MAN_0071`/`MAN_0107`) do not advance within budget but remain crash-free/in-bounds -- documented as a normal convergence-timing characteristic, not a defect |
+| Common-state frozen tests still pass | Confirmed -- `test_common_state_freeze.py` in the 449-test full-suite run |
+| No hidden action override anywhere | Re-confirmed -- Stage 3-F's fallback-isolation tests still pass unchanged |
+| New downstream executes representative full episodes on real maneuvers | Confirmed -- 106/168 reach genuine `success` terminations end-to-end under the fixed MERGE-repeatedly script (not a target metric, just evidence full episodes complete); `MAN_0041`'s full chained episode completes end-to-end post-fix |
+| Performance measured (not optimized) | Confirmed -- see performance snapshot above; no optimization attempted |
+
+**Known issues / open items for Stage 3-H (per this stage's explicit
+mandate to document rather than force an unprincipled fix):**
+- `MAN_0071`/`MAN_0107` (both chained, TRAIN) do not advance their
+  chain within a 120-step fixed-MERGE-script audit budget. Inspected
+  directly: neither shows the `-44m`-style corrupted-Frenet-state
+  signature the `lane_geometry.py` fix addresses; this looks like
+  ordinary MPC-tracking/convergence variation against these two
+  scenes' specific real geometry (or, for `MAN_0071`, a genuine
+  collision against real traffic) rather than a further instance of
+  the same bug class. Not investigated further within this stage's
+  budget -- flagged for Stage 3-H if it recurs as a broader pattern.
+- Cost weights/feasibility limits remain the Stage 3-C/3-D initial,
+  non-final values (unchanged by this stage, per the explicit
+  instruction not to tune thresholds to inflate success numbers).
+- Legacy-vs-frenet_mpc termination agreement was 9/12 on the sampled
+  subset -- recorded as diagnostic data only; no conclusion drawn (see
+  comparison table above).
+- Waymax's own `step()`/`metrics()` calls dominate per-step wall time
+  roughly as much as the new Stage 3 MPC stack does; if a future stage
+  wants faster full-split sweeps, batching/jitting the Waymax calls
+  themselves (not Stage 3's own planner, which is already sub-2ms) is
+  where the headroom is -- not attempted here (measurement only, per
+  this stage's scope).
+
+**THIS IS THE FINAL STAGE OF THIS AUTONOMOUS RUN.** Per the approved
+plan, Stage 3-H requires separate user review and must NOT be started
+autonomously. All work stops here pending that review.
+
+**Commit:** `<pending, see final progress-file update commit for the
+recorded SHA>`
