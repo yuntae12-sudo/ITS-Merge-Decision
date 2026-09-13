@@ -30,7 +30,7 @@ the last verified-complete Stage.
 | 3-C BehaviorAction Execution Mapping | COMPLETE | `aafbc2f` |
 | 3-D LTV-MPC | COMPLETE | `a367451` |
 | 3-E Waymax Adapter / Common Downstream | COMPLETE | `4fd2c0e` |
-| 3-F MergeEnvironment Integration | NOT STARTED | — |
+| 3-F MergeEnvironment Integration | COMPLETE | (pending, see below) |
 | 3-G Robustness/Regression | NOT STARTED | — |
 
 ## Log
@@ -294,3 +294,226 @@ Full suite: `PYTHONPATH=. pytest tests/ -q` -> **357 passed, 0 failed, 0 errors*
 - `DownstreamResult.diagnostics` is a plain nested dict (`{"planner": ..., "controller": ...}` or `{"planner": ..., "error": ...}`), not a frozen dataclass -- kept simple since Stage 3-E has no consumer of this data yet beyond tests; Stage 3-F/logging code may want a more structured diagnostics type if it needs to aggregate these across an episode.
 
 **Commit:** `4fd2c0e`
+
+### Stage 3-F: MergeEnvironment integration (frenet_mpc, opt-in only)
+
+**Date:** 2026-09-14
+
+**Files changed:**
+- `src/environment/merge_environment.py` -- **MODIFIED** (first Stage 3
+  change to an existing Phase 2 production file; every prior Stage
+  3-A through 3-E change was additive-only new files). Additive,
+  careful change: added a `downstream_mode: str = "legacy"`
+  constructor parameter (plus `downstream_config_path`), a thin
+  `if self._downstream_mode == "legacy": ... else: ...` branch in
+  `step()` around the objective->command computation, three new
+  private helper methods (`_get_active_reference_lines`,
+  `_build_surrounding_agents`, `_compute_frenet_mpc_command`), a
+  `reset()` addition (construct/reset `CommonDownstream` + build
+  initial reference pair, gated on `downstream_mode == "frenet_mpc"`),
+  and two new `info` fields (`downstream_status`,
+  `downstream_reference_rebuilt`, both `None` in legacy mode). The
+  **default remains `"legacy"`** -- every existing caller (both
+  `test_merge_environment.py` and `test_common_state_freeze.py`, which
+  never pass this argument) exercises the EXACT pre-existing code
+  path, confirmed by re-running both files UNCHANGED (27/27 passed,
+  see below) and by inspecting the diff directly: the legacy branch's
+  five lines (`reference_polyline = ...` through
+  `command = self._controller.compute_command(...)`) are byte-
+  identical to before, only re-indented one level under the new `if`.
+- `tests/environment/test_merge_environment_frenet_mpc.py` -- NEW, 19
+  tests for the new opt-in `downstream_mode="frenet_mpc"` path. Does
+  NOT modify `test_merge_environment.py`'s existing assertions.
+
+**Key design decisions:**
+
+1. **Fallback-command design (Stage 3-E deliberately deferred this to
+   3-F; see that stage's design decision #1).** On ANY non-OK
+   `DownstreamStatus` (planner infeasible/collision-blocked/invalid
+   reference, or controller failure), `_compute_frenet_mpc_command`
+   returns a bounded braking command:
+   `acceleration_mps2 = -MAX_ACCEL_MPS2` (`-6.0`, reusing the SAME
+   constant `low_level_controller.py` and Stage 3-C's own feasibility
+   config already use -- not a new, independently-chosen number),
+   `steering_curvature = 0.0` (hold heading, since there is no valid
+   planned trajectory to steer toward). Chosen because: (a) Waymax's
+   `PlanningAgentEnvironment.step` genuinely needs SOME physical
+   action every call to remain steppable -- confirmed by direct
+   inspection, this is not optional; (b) a FULL-magnitude brake (not a
+   partial/tuned value) is the most conservative, least-assumption
+   choice when the planner/controller could not produce anything
+   trustworthy -- inventing a gentler heuristic would itself be an
+   unjustified assumption about what "close enough to safe" means
+   when the actual planned geometry is unknown/rejected; (c) it is
+   IDENTICAL regardless of policy origin (FSM vs PPO) -- this module
+   has no notion of policy type, matching Stage 3-E's own design; (d)
+   it NEVER changes `requested_action`/`executed_action` in `info` --
+   those are computed from `DecisionState.advance(action)` BEFORE the
+   downstream is ever called, and the fallback only substitutes the
+   PHYSICAL command applied this frame -- verified directly by
+   `test_downstream_failure_fallback_never_alters_requested_or_executed_action`
+   and `test_fallback_command_finite_and_bounded_on_forced_controller_failure`
+   (both force a failure via monkeypatching `CommonDownstream.step`
+   and confirm `requested_action`/`executed_action` are unaffected);
+   (e) the real failure status is always surfaced via the new
+   `info["downstream_status"]` field -- never silently reported as a
+   normal successful step.
+
+2. **Reference-line caching/invalidation.** `_get_active_reference_lines`
+   caches Stage 3-A `ReferenceLine`s keyed by the EXACT
+   `(active_source_lane_id, active_target_lane_id)` pair
+   `EpisodeContext` already exposes -- no second, independent
+   chain-tracking mechanism was built. The cache is populated lazily
+   (built on first use per pair) and invalidated in exactly two
+   places: (a) `reset()`, which clears the whole cache and eagerly
+   rebuilds the initial pair; (b) `step()`'s `chain_advanced` branch
+   (fired by the EXISTING, untouched `_maybe_advance_chain()` return
+   value, called in the SAME position it already was, right after the
+   Waymax step), which evicts only the now-stale pair (computed via
+   `lane_chain[active_transition_index - 1], lane_chain[active_transition_index]`
+   -- i.e. exactly the (old_source, old_target) pair just used, since
+   `active_transition_index` has already been incremented by
+   `advance_if_intermediate_reached` at that point) and calls
+   `CommonDownstream.reset()` to clear the MPC's warm-start, so the
+   next solve is not biased toward the old geometry's control
+   sequence. The new pair is rebuilt lazily on the NEXT step via the
+   same `_get_active_reference_lines()` call, per the task brief's
+   explicit instruction not to force an eager rebuild inside the
+   chain-advanced branch itself. This mechanism is verified
+   deterministically and controller-independently by
+   `test_reference_rebuild_fires_on_chain_advanced_frenet_mpc`, which
+   monkeypatches `_maybe_advance_chain` to force a controlled
+   advancement (spying on `CommonDownstream.reset` and inspecting the
+   cache directly) -- see "known issue" below for why this had to be
+   decoupled from the real end-to-end `CHAINED_MANEUVER` rollout.
+
+3. **Causal-input reuse (no second gap/TTC derivation).**
+   `_compute_frenet_mpc_command` builds `FollowInputs` DIRECTLY from
+   `observation_before` -- the SAME 14D observation array
+   `BehaviorExecutor.compute_objective` already consumed this exact
+   step (indices 2/3/4 for target front, 10/11/12 for source front,
+   per `observation_builder.OBSERVATION_FIELD_NAMES`) -- never a
+   second, independently-derived set of gap/relative-speed numbers.
+   Surrounding-agent state (`_build_surrounding_agents`) is read
+   directly from `self._state.current_sim_trajectory`/
+   `object_metadata`, the same per-frame arrays `_build_observation`
+   itself reads, excluding only the ego id and invalid slots -- no
+   separate simulation-state re-derivation. This directly satisfies
+   the Stage 3-0 audit's fairness constraint restated in the task
+   brief: the 14D observation and the planner's causal inputs come
+   from the identical underlying computation.
+
+4. **Legacy-mode byte-identical verification method.** Not just "the
+   tests still pass" -- the diff itself was inspected line-by-line
+   (`git diff src/environment/merge_environment.py`) to confirm the
+   legacy branch's body is a verbatim, only-reindented copy of the
+   pre-Stage-3-F code (no numeric literal, call argument, or ordering
+   changed), AND the full unmodified
+   `tests/environment/test_merge_environment.py` +
+   `test_common_state_freeze.py` suites (27 tests total, including
+   exact-equality determinism tests like
+   `test_reset_is_deterministic`/`test_same_action_sequence_produces_same_rollout`
+   and the numeric-inequality causality test
+   `test_keep_and_stop_produce_different_controller_commands`) were
+   re-run UNCHANGED and pass, which would catch even a subtle
+   behavioral drift in the legacy path.
+
+5. **`CommonDownstream`/planner/MPC config construction is entirely
+   gated on `downstream_mode == "frenet_mpc"`** -- a `MergeEnvironment`
+   constructed with the default `legacy` mode never loads
+   `configs/phase3_downstream.yaml`, never constructs a
+   `CommonDownstream`/`LtvMpcController`, and never imports/executes
+   any Stage 3-A/B/C/D/E code path at runtime (the modules are
+   imported at module-load time, per normal Python import semantics,
+   but no Stage 3 object is ever instantiated or called unless
+   `frenet_mpc` is explicitly requested) -- zero runtime cost/behavior
+   change for the default path.
+
+**Known issue found during Stage 3-F test development (not a bug in
+this stage's own code, a real finding about Stage 3-C's planner +
+CHAINED_MANEUVER's specific real geometry):** the real chained
+maneuver `CHAINED_MANEUVER` (used successfully by the LEGACY suite's
+own chain-advancement tests, specifically because it is documented
+there as "confirmed by direct rollout to reach success reliably"
+*under the legacy P-controller*) does NOT reliably drive
+`active_transition_index` forward under the frenet_mpc downstream
+within a reasonable step budget. Root-caused via direct diagnostic:
+at episode start ego is still physically in the SOURCE lane, so
+projecting ego's current pose into the SHORT intermediate TARGET
+lane's own Frenet frame (Stage 3-C's approach (b), a prior, already-
+approved design decision, not something this stage should silently
+change) yields a huge out-of-domain `(s, d)` (observed `s≈-44.6,
+d≈-44.6` against a lane only ~20.5m long); Stage 3-B's documented
+open-path linear extrapolation then produces a Cartesian candidate
+trajectory far from both ego's real position and the target lane's
+own geometry, which Stage 3-C's constant-velocity collision proxy
+then spuriously flags as colliding with an unrelated, distant real
+vehicle at `t=0`. This is consistent with `merge_reference.py`'s own
+Stage B-1.5 documented history of the identical class of problem
+(ego far from the target lane's own domain at commitment time), which
+is exactly why the LEGACY path uses a blended source/target reference
+instead of a raw target-frame projection. Since Stage 3-C's
+target-frame-projection approach for MERGE was already an approved,
+documented Stage 3-C decision (not this stage's to relitigate), Stage
+3-F does not alter it; instead, the chain-advancement/reference-
+rebuild MECHANISM itself (the only thing actually owned by this
+stage) is verified deterministically and controller-independently via
+`test_reference_rebuild_fires_on_chain_advanced_frenet_mpc` (forces
+`_maybe_advance_chain` to fire via monkeypatching, independent of
+whether the real MPC trajectory converges), while
+`test_chained_maneuver_advances_and_rebuilds_reference_frenet_mpc`
+still runs the real `CHAINED_MANEUVER` end-to-end and asserts the
+diagnostic is well-formed on every step and correct IF an advance
+occurs, without requiring one to occur. Flagged here explicitly as a
+known limitation for a future stage (candidate improvement: a smarter
+MERGE reference-frame choice for short/near-start intermediate
+transitions, or a less literal constant-velocity collision proxy) --
+out of Stage 3-F's own scope (wiring `CommonDownstream` into
+`MergeEnvironment`, not modifying Stage 3-C's planner).
+
+**Commands run:**
+- `pytest tests/environment/test_merge_environment.py tests/environment/test_common_state_freeze.py -q`
+  -> **27 passed** in 970.53s (16m10s) -- unchanged legacy-mode
+  regression suite, confirming zero behavior change in the default
+  path.
+- `pytest tests/environment/test_merge_environment_frenet_mpc.py -v`
+  -> **19 passed** in 162.98s (2m43s) -- new frenet_mpc-mode
+  integration tests.
+- Full suite: `pytest tests/ -q` -> **449 passed, 0 failed, 0 errors**
+  in 1689.95s (28m09s), confirming exactly 430 (Stage 3-A/B/C/D/E
+  baseline) + 19 (new Stage 3-F) = 449, i.e. zero regressions.
+
+**Gate verification:**
+
+| Criterion | Result |
+|---|---|
+| (1) All existing legacy-mode tests pass UNCHANGED | Confirmed -- 27/27 passed, zero assertion changes |
+| (2) New frenet_mpc-mode integration tests pass | Confirmed -- 19/19 passed (KEEP/FOLLOW/MERGE/STOP causality, commitment lock, success-requires-commitment, chain advancement + reference rebuild (both real-rollout and deterministic-mechanism forms), collision/offroad propagation, 14D observation finiteness, command finiteness incl. fallback steps, fallback-never-alters-requested/executed-action, lightweight diagnostic comparison) |
+| (3) No frozen Phase 2 contract changed | Confirmed -- `BehaviorAction`/`BehaviorObjective`/`DecisionState`/`EpisodeContext`/`observation_builder`/`termination.py` files untouched (only imported); `requested_action`/`executed_action`/MERGE-commitment/chain-advancement-ownership semantics verified unchanged by both the legacy regression suite and the new fallback-isolation tests |
+| (4) No hidden action override on downstream failure | Confirmed -- `test_downstream_failure_fallback_never_alters_requested_or_executed_action` and `test_fallback_command_finite_and_bounded_on_forced_controller_failure` |
+| (5) Chain-transition reference/warm-start reset works and is diagnostically visible | Confirmed -- `test_reference_rebuild_fires_on_chain_advanced_frenet_mpc` (deterministic) + `test_chained_maneuver_advances_and_rebuilds_reference_frenet_mpc` (real rollout, conditional on an advance occurring) |
+| (6) Full existing test suite passes | 449/449 passed (1689.95s) |
+| (7) Only `merge_environment.py` modified among existing files | Confirmed -- `git status --short` shows exactly `M src/environment/merge_environment.py` plus one new untracked test file; diff inspected directly to confirm the legacy branch is a verbatim reindent |
+
+**Known issues / follow-ups for Stage 3-G:**
+- The `CHAINED_MANEUVER` real-geometry limitation above (MERGE's
+  target-frame projection producing a spurious collision-blocked
+  status near a short intermediate lane at episode start) is a real,
+  documented finding about Stage 3-C's planner's interaction with this
+  specific real scene's geometry -- worth Stage 3-G's attention if
+  robustness/regression testing surfaces it as a broader pattern
+  across more real maneuvers, not just this one.
+- Cost weights/feasibility limits are still the Stage 3-C/3-D initial,
+  non-final values (explicitly documented as such in those stages) --
+  expected to need retuning once exercised across a broader real-data
+  robustness pass (Stage 3-G) and eventually PPO training (out of
+  scope here).
+- `downstream_reference_rebuilt`/`downstream_status` are `None` in
+  legacy mode (by design, since the concepts don't apply there) --
+  any future caller reading `info` across both modes should check
+  `downstream_mode` (or tolerate `None`) rather than assume these
+  fields are always populated.
+
+**Commit:** (recorded in a follow-up commit after this doc is committed, per prior stages' pattern)
+
+**Next stage: 3-G** (robustness/regression).

@@ -36,7 +36,14 @@ from waymax import dynamics as waymax_dynamics
 from waymax.datatypes import Action as WaymaxAction
 from waymax.env.planning_agent_environment import PlanningAgentEnvironment
 
+from src.control.ltv_mpc import load_mpc_config
+from src.control.mpc_types import ControllerCommand
 from src.environment.behavior_action import BehaviorAction, BehaviorExecutor
+from src.environment.common_downstream import (
+    CommonDownstream,
+    DownstreamRequest,
+    DownstreamStatus,
+)
 from src.environment.decision_state import DecisionState
 from src.environment.decision_window import (
     DecisionStartUnresolvedError,
@@ -47,7 +54,7 @@ from src.environment.episode_context import (
     parse_candidate_ids,
     parse_lane_chain,
 )
-from src.environment.low_level_controller import LowLevelController
+from src.environment.low_level_controller import MAX_ACCEL_MPS2, LowLevelController
 from src.environment.merge_reference import build_merge_reference
 from src.environment.observation_builder import ObservationInputs, build_observation
 from src.environment.termination import (
@@ -57,6 +64,9 @@ from src.environment.termination import (
     check_online_causal_merge_success,
     check_termination,
 )
+from src.planning.candidate_evaluator import CurrentAgentState
+from src.planning.frenet_planner import EgoKinematicState, FollowInputs, load_planner_config
+from src.planning.reference import ReferenceLine
 from src.scenarios.lane_assignment import (
     LaneAssignmentConfig,
     load_lane_assignment_config,
@@ -81,6 +91,22 @@ from src.scenarios.scenario_loader import (
 )
 
 DEFAULT_MERGE_CONFIG_PATH = "configs/phase1_merge.yaml"
+DEFAULT_DOWNSTREAM_CONFIG_PATH = "configs/phase3_downstream.yaml"
+
+# Stage 3-F fallback command (see step()'s frenet_mpc branch and
+# docs/phase3/OVERNIGHT_PROGRESS.md Stage 3-F entry for the full
+# rationale): applied ONLY when the frenet_mpc downstream reports a
+# non-OK status this step, so `waymax_env.step` always has SOME
+# physical command to consume. Bounded braking, no steering -- reuses
+# the same MAX_ACCEL_MPS2 bound already used by the legacy low-level
+# controller/Stage 3-C's own feasibility limit (consistency with the
+# one dynamics model this command is actually executed on), applied
+# as a full-magnitude deceleration (never a partial/tuned value) since
+# there is no valid planned trajectory to do anything gentler against.
+# `steering_curvature=0.0` holds heading rather than steering toward
+# a reference that failed to produce a valid command.
+FALLBACK_DECELERATION_MPS2 = -MAX_ACCEL_MPS2
+FALLBACK_STEERING_CURVATURE = 0.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,7 +161,27 @@ class MergeEnvironment:
         dataset_config_path: str,
         merge_config_path: str = DEFAULT_MERGE_CONFIG_PATH,
         max_num_objects: int = 64,
+        downstream_mode: str = "legacy",
+        downstream_config_path: str = DEFAULT_DOWNSTREAM_CONFIG_PATH,
     ):
+        """``downstream_mode``:
+            "legacy" (DEFAULT -- must never change): the existing
+                Phase 2 ``LowLevelController``/``merge_reference``
+                execution path, byte-identical to pre-Stage-3-F
+                behavior. Every existing caller that does not pass
+                this argument gets exactly this.
+            "frenet_mpc" (Stage 3-F, opt-in only): routes execution
+                through Stage 3-E's ``CommonDownstream`` (Stage 3-C's
+                Frenet planner + Stage 3-D's LTV-MPC) instead. See
+                ``step()``'s frenet_mpc branch for the full wiring.
+        """
+
+        if downstream_mode not in ("legacy", "frenet_mpc"):
+            raise ValueError(
+                f"Unknown downstream_mode: {downstream_mode!r}; "
+                "must be 'legacy' or 'frenet_mpc'."
+            )
+
         self._expansion_config = load_dataset_config(dataset_config_path)
         self._merge_config_path = merge_config_path
         self._lane_assignment_config: LaneAssignmentConfig = (
@@ -152,6 +198,19 @@ class MergeEnvironment:
         self._max_num_objects = max_num_objects
         self._executor = BehaviorExecutor()
         self._controller = LowLevelController()
+
+        # Stage 3-F: opt-in alternate downstream. Never constructed
+        # (nor imported into any codepath) unless requested, so the
+        # legacy default path's runtime behavior/cost is unaffected.
+        self._downstream_mode = downstream_mode
+        self._common_downstream: Optional[CommonDownstream] = None
+        self._reference_cache: dict = {}
+        if downstream_mode == "frenet_mpc":
+            self._planner_config = load_planner_config(downstream_config_path)
+            self._mpc_config = load_mpc_config(downstream_config_path)
+            self._common_downstream = CommonDownstream(
+                self._planner_config, self._mpc_config
+            )
 
         # Rebuilt fresh every reset() (init_steps depends on the
         # maneuver's own merge_start_frame -- see reset()), so no
@@ -258,6 +317,15 @@ class MergeEnvironment:
         self._steps_elapsed = 0
         self._episode_horizon = self._resolve_episode_horizon(record, decision_start_frame)
 
+        if self._downstream_mode == "frenet_mpc":
+            # Fresh episode: clear the MPC's warm-start and any cached
+            # ReferenceLines from a previous episode's lane geometry
+            # (Stage 3-F -- see _get_active_reference_lines below for
+            # the cache's per-(source,target) keying).
+            self._common_downstream.reset()
+            self._reference_cache = {}
+            self._get_active_reference_lines()  # populate initial pair
+
         observation = self._build_observation()
         info = self._build_info(
             requested_action=None,
@@ -293,17 +361,25 @@ class MergeEnvironment:
             executed_action, observation_before
         )
 
-        reference_polyline = self._resolve_reference_polyline(objective)
+        downstream_status = None
+        downstream_reference_rebuilt = None
 
-        ego_x, ego_y, ego_yaw, ego_speed = self._current_ego_pose_and_speed()
-        command = self._controller.compute_command(
-            reference_speed_mps=objective.reference_speed_mps,
-            reference_polyline=reference_polyline,
-            ego_x=ego_x,
-            ego_y=ego_y,
-            ego_yaw=ego_yaw,
-            ego_speed_mps=ego_speed,
-        )
+        if self._downstream_mode == "legacy":
+            reference_polyline = self._resolve_reference_polyline(objective)
+
+            ego_x, ego_y, ego_yaw, ego_speed = self._current_ego_pose_and_speed()
+            command = self._controller.compute_command(
+                reference_speed_mps=objective.reference_speed_mps,
+                reference_polyline=reference_polyline,
+                ego_x=ego_x,
+                ego_y=ego_y,
+                ego_yaw=ego_yaw,
+                ego_speed_mps=ego_speed,
+            )
+        else:
+            command, downstream_status = self._compute_frenet_mpc_command(
+                executed_action, objective, observation_before
+            )
 
         waymax_action = WaymaxAction(
             data=np.array(
@@ -316,6 +392,28 @@ class MergeEnvironment:
         self._steps_elapsed += 1
 
         chain_advanced = self._maybe_advance_chain()
+
+        if self._downstream_mode == "frenet_mpc" and chain_advanced:
+            # Chain transition: the reference geometry has fundamentally
+            # changed (new active source/target pair). Invalidate the
+            # stale cached ReferenceLines (rebuilt lazily on the NEXT
+            # step's _get_active_reference_lines() call) and clear the
+            # MPC's warm-start so it does not bias the next solve
+            # toward the old geometry's control sequence (Stage 3-F --
+            # see docs/phase3/OVERNIGHT_PROGRESS.md Stage 3-F entry).
+            stale_key = (
+                self._episode_context.lane_chain[
+                    self._episode_context.active_transition_index - 1
+                ],
+                self._episode_context.lane_chain[
+                    self._episode_context.active_transition_index
+                ],
+            )
+            self._reference_cache.pop(stale_key, None)
+            self._common_downstream.reset()
+            downstream_reference_rebuilt = True
+        elif self._downstream_mode == "frenet_mpc":
+            downstream_reference_rebuilt = False
 
         success = self._check_final_success()
         collision, offroad = self._compute_safety_metrics()
@@ -348,6 +446,8 @@ class MergeEnvironment:
             objective=objective,
             chain_advanced=chain_advanced,
             termination_reason=termination_result.reason,
+            downstream_status=downstream_status,
+            downstream_reference_rebuilt=downstream_reference_rebuilt,
         )
 
         reward = 0.0  # Stage B-1 scope: no reward yet.
@@ -449,6 +549,158 @@ class MergeEnvironment:
         return build_merge_reference(
             source_polyline, target_polyline, ego_x, ego_y
         ).polyline
+
+    # ------------------------------------------------------------------
+    # Stage 3-F: frenet_mpc downstream (opt-in only; see __init__'s
+    # downstream_mode docstring). None of this is reachable from the
+    # default "legacy" mode.
+    # ------------------------------------------------------------------
+
+    def _get_active_reference_lines(self):
+        """Returns ``(source_reference, target_reference)`` -- Stage
+        3-A ``ReferenceLine`` objects for the CURRENTLY active
+        (source, target) lane pair, built once per pair and cached
+        (Stage 3-A's own measured construction cost, ~0.1-0.3ms, is
+        real if small; caching avoids paying it every single step for
+        an unchanging pair). The cache key is exactly the
+        (source_lane_id, target_lane_id) pair -- ``EpisodeContext`` is
+        the sole owner of which pair is active; this cache does not
+        track transitions itself, it is only invalidated reactively
+        (by ``reset()`` and by ``step()``'s ``chain_advanced`` branch,
+        see there for why a fresh pair is rebuilt on the NEXT step
+        rather than reused)."""
+
+        key = (
+            self._episode_context.active_source_lane_id,
+            self._episode_context.active_target_lane_id,
+        )
+        cached = self._reference_cache.get(key)
+        if cached is not None:
+            return cached
+
+        source_polyline = self._polylines_by_id[
+            self._episode_context.active_source_lane_id
+        ]
+        target_polyline = self._polylines_by_id[
+            self._episode_context.active_target_lane_id
+        ]
+        source_reference = ReferenceLine.from_lane_polyline(source_polyline)
+        target_reference = ReferenceLine.from_lane_polyline(target_polyline)
+        self._reference_cache[key] = (source_reference, target_reference)
+        return source_reference, target_reference
+
+    def _build_surrounding_agents(self) -> list:
+        """Current-frame (never future/logged) surrounding-agent state
+        for the planner's collision proxy (Stage 3-C's
+        ``CurrentAgentState``) -- reused directly from
+        ``self._state.current_sim_trajectory``/``object_metadata``,
+        the same per-frame arrays ``_build_observation`` already reads,
+        rather than re-deriving a second, independently-sourced set of
+        agent positions (Stage 3-0 fairness note: the 14D observation
+        and the planner's causal inputs must come from the identical
+        underlying computation)."""
+
+        traj = self._state.current_sim_trajectory
+        x = np.asarray(traj.x)[:, 0]
+        y = np.asarray(traj.y)[:, 0]
+        vel_x = np.asarray(traj.vel_x)[:, 0]
+        vel_y = np.asarray(traj.vel_y)[:, 0]
+        length = np.asarray(traj.length)[:, 0]
+        width = np.asarray(traj.width)[:, 0] if hasattr(traj, "width") else None
+        valid = np.asarray(traj.valid)[:, 0].astype(bool)
+        object_ids = np.asarray(self._state.object_metadata.ids)
+
+        agents = []
+        for i in range(object_ids.shape[0]):
+            if not valid[i] or int(object_ids[i]) == self._sdc_id:
+                continue
+            radius_m = None
+            if width is not None and np.isfinite(width[i]):
+                # Conservative circular proxy from the agent's own
+                # half-diagonal (matches candidate_evaluator.py's own
+                # documented circular-proxy convention/collision_limits
+                # default -- this only overrides the DEFAULT radius
+                # when a real per-agent size is available).
+                radius_m = float(np.hypot(length[i], width[i]) / 2.0)
+            agents.append(
+                CurrentAgentState(
+                    agent_id=int(object_ids[i]),
+                    x=float(x[i]),
+                    y=float(y[i]),
+                    velocity_x_mps=float(vel_x[i]),
+                    velocity_y_mps=float(vel_y[i]),
+                    radius_m=radius_m,
+                )
+            )
+        return agents
+
+    def _compute_frenet_mpc_command(
+        self, executed_action: BehaviorAction, objective, observation_before: np.ndarray
+    ):
+        """Stage 3-F: builds a ``DownstreamRequest`` from this step's
+        already-computed inputs (identical ``BehaviorObjective``, ego
+        pose/speed, and 14D observation the legacy path already
+        computed -- no second, independently-derived set of gap/TTC
+        numbers is created here, per the Stage 3-0 fairness audit) and
+        calls Stage 3-E's ``CommonDownstream``.
+
+        Returns ``(command, downstream_status)``. On any non-OK
+        status, ``command`` is Stage 3-F's fallback braking command
+        (see module-level ``FALLBACK_DECELERATION_MPS2`` for the exact
+        value/rationale) -- ``downstream_status`` still reports the
+        real failure explicitly (surfaced in ``info`` by the caller),
+        so this is never a silently-reported success.
+        """
+
+        source_reference, target_reference = self._get_active_reference_lines()
+
+        ego_x, ego_y, ego_yaw, ego_speed = self._current_ego_pose_and_speed()
+        ego_state = EgoKinematicState(x=ego_x, y=ego_y, yaw=ego_yaw, speed_mps=ego_speed)
+
+        # Causal FOLLOW/MERGE gap inputs sourced from the SAME 14D
+        # observation the legacy path/BehaviorExecutor already
+        # consumed this step (indices per
+        # observation_builder.OBSERVATION_FIELD_NAMES) -- never
+        # reselected/re-derived here.
+        follow_inputs = FollowInputs(
+            source_front_gap_m=(
+                float(observation_before[11])
+                if observation_before[10] != 0.0 else None
+            ),
+            source_front_relative_speed_mps=(
+                float(observation_before[12])
+                if observation_before[10] != 0.0 else None
+            ),
+            target_front_gap_m=(
+                float(observation_before[3])
+                if observation_before[2] != 0.0 else None
+            ),
+            target_front_relative_speed_mps=(
+                float(observation_before[4])
+                if observation_before[2] != 0.0 else None
+            ),
+        )
+
+        request = DownstreamRequest(
+            behavior_action=executed_action,
+            objective=objective,
+            ego_state=ego_state,
+            source_reference=source_reference,
+            target_reference=target_reference,
+            follow_inputs=follow_inputs,
+            surrounding_agents=self._build_surrounding_agents(),
+            dt_s=0.1,
+        )
+        result = self._common_downstream.step(request)
+
+        if result.status != DownstreamStatus.OK:
+            fallback_command = ControllerCommand(
+                acceleration_mps2=FALLBACK_DECELERATION_MPS2,
+                steering_curvature=FALLBACK_STEERING_CURVATURE,
+            )
+            return fallback_command, result.status
+
+        return result.command, result.status
 
     def _build_observation(self) -> np.ndarray:
         traj = self._state.current_sim_trajectory
@@ -620,6 +872,8 @@ class MergeEnvironment:
         objective=None,
         chain_advanced=None,
         termination_reason=None,
+        downstream_status=None,
+        downstream_reference_rebuilt=None,
     ) -> dict:
         return {
             "requested_action": requested_action,
@@ -649,4 +903,8 @@ class MergeEnvironment:
                 termination_reason.value if termination_reason else None
             ),
             "steps_elapsed": self._steps_elapsed,
+            "downstream_status": (
+                downstream_status.value if downstream_status is not None else None
+            ),
+            "downstream_reference_rebuilt": downstream_reference_rebuilt,
         }
