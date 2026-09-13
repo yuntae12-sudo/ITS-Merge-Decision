@@ -1,0 +1,211 @@
+# Phase 2 Stage C-2: FROZEN common raw 14D observation research-
+# interface contract.
+#
+# This file documents the ACTUAL behavior of
+# src/environment/observation_builder.py (production code remains the
+# behavior source of truth; this is a machine-readable specification
+# of it, not a second independent implementation). Both the Formal
+# Rule-Based FSM and PPO receive byte-identical vectors of this exact
+# shape/order/semantics for the same simulated state -- neither
+# implementation may see additional information (Stage C Section 26).
+#
+# Any future change to dimension count, feature order, or the meaning
+# of an existing feature is a MAJOR research-design decision: it
+# requires a version bump below, re-running the dataset descriptor
+# generation (scripts/build_phase2_dataset_descriptors.py), and
+# re-running any already-completed Formal FSM / PPO evaluation. It
+# must never happen silently.
+
+state_dim: 14
+version: "1.0"
+frozen_at_stage: "B-2.8 (produced) / C-2 (frozen as research interface)"
+
+# Sentinel/shared constants (must match
+# src.environment.observation_builder.TTC_CAP_S exactly -- see the
+# schema test that imports and checks this).
+ttc_cap_s: 100.0
+
+features:
+  - index: 0
+    name: v_e
+    unit: m/s
+    definition: >
+      Ego's scalar ground speed, sqrt(vel_x^2 + vel_y^2) -- NOT a
+      lane-tangent-projected longitudinal speed (rejected: can go
+      negative purely from a distant/misaligned tangent sample, a
+      projection artifact rather than real motion).
+    sign_convention: always >= 0 (magnitude)
+    valid_range: "[0, +inf)"
+    sentinel_values: none
+    presence_dependency: none (always defined)
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 1
+    name: d_m
+    unit: m
+    definition: >
+      Remaining longitudinal distance to the merge-region end
+      reference: max(merge_end_s - ego_source_arc_length_m, 0.0).
+      merge_end_s is static per-scene source-lane arc-length geometry
+      (no ego-trajectory dependency); ego_source_arc_length_m is ego's
+      CURRENT-frame projection onto the source lane.
+    sign_convention: always >= 0 (clipped at 0 once past the merge-region end)
+    valid_range: "[0, +inf)"
+    sentinel_values: "0.0 if ego's source-lane projection is unavailable/off-lane"
+    presence_dependency: none (always defined)
+    causal_source: "CAUSAL_MAP_INFO (merge_end_s) + CAUSAL_CURRENT_STATE (ego projection)"
+
+  - index: 2
+    name: target_front_present
+    unit: boolean (0.0 / 1.0)
+    definition: 1.0 iff a target-lane front vehicle was found at the current frame.
+    sign_convention: n/a
+    valid_range: "{0.0, 1.0}"
+    sentinel_values: none
+    presence_dependency: is the presence flag itself
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 3
+    name: target_front_gap
+    unit: m
+    definition: >
+      Bumper-to-bumper longitudinal gap to the target-lane front
+      vehicle (can be <= 0 if already overlapping -- never clamped
+      positive).
+    sign_convention: "positive = physically separated; <=0 = overlapping"
+    valid_range: "(-inf, +inf) when present"
+    sentinel_values: "0.0 when target_front_present == 0 (NOT a real zero-distance measurement)"
+    presence_dependency: target_front_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 4
+    name: target_front_relative_speed
+    unit: m/s
+    definition: v_ego_long - v_front_long (target-lane-tangent-projected).
+    sign_convention: "positive = ego closing on the front vehicle"
+    valid_range: "(-inf, +inf) when present"
+    sentinel_values: "0.0 when target_front_present == 0"
+    presence_dependency: target_front_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 5
+    name: target_front_ttc
+    unit: s
+    definition: >
+      gap / closing_speed when closing_speed > 0; 0.0 if gap <= 0
+      (already overlapping); otherwise (non-closing) capped at
+      ttc_cap_s.
+    sign_convention: always >= 0
+    valid_range: "[0, ttc_cap_s]"
+    sentinel_values: >
+      ttc_cap_s (100.0) means "non-closing or absent" -- NEVER a
+      literal 100-second measurement. Present-but-non-closing and
+      absent are NOT distinguishable from this field alone; gate on
+      target_front_present first.
+    presence_dependency: target_front_present (see sentinel_values note)
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 6
+    name: target_rear_present
+    unit: boolean (0.0 / 1.0)
+    definition: 1.0 iff a target-lane rear vehicle was found at the current frame.
+    sign_convention: n/a
+    valid_range: "{0.0, 1.0}"
+    sentinel_values: none
+    presence_dependency: is the presence flag itself
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 7
+    name: target_rear_gap
+    unit: m
+    definition: Bumper-to-bumper longitudinal gap to the target-lane rear vehicle.
+    sign_convention: "positive = physically separated; <=0 = overlapping"
+    valid_range: "(-inf, +inf) when present"
+    sentinel_values: "0.0 when target_rear_present == 0"
+    presence_dependency: target_rear_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 8
+    name: target_rear_relative_speed
+    unit: m/s
+    definition: v_rear_long - v_ego_long (target-lane-tangent-projected).
+    sign_convention: "positive = the rear vehicle closing on ego"
+    valid_range: "(-inf, +inf) when present"
+    sentinel_values: "0.0 when target_rear_present == 0"
+    presence_dependency: target_rear_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 9
+    name: target_rear_ttc
+    unit: s
+    definition: >
+      gap / closing_speed when closing_speed > 0; 0.0 if gap <= 0;
+      otherwise capped at ttc_cap_s. Same sentinel semantics as index 5.
+    sign_convention: always >= 0
+    valid_range: "[0, ttc_cap_s]"
+    sentinel_values: "ttc_cap_s (100.0) means non-closing or absent"
+    presence_dependency: target_rear_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 10
+    name: source_front_present
+    unit: boolean (0.0 / 1.0)
+    definition: 1.0 iff a source-lane (current-lane) front vehicle was found.
+    sign_convention: n/a
+    valid_range: "{0.0, 1.0}"
+    sentinel_values: none
+    presence_dependency: is the presence flag itself
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 11
+    name: source_front_gap
+    unit: m
+    definition: Bumper-to-bumper longitudinal gap to the source-lane front vehicle.
+    sign_convention: "positive = physically separated; <=0 = overlapping"
+    valid_range: "(-inf, +inf) when present"
+    sentinel_values: "0.0 when source_front_present == 0"
+    presence_dependency: source_front_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 12
+    name: source_front_relative_speed
+    unit: m/s
+    definition: v_ego_long - v_front_long (source-lane-tangent-projected).
+    sign_convention: "positive = ego closing on the source-lane lead vehicle"
+    valid_range: "(-inf, +inf) when present"
+    sentinel_values: "0.0 when source_front_present == 0"
+    presence_dependency: source_front_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+  - index: 13
+    name: source_front_ttc
+    unit: s
+    definition: >
+      gap / closing_speed when closing_speed > 0; 0.0 if gap <= 0;
+      otherwise capped at ttc_cap_s. Same sentinel semantics as index 5.
+    sign_convention: always >= 0
+    valid_range: "[0, ttc_cap_s]"
+    sentinel_values: "ttc_cap_s (100.0) means non-closing or absent"
+    presence_dependency: source_front_present
+    causal_source: CAUSAL_CURRENT_STATE
+
+# Chained-maneuver semantics (Stage C-2 Section 22): "target"/"source"
+# above always refer to the CURRENTLY ACTIVE transition
+# (episode_context.active_source_lane_id / active_target_lane_id),
+# which advances when ego stably enters an intermediate target lane.
+# The state is NEVER anchored to the first transition once a chain
+# has advanced -- see MergeEnvironment._build_observation, which reads
+# these active lane ids fresh every call.
+chained_maneuver_note: >
+  All target/source-lane-dependent features (indices 1, 2-9, 10-13)
+  are computed against the CURRENTLY ACTIVE (source, target) pair, not
+  a fixed pair from episode start.
+
+# Fairness (Stage C-2 Section 26): this file specifies the RAW common
+# state only. Any policy-specific preprocessing (e.g. PPO neural-net
+# input normalization) is NOT part of this frozen contract and must
+# not be implemented as a change to observation_builder.py itself.
+fairness_note: >
+  Both Formal FSM and PPO must call build_observation() and receive
+  this exact vector. Neither may receive additional environment
+  information beyond what is specified here.
