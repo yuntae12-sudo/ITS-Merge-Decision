@@ -31,7 +31,7 @@ the last verified-complete Stage.
 | 3-D LTV-MPC | COMPLETE | `a367451` |
 | 3-E Waymax Adapter / Common Downstream | COMPLETE | `4fd2c0e` |
 | 3-F MergeEnvironment Integration | COMPLETE | `78a9faa` |
-| 3-G Robustness/Regression | COMPLETE | `<pending, see end of this entry>` |
+| 3-G Robustness/Regression | COMPLETE | `6be3452` |
 
 ## Log
 
@@ -874,5 +874,4 @@ mandate to document rather than force an unprincipled fix):**
 plan, Stage 3-H requires separate user review and must NOT be started
 autonomously. All work stops here pending that review.
 
-**Commit:** `<pending, see final progress-file update commit for the
-recorded SHA>`
+**Commit:** `6be3452`
