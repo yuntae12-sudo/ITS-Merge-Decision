@@ -26,7 +26,7 @@ the last verified-complete Stage.
 | Stage | Status | Commit SHA |
 |---|---|---|
 | 3-A Reference/Geometry | COMPLETE | `95ab85c92ab63f74cac036bc46f660826061369a` |
-| 3-B Frenet Core | COMPLETE | _(recorded below after commit)_ |
+| 3-B Frenet Core | COMPLETE | `d4b77312639ecf87908a703cfa5db588258ea2e0` |
 | 3-C BehaviorAction Execution Mapping | NOT STARTED | — |
 | 3-D LTV-MPC | NOT STARTED | — |
 | 3-E Waymax Adapter / Common Downstream | NOT STARTED | — |
@@ -149,5 +149,7 @@ SPOT-CHECK GATE: PASS
 **Known issues / follow-ups for Stage 3-C:**
 - The curved-reference round-trip discretization-error finding above (item 7) is worth keeping in mind if Stage 3-C's candidate evaluator does tight numerical comparisons against real (not synthetic) WOMD reference lines with sparser point density than the 4000-point synthetic fixture used here — real WOMD spacing is ~1m (per Stage 3-A's own measurement), so this is not expected to be a practical problem, but has not been exhaustively quantified against real curvature ranges the way the synthetic arc was.
 - `frenet_types.FrenetPath.s_ddd` and `valid`/`rejection_reason` fields are defined but unused placeholders, intentionally deferred to Stage 3-C per the task brief.
+
+**Commit:** `d4b77312639ecf87908a703cfa5db588258ea2e0`
 
 **Next stage: 3-C** (BehaviorAction execution mapping / candidate generation).
