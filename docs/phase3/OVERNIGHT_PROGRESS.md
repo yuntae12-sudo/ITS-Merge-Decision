@@ -28,7 +28,7 @@ the last verified-complete Stage.
 | 3-A Reference/Geometry | COMPLETE | `95ab85c92ab63f74cac036bc46f660826061369a` |
 | 3-B Frenet Core | COMPLETE | `d4b77312639ecf87908a703cfa5db588258ea2e0` |
 | 3-C BehaviorAction Execution Mapping | COMPLETE | `aafbc2f` |
-| 3-D LTV-MPC | COMPLETE | `PENDING_SHA` |
+| 3-D LTV-MPC | COMPLETE | `a367451` |
 | 3-E Waymax Adapter / Common Downstream | NOT STARTED | — |
 | 3-F MergeEnvironment Integration | NOT STARTED | — |
 | 3-G Robustness/Regression | NOT STARTED | — |
@@ -252,6 +252,6 @@ Full suite: `PYTHONPATH=. pytest tests/ -q` -> **357 passed, 0 failed, 0 errors*
 - No control-rate constraint (only a rate-smoothness cost term) -- empirically sufficient for this stage's synthetic tests; if Stage 3-E/F's real closed-loop integration surfaces chattering the cost term alone doesn't damp, a rate constraint is the natural next step.
 - Cost weights are explicitly initial/non-final (see design decision 6) -- expected to need retuning once wired into real closed-loop scenarios (Stage 3-E/F) and eventually PPO training (Stage 3-H, out of scope here).
 
-**Commit:** `PENDING_SHA`
+**Commit:** `a367451`
 
 **Next stage: 3-E** (wire Stage 3-C's `CartesianTrajectory` planner output into this MPC controller).
