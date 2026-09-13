@@ -26,7 +26,7 @@ the last verified-complete Stage.
 | Stage | Status | Commit SHA |
 |---|---|---|
 | 3-A Reference/Geometry | COMPLETE | `95ab85c92ab63f74cac036bc46f660826061369a` |
-| 3-B Frenet Core | NOT STARTED | — |
+| 3-B Frenet Core | COMPLETE | _(recorded below after commit)_ |
 | 3-C BehaviorAction Execution Mapping | NOT STARTED | — |
 | 3-D LTV-MPC | NOT STARTED | — |
 | 3-E Waymax Adapter / Common Downstream | NOT STARTED | — |
@@ -97,3 +97,57 @@ Full suite: `python3 -m pytest tests/ -q` → **298 passed, 0 failed, 0 errors**
 **Note on measurement provenance:** the module docstring in `reference.py` was first written against a smaller preliminary sample (38 maneuvers / 2957 segments) before the full 85-maneuver gate audit ran; it has been updated in this commit to cite the full gate-run numbers above (min segment length 0.394 m, not the earlier preliminary 0.487 m — both are consistent with "near-uniform ~1 m spacing, no real near-duplicates," the correction is one of measurement precision, not a change in conclusion).
 
 **Commit:** `95ab85c92ab63f74cac036bc46f660826061369a`
+
+### Stage 3-B: Frenet trajectory core (quintic/quartic polynomials + Frenet<->Cartesian transform)
+
+**Files added:**
+- `src/planning/frenet_types.py` — `FrenetState` (frozen dataclass: s, s_d, s_dd, d, d_d, d_dd), `FrenetPath` (time-sampled trajectory arrays plus optional `s_ddd` jerk array and `valid`/`rejection_reason` fields reserved for Stage 3-C's candidate evaluator, not implemented here), `CartesianTrajectory` (time-sampled x, y, yaw, curvature, velocity, acceleration). Pure dataclasses, no BehaviorAction dependency.
+- `src/planning/polynomial.py` — `QuinticPolynomial` (fully-constrained: position/velocity/acceleration boundary conditions at both t=0 and t=T) and `QuarticPolynomial` (velocity-keeping: position/velocity/acceleration at t=0, only velocity/acceleration at t=T, terminal position free). Both solve the boundary-value problem by setting up and solving the small (3x3 / 2x2) linear system implied by the boundary conditions via `numpy.linalg.solve`, rather than transcribing a hand-expanded closed-form matrix-inverse formula from memory — mathematically identical but eliminates transcription-error risk. Both expose `position/velocity/acceleration/jerk` evaluation and an exact closed-form `jerk_cost()` (`integral_0^T jerk(t)^2 dt`, computed by symbolically integrating the squared jerk polynomial term-by-term).
+- `src/planning/frenet_transform.py` — `frenet_to_cartesian`/`cartesian_to_frenet`, consuming Stage 3-A's `ReferenceLine`. Position uses the standard Werling et al. offset formula (`x = rx - d*sin(theta_r)`, `y = ry + d*cos(theta_r)`); heading/curvature/velocity/acceleration are recovered via a first-principles route (Frenet tangential/normal velocity-acceleration decomposition, rotated into world frame via full product-rule differentiation to pick up frame-rotation cross terms, then yaw/curvature/acceleration read off the resulting Cartesian velocity/acceleration vectors via the exact planar identities `yaw=atan2(vy,vx)`, `kappa=(vx*ay-vy*ax)/v^3`, `a=(vx*ax+vy*ay)/v`) rather than transcribing Werling's higher-order closed-form heading/curvature composition formula from memory. Explicit low-speed fallback (see design decisions below).
+- `tests/planning/test_frenet_types.py`, `test_polynomial.py`, `test_frenet_transform.py` — 30 new tests (6 + 7 + 17 respectively).
+- `scripts/audit_phase3_frenet_transform.py` — read-only real-WOMD spot-check script (15 reference lines x 4 s-samples x 5 speeds x 3 lateral offsets = 900 conversion checks).
+
+**Key design decisions:**
+1. **Polynomial boundary-value solve via `np.linalg.solve` on the small residual linear system**, not a memorized closed-form inverse — the boundary conditions are already the exact problem statement; solving them numerically is exact (up to float64 rounding) and removes any risk of a mis-transcribed textbook formula. Verified in tests to reproduce boundary conditions to <1e-8 absolute error.
+2. **Jerk cost computed by exact term-by-term polynomial integration** (`integral_0^T t^k dt = T^(k+1)/(k+1)` applied to every cross term of the squared jerk polynomial), not numerically — this is exact for any polynomial. Cross-checked against `scipy.integrate.quad` numerical integration across 20 random boundary-condition sets each for quintic and quartic, requiring `rel=1e-6, abs=1e-9` agreement (chosen because both the closed-form sum and `quad`'s adaptive quadrature on a smooth low-degree polynomial converge to close to machine precision, so a fairly tight relative tolerance is appropriate and both methods agreed far inside it in practice).
+3. **Frenet transform uses TIME derivatives** throughout (`s_d`, `d_d`, ...) to match `FrenetState`'s field convention, rather than Werling's original arc-length-derivative (`d' = dd/ds`) notation — internally related by the chain rule wherever needed, never exposed externally.
+4. **Low-speed singularity threshold: `LOW_SPEED_THRESHOLD_MPS = 0.5` m/s.** Reasoned from this repo's own numbers, not copied from another codebase: Phase 3's MPC dt is locked at 0.1s, and this repo's own `comfortable_deceleration = 2.0 m/s^2` (locked STOP-target design decision) means one control step changes speed by 0.2 m/s — 0.5 m/s is ~2.5 control-steps' margin (avoids branch-flapping across consecutive planner ticks near a STOP) while remaining far below `NOMINAL_CRUISE_SPEED_MPS = 15.0` (3.3%), so the fallback never fires during normal-speed driving. Below threshold, both directions use a purely geometric fallback (assume lane-aligned heading `theta = theta_r`, `kappa = kappa_r`, no division by `s_d`) — deliberately exercised by the STOP maneuver's own terminal state (`STOP_TARGET_SPEED_MPS = 0.0`), confirmed via a dedicated test (`test_stop_maneuver_terminal_state_finite`). A secondary guard also checks the reconstructed Cartesian speed `v` itself (can be near-zero even when `s_d` wasn't, at a lateral-motion cusp) before the curvature/acceleration divide. The geometric `(1 - kappa_r*d)` singularity is also defensively clamped (floor `1e-3`) in `cartesian_to_frenet`, per the task brief's note that it's unlikely to matter for typical highway-merge `d` ranges but should not silently blow up if ever hit.
+5. **`acceleration` is a scalar, tangential-to-heading quantity** in both transform directions (`(ax,ay) = acceleration*(cos(yaw),sin(yaw))` on the way in; `(vx*ax+vy*ay)/v` on the way out) — matches Waymax's own `(acceleration_mps2, steering_curvature)` action convention (locked design decision #1) and makes the two transform directions round-trip-consistent by construction, not coincidentally. Documented explicitly in `cartesian_to_frenet`'s docstring so a future caller does not mistakenly pass a full 2D (including centripetal) acceleration vector.
+6. **Sign convention (`d>0` = left of travel) re-verified, not assumed**, against Stage 3-A's own `ReferenceLine.project` (`test_consistent_with_reference_projection_sign`) and directly on a synthetic straight reference (`test_positive_d_is_left_of_travel`).
+7. During test-tolerance tuning, discovered (and documented in `test_frenet_transform.py`) that curved-reference round-trip position error is dominated by `ReferenceLine`'s own finite-difference curvature-estimation error (not a transform bug) — verified by re-running the same round trip at 400/2000/8000/32000-point arc resolutions and observing the residual shrink well faster than linearly, consistent with the central-difference scheme's second-order accuracy. The curved-reference test fixture uses 4000 points (denser than the 400-point default used for other synthetic geometry in this file) with a documented `3e-3` m position tolerance to comfortably clear this known, understood, non-bug error source.
+
+**Test results:**
+
+`PYTHONPATH=. pytest tests/planning/ -q` → **51 passed** (21 unchanged Stage 3-A `test_reference.py` + 30 new: 6 `test_frenet_types.py` + 7 `test_polynomial.py` + 17 `test_frenet_transform.py`, run to completion in the `its-merge` conda env), 0 failed.
+
+Full suite: `pytest tests/ -q` → **328 passed, 0 failed, 0 errors** in 1588.40s (26m28s), confirming exactly 298 (Stage 3-A baseline) + 30 (new Stage 3-B) = 328, i.e. zero Phase 2/Stage 3-A regressions and all new tests accounted for. No warnings beyond the usual TF/oneDNN/GPU startup notices already seen in Stage 3-A's run.
+
+**Real-WOMD spot-check** (`PYTHONPATH=. python3 scripts/audit_phase3_frenet_transform.py`):
+
+```
+Loaded 110 TRAIN maneuvers.
+Spot-checking 15 real ReferenceLines.
+
+=== Stage 3-B real-WOMD spot-check results ===
+Reference lines checked: 15
+Total conversion checks: 900
+Non-finite outputs: 0
+Crashes: 0
+SPOT-CHECK GATE: PASS
+```
+
+**Gate status — all criteria met:**
+
+| Criterion | Result |
+|---|---|
+| (1) New Frenet-math tests pass (boundary conditions, jerk cost cross-check, round-trips, sign convention, low-speed, yaw wrap, curvature finiteness, boundary handling) | 51/51 pass in `tests/planning/` (30 new) |
+| (2) Stage 3-A's geometry tests still pass unchanged | Confirmed — same 21 tests in `test_reference.py`, untouched file, still passing |
+| (3) ALL existing Phase 2 tests still pass | 328/328 passed, 0 failed, 0 errors, full `tests/` (1588.40s) |
+| (4) Real-WOMD spot-check (10-20 reference lines) finite, zero crashes | PASS — 15 reference lines, 900 checks, 0 non-finite, 0 crashes |
+| (5) No Phase 2 production file modified, no Stage 3-A file modified | Confirmed — `git diff --stat HEAD` empty; only new files under `src/planning/`, `tests/planning/`, `scripts/`, `docs/` |
+
+**Known issues / follow-ups for Stage 3-C:**
+- The curved-reference round-trip discretization-error finding above (item 7) is worth keeping in mind if Stage 3-C's candidate evaluator does tight numerical comparisons against real (not synthetic) WOMD reference lines with sparser point density than the 4000-point synthetic fixture used here — real WOMD spacing is ~1m (per Stage 3-A's own measurement), so this is not expected to be a practical problem, but has not been exhaustively quantified against real curvature ranges the way the synthetic arc was.
+- `frenet_types.FrenetPath.s_ddd` and `valid`/`rejection_reason` fields are defined but unused placeholders, intentionally deferred to Stage 3-C per the task brief.
+
+**Next stage: 3-C** (BehaviorAction execution mapping / candidate generation).
