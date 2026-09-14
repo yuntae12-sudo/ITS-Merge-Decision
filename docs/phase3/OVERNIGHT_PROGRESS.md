@@ -1417,5 +1417,11 @@ measured result, per the task's own instruction.
   counters/fields, +Phase 3 freeze docstring notice; no frozen
   success/termination semantics touched, no default changed)
 
-**Commit(s):** see the commit(s) immediately following this entry in
-`git log` for the exact SHA(s) this Stage 3-H entry corresponds to.
+**Commits:**
+- `658e7c0` -- test(phase3): lock Stage 3-G geometry fix and add intervention diagnostics tests
+- `94be77c` -- test(phase3): pin current FOLLOW/MERGE gap-ignoring execution contract
+- `110279d` -- feat(phase3): add explicit, countable downstream-intervention diagnostics
+- `345b341` -- docs(phase3): record Stage 3-H review-and-freeze findings
+
+**FROZEN PHASE 3 COMMIT SHA (this stage's final commit, the state
+Phase 4/5 must build on):** `345b34113282baf375a9b7d9710e1996a66042bf`
