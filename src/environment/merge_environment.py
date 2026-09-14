@@ -174,6 +174,23 @@ class MergeEnvironment:
                 through Stage 3-E's ``CommonDownstream`` (Stage 3-C's
                 Frenet planner + Stage 3-D's LTV-MPC) instead. See
                 ``step()``'s frenet_mpc branch for the full wiring.
+
+        *** Stage 3-H Phase 3 freeze notice ***
+        Phase 3 (the "common downstream" work, Stages 3-A through 3-H)
+        is now FROZEN as of the Stage 3-H commit recorded in
+        docs/phase3/OVERNIGHT_PROGRESS.md. That freeze declares:
+        ALL Phase 4/5 research evaluators (Formal Rule-Based FSM, PPO
+        training/evaluation, and any FSM-vs-PPO comparison) MUST
+        construct this class with ``downstream_mode="frenet_mpc"``.
+        The "legacy" path (this constructor's default, intentionally
+        UNCHANGED by the freeze -- existing Phase 2 callers/tests must
+        keep working byte-identically) is a pre-Phase-3 execution
+        stack that Phase 4/5 research must not use as its downstream
+        controller. See docs/phase3/OVERNIGHT_PROGRESS.md's Stage 3-H
+        entry for the full frozen-architecture rationale, the
+        intervention-diagnostics contract (`info["intervention_rate"]`
+        etc.), and the FOLLOW/MERGE gap-ignoring execution contract
+        this freeze also pins.
         """
 
         if downstream_mode not in ("legacy", "frenet_mpc"):
@@ -227,6 +244,21 @@ class MergeEnvironment:
         self._merge_end_s: Optional[float] = None
         self._steps_elapsed: int = 0
         self._episode_horizon: int = MAX_EPISODE_HORIZON_FRAMES
+
+        # Stage 3-H Section 3: episode-cumulative intervention
+        # diagnostics (see step()'s frenet_mpc branch and
+        # docs/phase3/OVERNIGHT_PROGRESS.md Stage 3-H entry for the
+        # full rationale). Computed identically regardless of policy
+        # origin (FSM vs PPO) -- purely a function of
+        # `downstream_status`, never of which policy chose the action.
+        # Always 0 in legacy mode (the concept does not apply there;
+        # see `_build_info`'s own docstring note for how callers should
+        # interpret these fields across both modes).
+        self._downstream_failure_count: int = 0
+        self._planner_infeasible_count: int = 0
+        self._collision_blocked_count: int = 0
+        self._controller_failure_count: int = 0
+        self._invalid_reference_count: int = 0
 
     # ------------------------------------------------------------------
     # reset
@@ -317,6 +349,14 @@ class MergeEnvironment:
         self._steps_elapsed = 0
         self._episode_horizon = self._resolve_episode_horizon(record, decision_start_frame)
 
+        # Stage 3-H Section 3: fresh episode, fresh intervention
+        # counters (see __init__'s field docstring above).
+        self._downstream_failure_count = 0
+        self._planner_infeasible_count = 0
+        self._collision_blocked_count = 0
+        self._controller_failure_count = 0
+        self._invalid_reference_count = 0
+
         if self._downstream_mode == "frenet_mpc":
             # Fresh episode: clear the MPC's warm-start and any cached
             # ReferenceLines from a previous episode's lane geometry
@@ -380,6 +420,14 @@ class MergeEnvironment:
             command, downstream_status = self._compute_frenet_mpc_command(
                 executed_action, objective, observation_before
             )
+            # Stage 3-H Section 3: count this step's intervention
+            # status, identically regardless of policy origin -- a
+            # pure function of `downstream_status`, computed here (not
+            # inside _compute_frenet_mpc_command, which already has a
+            # documented, narrower job: producing one command) so the
+            # counting logic lives next to the other per-step
+            # bookkeeping (chain_advanced, steps_elapsed) it parallels.
+            self._record_downstream_status(downstream_status)
 
         waymax_action = WaymaxAction(
             data=np.array(
@@ -531,6 +579,34 @@ class MergeEnvironment:
             source_polyline, target_polyline, self._merge_topology_config
         )
         return merge_end_s
+
+    def _record_downstream_status(self, downstream_status) -> None:
+        """Stage 3-H Section 3: increments this episode's cumulative
+        intervention counters from one step's ``DownstreamStatus``.
+        Only called in ``frenet_mpc`` mode (the counters stay at 0 in
+        legacy mode, where the concept does not apply).
+
+        This is purely a diagnostic tally -- it does NOT alter
+        `requested_action`/`executed_action`, termination/success
+        semantics, or the physical command applied this step (that is
+        still `_compute_frenet_mpc_command`'s fallback-braking command,
+        already computed before this is called). See module/class
+        docstrings and docs/phase3/OVERNIGHT_PROGRESS.md's Stage 3-H
+        entry for the full research-fairness rationale: a high
+        `intervention_rate` must remain VISIBLE alongside `success`,
+        never silently folded into a normal-looking episode.
+        """
+
+        if downstream_status != DownstreamStatus.OK:
+            self._downstream_failure_count += 1
+        if downstream_status == DownstreamStatus.PLANNER_INFEASIBLE:
+            self._planner_infeasible_count += 1
+        elif downstream_status == DownstreamStatus.COLLISION_BLOCKED:
+            self._collision_blocked_count += 1
+        elif downstream_status == DownstreamStatus.CONTROLLER_FAILURE:
+            self._controller_failure_count += 1
+        elif downstream_status == DownstreamStatus.INVALID_REFERENCE:
+            self._invalid_reference_count += 1
 
     def _resolve_reference_polyline(self, objective):
         source_polyline = self._polylines_by_id[
@@ -907,4 +983,27 @@ class MergeEnvironment:
                 downstream_status.value if downstream_status is not None else None
             ),
             "downstream_reference_rebuilt": downstream_reference_rebuilt,
+            # Stage 3-H Section 3: episode-CUMULATIVE (not per-step)
+            # intervention diagnostics. Always 0 / 0.0 in legacy mode
+            # (the concept does not apply there -- there is no
+            # planner/controller feasibility/collision check to
+            # intervene on). In frenet_mpc mode, these are computed
+            # identically regardless of policy origin (FSM vs PPO) --
+            # a pure tally of this episode's `downstream_status`
+            # values so far (see `_record_downstream_status`).
+            # `intervention_rate` = (steps with a non-OK downstream
+            # status so far) / (steps elapsed so far); 0.0 before any
+            # step. A high `intervention_rate` alongside a `success`
+            # termination is a research caveat (a possibly-masked bad
+            # MERGE decision), never evidence to hide -- see
+            # docs/phase3/OVERNIGHT_PROGRESS.md Stage 3-H entry.
+            "downstream_failure_count": self._downstream_failure_count,
+            "planner_infeasible_count": self._planner_infeasible_count,
+            "collision_blocked_count": self._collision_blocked_count,
+            "controller_failure_count": self._controller_failure_count,
+            "invalid_reference_count": self._invalid_reference_count,
+            "intervention_rate": (
+                self._downstream_failure_count / self._steps_elapsed
+                if self._steps_elapsed > 0 else 0.0
+            ),
         }
