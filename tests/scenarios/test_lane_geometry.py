@@ -398,3 +398,140 @@ def test_signed_projection_requires_two_points():
 
     with pytest.raises(ValueError):
         project_point_to_polyline_signed(polyline, x=0.0, y=0.0)
+
+
+# --- Stage 3-H regression: dedicated lock-in for the Stage 3-G bug fix
+# in project_point_to_polyline_signed's extrapolation branches.
+#
+# The bug (see docs/phase3/OVERNIGHT_PROGRESS.md Stage 3-G entry, and
+# the fix's own inline comment in lane_geometry.py):
+# `lateral_distance_m` was computed as the Euclidean distance from the
+# query point to the CLAMPED boundary-endpoint projection, not the
+# true perpendicular distance to the segment's infinite tangent line.
+# For an on-centerline query (y=0.0, the ONLY case every pre-existing
+# extrapolation test above uses) this distinction is invisible -- the
+# lateral offset is exactly 0.0 either way. The bug only manifests for
+# a query point that is BOTH far outside the polyline's domain along
+# the tangent AND offset perpendicular to it (e.g. "~1m off centerline
+# but ~45m before/after the polyline"), which is exactly the blind
+# spot none of the tests above cover. These tests close that gap with
+# hand-computed independent expected values (never calling the
+# function under test to derive its own expected output).
+
+
+def test_signed_projection_extrapolation_upstream_true_perpendicular_offset():
+    """Query point far upstream of the first segment, with a nonzero
+    perpendicular offset. On a straight polyline along +x from (0,0)
+    to (10,0), the segment's tangent is (1, 0) and its left-hand
+    perpendicular is (0, 1) (matching this module's own sign
+    convention: perpendicular = (-dir_y, dir_x)). A query point at
+    (x=-45.0, y=1.0) sits 45 m before the polyline's own domain, but
+    only 1.0 m off the extended centerline -- independently computed
+    by basic vector projection, not by calling the function under
+    test."""
+
+    roadgraph_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    query_x, query_y = -45.0, 1.0
+
+    # Independent hand computation: tangent = (1, 0), origin = (0, 0).
+    # t_raw = dot(query - origin, tangent) / |tangent|^2 = -45.0.
+    # unclamped_projected = origin + t_raw * tangent = (-45.0, 0.0).
+    # offset = query - unclamped_projected = (0.0, 1.0).
+    # perpendicular = (-tangent_y, tangent_x) = (0.0, 1.0).
+    # true_lateral = dot(offset, perpendicular) = 1.0.
+    expected_arc_length_m = -45.0
+    expected_lateral_distance_m = 1.0
+
+    result = project_point_to_polyline_signed(polyline, x=query_x, y=query_y)
+
+    assert result["arc_length_m"] == pytest.approx(
+        expected_arc_length_m, abs=1e-6
+    )
+    assert result["lateral_distance_m"] == pytest.approx(
+        expected_lateral_distance_m, abs=1e-6
+    )
+    # The buggy value (Euclidean distance to the clamped endpoint
+    # (0,0)) would have been hypot(45.0, 1.0) ~= 45.011 -- assert the
+    # true value is nowhere near that, as an explicit anti-regression
+    # tripwire in addition to the exact equality above.
+    assert abs(result["lateral_distance_m"]) < 2.0
+
+
+def test_signed_projection_extrapolation_downstream_true_perpendicular_offset():
+    """Query point far downstream of the last segment, with a nonzero
+    perpendicular offset. Mirror of the upstream case above, past the
+    polyline's end (x=10.0)."""
+
+    roadgraph_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    query_x, query_y = 55.0, -2.0
+
+    # Independent hand computation: tangent = (1, 0), last point
+    # (10, 0). t_raw = dot((55,-2) - (10,0), (1,0)) / 1.0 = 45.0.
+    # unclamped_projected = (10, 0) + 45.0 * (1, 0) = (55.0, 0.0).
+    # offset = (55.0, -2.0) - (55.0, 0.0) = (0.0, -2.0).
+    # perpendicular = (0.0, 1.0). true_lateral = dot(offset, perp) = -2.0.
+    expected_arc_length_m = 10.0 + 45.0  # arc_end + t_raw * seg_len
+    expected_lateral_distance_m = -2.0
+
+    result = project_point_to_polyline_signed(polyline, x=query_x, y=query_y)
+
+    assert result["arc_length_m"] == pytest.approx(
+        expected_arc_length_m, abs=1e-6
+    )
+    assert result["lateral_distance_m"] == pytest.approx(
+        expected_lateral_distance_m, abs=1e-6
+    )
+    # Buggy value would have been hypot(45.0, 2.0) ~= 45.044.
+    assert abs(result["lateral_distance_m"]) < 3.0
+
+
+def test_signed_projection_lateral_distance_invariant_to_extrapolation_distance():
+    """The exact bug class that occurred: lateral_distance_m must NOT
+    scale with how far upstream/downstream the query point is. Varying
+    ONLY the along-tangent extrapolation distance while holding the
+    perpendicular offset fixed at 1.0 m must leave lateral_distance_m
+    unchanged (up to floating-point tolerance) -- this is precisely
+    the invariant the buggy Euclidean-to-clamped-endpoint computation
+    violated (it grew with the along-tangent distance instead of
+    staying constant)."""
+
+    roadgraph_points = _make_roadgraph_points(
+        {1: [(0.0, 0.0), (10.0, 0.0)]}
+    )
+    polyline = extract_lane_polylines(roadgraph_points)[0]
+
+    fixed_perpendicular_offset = 1.0
+    upstream_extrapolation_distances = [0.5, 5.0, 45.0, 500.0]
+
+    lateral_values = [
+        project_point_to_polyline_signed(
+            polyline,
+            x=-distance,
+            y=fixed_perpendicular_offset,
+        )["lateral_distance_m"]
+        for distance in upstream_extrapolation_distances
+    ]
+
+    for value in lateral_values:
+        assert value == pytest.approx(fixed_perpendicular_offset, abs=1e-6)
+
+    # Same invariant downstream of the last point (x=10.0).
+    downstream_lateral_values = [
+        project_point_to_polyline_signed(
+            polyline,
+            x=10.0 + distance,
+            y=fixed_perpendicular_offset,
+        )["lateral_distance_m"]
+        for distance in upstream_extrapolation_distances
+    ]
+
+    for value in downstream_lateral_values:
+        assert value == pytest.approx(fixed_perpendicular_offset, abs=1e-6)

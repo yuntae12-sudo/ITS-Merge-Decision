@@ -1,0 +1,159 @@
+# Phase 3 Stage 3-C: common Frenet behavior-execution planner config.
+#
+# These constants parameterize src/planning/candidate_generator.py and
+# src/planning/candidate_evaluator.py. Values are either (a) reused
+# directly from an existing, already-justified constant elsewhere in
+# this repo (cited below), or (b) a documented, reasoned choice for
+# this stage -- never an arbitrary unexplained number. Nothing here
+# encodes a "should this action be taken" decision; these are pure
+# kinematic/comfort/feasibility bounds for EXECUTING an already-chosen
+# BehaviorAction.
+
+planner:
+  dt_s: 0.1
+  # Matches Phase 3's locked MPC dt (see docs/phase3/OVERNIGHT_PROGRESS.md
+  # locked decision #2) and Waymax's own simulation dt 1:1.
+
+  trajectory_horizon_s: 3.0
+  # Length of the generated candidate trajectory. 3.0 s is long enough
+  # to express a full quintic/quartic maneuver (lane-change-scale
+  # lateral shift, or a stop-distance-scale longitudinal profile) at
+  # highway speeds while staying short enough to replan every step
+  # against fresh current-frame information (this planner is invoked
+  # every environment step, not once per maneuver).
+
+  comfortable_deceleration_mps2: 2.0
+  # STOP's braking-distance formula input. Locked design decision
+  # (docs/phase3/OVERNIGHT_PROGRESS.md, decision #4): s_stop =
+  # s_current + v_current^2 / (2 * comfortable_deceleration).
+
+feasibility:
+  max_longitudinal_accel_mps2: 6.0
+  # Reused directly from InvertibleBicycleModel's default max_accel,
+  # already adopted in this repo as MAX_ACCEL_MPS2 in
+  # src/environment/low_level_controller.py. Using the same bound
+  # here means a trajectory this planner marks OK is also physically
+  # realizable by the shared downstream controller/dynamics model --
+  # not a second, independently-invented limit.
+
+  max_curvature_per_m: 0.3
+  # Reused directly from InvertibleBicycleModel's default
+  # max_steering, already adopted in this repo as
+  # MAX_STEERING_CURVATURE in src/environment/low_level_controller.py.
+  # Same rationale as above: consistency with the one dynamics model
+  # this trajectory will actually be executed on.
+
+  max_longitudinal_jerk_mps3: 20.0
+  # Not directly borrowed from an existing repo constant (no prior
+  # jerk bound exists here) -- reasoned from the two bounds above: a
+  # trajectory that ramps from 0 to max_longitudinal_accel_mps2 (6.0
+  # m/s^2) over one MPC control step (dt_s = 0.1 s) already implies a
+  # jerk on the order of 6.0/0.1 = 60 m/s^3 for that single transition;
+  # 20 m/s^3 is comfortably below that (rejects genuinely violent
+  # jerk spikes across the whole 3s trajectory) while still well above
+  # what any of the four actions' smooth quintic/quartic profiles
+  # produce in practice (verified empirically in
+  # tests/planning/test_candidate_evaluator.py), so it acts as a
+  # smoothness backstop, not a binding constraint on normal maneuvers.
+
+  min_forward_progress_s_dot_mps: -0.1
+  # Epsilon below zero (not exactly 0.0) purely to tolerate float
+  # solver noise right at a near-stationary STOP terminal state;
+  # anything more negative than this is rejected as requiring the
+  # vehicle to move backward, which no BehaviorAction here calls for.
+
+collision:
+  ego_radius_m: 1.5
+  # Simplification (Stage 3-C scope, documented in
+  # candidate_evaluator.py): both ego and other agents are checked as
+  # circles rather than oriented rectangles, for a fast conservative
+  # collision proxy. 1.5 m approximates a typical passenger-vehicle
+  # half-diagonal (~4.5m x 2.0m bounding box has a half-diagonal of
+  # about 2.5m; 1.5m is deliberately smaller than the full half-
+  # diagonal, matching the half-WIDTH-plus-margin scale that dominates
+  # a merge/lane-change collision geometry, where the risk is
+  # primarily lateral proximity, not bumper-to-bumper alignment) --
+  # see candidate_evaluator.py's module docstring for the full
+  # rationale and its documented conservativeness direction.
+
+  agent_radius_default_m: 1.5
+  # Same circular-proxy simplification, used when a specific agent's
+  # own half-length is not provided by the caller.
+
+  collision_margin_m: 0.5
+  # Added to the sum of the two radii before comparing to
+  # center-to-center distance; a small conservative buffer so a
+  # near-tangent circle contact is still flagged, given the
+  # circle-vs-rectangle approximation is otherwise the only source of
+  # margin.
+
+# Phase 3 Stage 3-D: Waymax-native LTV-MPC controller parameters.
+#
+# IMPORTANT: these are INITIAL Phase 3 controller parameters, chosen
+# to be conservative and sufficient for Stage 3-D's synthetic
+# correctness/tracking tests (tests/control/test_ltv_mpc.py) -- they
+# are NOT final, policy-tuned hyperparameters. No ASMC MORAI-tuned
+# numeric weight was ported (Stage 3-0 audit, locked): the weight
+# choice below only encodes "track position/heading/speed most
+# heavily, penalize effort/rate more lightly," not any specific
+# performance target.
+mpc:
+  horizon_steps: 20
+  # 20 steps * dt_s (0.1s) = 2.0s prediction horizon. Shorter than the
+  # planner's 3.0s trajectory_horizon_s above (a fresh reference is
+  # available every replan step, so the MPC does not need to look as
+  # far ahead as the trajectory generator itself); long enough to see
+  # meaningfully ahead of a single dt=0.1s step for a stable
+  # receding-horizon solve.
+
+  dt_s: 0.1
+  # Matches Phase 3's locked MPC dt (docs/phase3/OVERNIGHT_PROGRESS.md
+  # decision #2) and Waymax's own simulation dt 1:1.
+
+  max_iterations: 100
+  # scipy.optimize.minimize(method="L-BFGS-B") iteration cap. Ample
+  # for a smooth, moderate-dimensional (2*horizon_steps = 40 decision
+  # variables at horizon_steps=20) box-constrained problem with an
+  # analytic gradient; not tuned against a throughput target (Stage
+  # 3-H, out of scope for this stage).
+
+  weights:
+    w_pos: 10.0
+    # Position tracking is the dominant cost term -- an MPC that lets
+    # (x, y) drift while nailing other terms is not "tracking" in any
+    # meaningful sense.
+
+    w_yaw: 5.0
+    # Heading tracking: heavy, but somewhat lighter than position --
+    # position error already implicitly penalizes gross heading
+    # error via the (x,y) trajectory shape, so this is a secondary
+    # (not sole) enforcement of heading match.
+
+    w_speed: 2.0
+    # Speed tracking: lighter than position/heading -- speed error
+    # alone does not cause a collision/off-lane event the way
+    # position/heading error can, so it is weighted as an important
+    # but secondary objective.
+
+    w_accel_effort: 0.05
+    w_steering_effort: 0.05
+    # Light control-effort penalty: mostly a tie-breaker among
+    # near-equal-cost tracking solutions (regularization), not a
+    # meaningful constraint on the vehicle's ability to track
+    # aggressively when the reference actually demands it.
+
+    w_accel_rate: 0.1
+    w_steering_rate: 0.1
+    # Light control-rate (smoothness) penalty: damps step-to-step
+    # command chatter between consecutive horizon steps without
+    # meaningfully slowing convergence to a genuinely changing
+    # reference (e.g. an accelerating/decelerating speed profile).
+
+    w_terminal_pos: 20.0
+    w_terminal_yaw: 10.0
+    w_terminal_speed: 5.0
+    # Terminal weights ADD to (do not replace) the regular per-step
+    # weights at the final horizon step -- i.e. the last step is
+    # tracked at (w_pos + w_terminal_pos), etc. -- a standard
+    # heavier-terminal-cost MPC pattern so the horizon's endpoint is
+    # not left to drift just because it is only reached once.

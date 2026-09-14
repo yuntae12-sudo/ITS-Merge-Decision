@@ -195,3 +195,99 @@ def test_all_four_actions_produce_distinct_objective_shapes_when_relevant():
         objective = executor.compute_objective(action, observation)
         assert objective.reference_lane in ("source", "target")
         assert objective.reference_speed_mps >= 0.0
+
+
+# --- Stage 3-H Section 2: explicit, tested pin of the CURRENT
+# gap-ignoring FOLLOW/MERGE execution contract.
+#
+# Stage 3-H audited `_compute_follow_speed` and confirmed it still
+# `del`s its own `lead_gap_m` argument (never used in the return
+# formula) and computes `NOMINAL_CRUISE_SPEED_MPS - max(relative_speed,
+# 0)`, floored at 0 -- i.e. FOLLOW/MERGE's reference speed depends
+# ONLY on relative (closing) speed, never on the absolute gap distance.
+# This was a KNOWN, already-documented Stage B-0 placeholder (see this
+# module's own docstring), not a new finding -- Stage 3-H's own verdict
+# (see docs/phase3/OVERNIGHT_PROGRESS.md Stage 3-H entry, Section 2)
+# is to FREEZE this behavior as-is for Phase 3 (Option A), because:
+#   (1) BehaviorExecutor is shared unconditionally by FSM and PPO, so
+#       this gap-blindness is already fair -- neither policy is
+#       advantaged/disadvantaged by it.
+#   (2) `behavior_action.py` is frozen and out of this stage's
+#       authority to modify.
+#   (3) A gap-aware refinement could only legally live in the planner
+#       layer (candidate_generator.py), but doing so would make the
+#       planner reinterpret/override the sole documented meaning of
+#       `objective.reference_speed_mps` -- a research-design boundary
+#       question flagged for explicit user decision (Option B),
+#       not resolved unilaterally here.
+# This test exists so that any FUTURE change to this behavior (in
+# either direction) is a deliberate, visible decision that breaks an
+# explicit test, not a silent regression.
+
+
+def test_follow_reference_speed_pinned_gap_ignoring_contract():
+    """Pins the CURRENT contract: two FOLLOW observations with
+    identical closing (relative) speed but wildly different absolute
+    gap distances must produce the IDENTICAL reference_speed_mps --
+    because `_compute_follow_speed` deliberately ignores gap entirely
+    (see module docstring / `del lead_gap_m`). If gap-awareness is ever
+    introduced, this test must be updated as a deliberate, reviewed
+    change, not silently broken."""
+
+    executor = BehaviorExecutor()
+
+    close_gap_observation = _observation(
+        source_front_present=1.0,
+        source_front_gap=2.0,  # very close
+        source_front_relative_speed=3.0,  # closing
+    )
+    far_gap_observation = _observation(
+        source_front_present=1.0,
+        source_front_gap=200.0,  # very far
+        source_front_relative_speed=3.0,  # same closing speed
+    )
+
+    close_gap_objective = executor.compute_objective(
+        BehaviorAction.FOLLOW, close_gap_observation
+    )
+    far_gap_objective = executor.compute_objective(
+        BehaviorAction.FOLLOW, far_gap_observation
+    )
+
+    assert close_gap_objective.reference_speed_mps == pytest.approx(
+        far_gap_objective.reference_speed_mps
+    )
+    # Explicit pin of the exact formula: nominal cruise speed reduced
+    # by the (non-negative) closing speed, floored at 0.
+    expected_speed = max(NOMINAL_CRUISE_SPEED_MPS - max(3.0, 0.0), 0.0)
+    assert close_gap_objective.reference_speed_mps == pytest.approx(expected_speed)
+
+
+def test_merge_reference_speed_pinned_gap_ignoring_contract():
+    """Same pin as above, for MERGE against the target-lane lead."""
+
+    executor = BehaviorExecutor()
+
+    close_gap_observation = _observation(
+        target_front_present=1.0,
+        target_front_gap=2.0,
+        target_front_relative_speed=4.0,
+    )
+    far_gap_observation = _observation(
+        target_front_present=1.0,
+        target_front_gap=150.0,
+        target_front_relative_speed=4.0,
+    )
+
+    close_gap_objective = executor.compute_objective(
+        BehaviorAction.MERGE, close_gap_observation
+    )
+    far_gap_objective = executor.compute_objective(
+        BehaviorAction.MERGE, far_gap_observation
+    )
+
+    assert close_gap_objective.reference_speed_mps == pytest.approx(
+        far_gap_objective.reference_speed_mps
+    )
+    expected_speed = max(NOMINAL_CRUISE_SPEED_MPS - max(4.0, 0.0), 0.0)
+    assert close_gap_objective.reference_speed_mps == pytest.approx(expected_speed)
