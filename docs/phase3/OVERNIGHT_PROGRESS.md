@@ -1422,6 +1422,7 @@ measured result, per the task's own instruction.
 - `94be77c` -- test(phase3): pin current FOLLOW/MERGE gap-ignoring execution contract
 - `110279d` -- feat(phase3): add explicit, countable downstream-intervention diagnostics
 - `345b341` -- docs(phase3): record Stage 3-H review-and-freeze findings
+- `e94472f` -- docs(phase3): record Stage 3-H commit SHAs and final frozen Phase 3 SHA
 
 **FROZEN PHASE 3 COMMIT SHA (this stage's final commit, the state
-Phase 4/5 must build on):** `345b34113282baf375a9b7d9710e1996a66042bf`
+Phase 4/5 must build on):** `e94472f6f9098cb63ed8373f149797d190d73439`
