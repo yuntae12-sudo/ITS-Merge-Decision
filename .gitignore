@@ -11,6 +11,21 @@ data/*
 data/manifests/*
 !data/manifests/.gitkeep
 
+# Phase 2 Stage B-1.5: the maneuver_id -> scene_key -> split assignment
+# is a frozen research decision (controller/FSM threshold tuning must
+# never see validation-split scenes), not a regeneratable dataset
+# artifact -- tracked deliberately, unlike the other manifests above.
+!data/manifests/phase2_dataset_split.csv
+
+# Phase 2 Stage C-1: the dataset-difficulty descriptor + interaction
+# -tag table is deterministically reproducible from tracked code
+# (scripts/build_phase2_dataset_descriptors.py +
+# scripts/apply_phase2_difficulty_tags.py) and the frozen
+# configs/phase2_difficulty.yaml thresholds, but is tracked directly
+# per Stage C Section 14 so the exact frozen values used by later
+# analysis/evaluation are visible without rerunning the pipeline.
+!data/manifests/phase2_dataset_difficulty.csv
+
 # Generated outputs
 outputs/*
 !outputs/.gitkeep

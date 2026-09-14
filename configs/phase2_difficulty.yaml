@@ -1,0 +1,135 @@
+# Phase 2 Stage C-1: frozen dataset-difficulty interaction-tag
+# definitions and thresholds.
+#
+# All thresholds below were derived EXCLUSIVELY from TRAIN (110
+# maneuvers, data/manifests/phase2_dataset_split.csv split=="train"),
+# using data/manifests/phase2_dataset_difficulty.csv as produced by
+# scripts/build_phase2_dataset_descriptors.py. VALIDATION is scored
+# against these SAME frozen thresholds without ever re-fitting.
+#
+# Every threshold is a simple TRAIN percentile cut on a
+# policy-independent, causal, deterministic physical descriptor
+# already present in data/manifests/phase2_dataset_difficulty.csv (all
+# of which are themselves reused verbatim from the frozen 14D
+# observation, or from static/geometric dataset-analysis-only fields
+# -- see scripts/build_phase2_dataset_descriptors.py's module
+# docstring for the COMMON_POLICY_STATE vs DATASET_ANALYSIS_DESCRIPTOR
+# distinction). No threshold depends on FSM, AlwaysMerge, or any other
+# policy outcome, reward, or future ego trajectory.
+#
+# Tags are MULTI-LABEL (a maneuver may carry zero, one, or several).
+# A maneuver satisfying none of the "constrained" tags is implicitly
+# OPEN_GAP-eligible; OPEN_GAP itself is also computed explicitly below
+# for direct reporting.
+
+interaction_tags:
+
+  OPEN_GAP:
+    description: >
+      No vehicle occupies ANY of the three tracked slots (target
+      front, target rear, source front) at decision_start_frame --
+      the maneuver begins with a fully clear local neighborhood.
+    definition: >
+      target_front_present == 0 AND target_rear_present == 0 AND
+      source_front_present == 0
+    # No threshold to freeze -- purely a presence-flag conjunction.
+
+  FRONT_CONSTRAINED:
+    description: >
+      A target-lane front vehicle exists and is either close (tight
+      gap) or closing fast (low TTC) relative to the TRAIN
+      distribution among front-present maneuvers.
+    definition: >
+      target_front_present == 1 AND
+      (target_front_gap <= target_front_gap_p25_present OR
+       (target_front_ttc < TTC_CAP_S AND
+        target_front_ttc <= target_front_ttc_p25_noncapped))
+    thresholds:
+      target_front_gap_p25_present: 12.826556213440725  # meters
+      target_front_ttc_p25_noncapped: 2.4237243347740076  # seconds
+    train_support:
+      target_front_present_count: 54
+      target_front_present_fraction: 0.491
+      tag_count_among_present: 16
+
+  REAR_CONSTRAINED:
+    description: >
+      A target-lane rear vehicle exists at decision_start_frame.
+      TRAIN shows this slot is rare (3/110, 2.7%) -- reported as an
+      honest dataset limitation, not amplified by lowering the bar to
+      manufacture a larger group. No gap/TTC sub-threshold is applied
+      on top of presence, since presence alone is already the rare
+      event worth flagging.
+    definition: >
+      target_rear_present == 1
+    thresholds: {}
+    train_support:
+      target_rear_present_count: 3
+      target_rear_present_fraction: 0.027
+
+  SOURCE_FOLLOW_RELEVANT:
+    description: >
+      A source-lane lead vehicle exists and is closer than the TRAIN
+      median gap among source-front-present maneuvers -- i.e. FOLLOW
+      is a materially relevant action choice, not merely available.
+    definition: >
+      source_front_present == 1 AND
+      source_front_gap <= source_front_gap_median_present
+    thresholds:
+      source_front_gap_median_present: 5.247500608636946  # meters
+    train_support:
+      source_front_present_count: 41
+      source_front_present_fraction: 0.373
+      tag_count_among_present: 21
+
+  LATE_MERGE:
+    description: >
+      Remaining merge distance at decision_start_frame is small
+      relative to the full TRAIN distribution (d_m is always present,
+      no gating needed) -- little room/time left to complete the
+      merge once the episode starts.
+    definition: >
+      d_m <= d_m_p25_all_train
+    thresholds:
+      d_m_p25_all_train: 10.95366438058109  # meters
+    train_support:
+      tag_count: 28
+      tag_fraction: 0.255
+
+  DENSE_INTERACTION:
+    description: >
+      Local traffic density (vehicle count within
+      agent_selection.density_radius_m of ego at decision_start_frame,
+      a dataset-analysis-only descriptor -- see
+      scenario_features.compute_traffic_density) is high relative to
+      the full TRAIN distribution.
+    definition: >
+      traffic_density >= traffic_density_p75_all_train
+    thresholds:
+      traffic_density_p75_all_train: 22.0  # vehicle count
+    train_support:
+      tag_count: 31
+      tag_fraction: 0.282
+
+  MULTI_CONSTRAINT:
+    description: >
+      Two or more of {FRONT_CONSTRAINED, REAR_CONSTRAINED,
+      SOURCE_FOLLOW_RELEVANT, LATE_MERGE, DENSE_INTERACTION} are
+      simultaneously active -- a purely derived combination tag, no
+      new threshold of its own.
+    definition: >
+      count(FRONT_CONSTRAINED, REAR_CONSTRAINED,
+            SOURCE_FOLLOW_RELEVANT, LATE_MERGE, DENSE_INTERACTION) >= 2
+    thresholds: {}
+
+# Scalar EASY/MEDIUM/HARD tiering: NOT adopted this stage. TRAIN's
+# tag co-occurrence is not a clean monotonic single axis (e.g. a
+# DENSE_INTERACTION maneuver need not also be FRONT_CONSTRAINED or
+# LATE_MERGE -- the five component tags capture qualitatively
+# different physical constraints, not one severity scale), and the
+# canonical pool is small (110 TRAIN maneuvers) -- collapsing five
+# largely-independent physical axes into three arbitrary bins would
+# not be scientifically defensible without inventing an unweighted
+# aggregate score. Multi-label interaction tags are used instead for
+# all downstream grouped evaluation reporting.
+scalar_difficulty_tier: NOT_USED

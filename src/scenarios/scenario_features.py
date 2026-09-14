@@ -48,7 +48,11 @@ from typing import List, Optional
 import numpy as np
 import yaml
 
-from src.scenarios.lane_geometry import LanePolyline, project_point_to_polyline
+from src.scenarios.lane_geometry import (
+    LanePolyline,
+    project_point_to_polyline,
+    project_point_to_polyline_signed,
+)
 
 # Per Phase 0's OBJECT_TYPE_NAMES (scripts/run_scene.py): 1 = VEHICLE.
 # Front/Rear candidates must be actual vehicles, not pedestrians/
@@ -211,9 +215,26 @@ def find_target_lane_front_rear(
     target-lane arc length. Among survivors, Front is the smallest
     positive (s_vehicle - s_ego); Rear is the largest negative.
 
+    Longitudinal ordering fix (Stage B-0): both `ego_s_m` and each
+    candidate's own longitudinal position are computed with
+    ``project_point_to_polyline_signed`` (SIGNED/unclamped arc length),
+    not ``project_point_to_polyline`` (which clamps to the polyline's
+    own domain). Without this, ego and any candidate vehicle upstream
+    of the target lane's own start point (common at an early
+    pre-merge reference frame, before ego has entered the target lane)
+    would both clamp to the identical `arc_length_m=0.0`, making
+    `relative_s == 0.0` for two physically distinct vehicles and
+    silently excluding a real rear (or front) vehicle from selection.
+    The lateral-distance and heading-difference gates below still use
+    the ordinary (clamped) projection for their own filtering, since
+    those checks are about proximity to the polyline's physical
+    extent, not longitudinal order.
+
     Args:
         target_polyline: the target lane to project onto.
-        ego_s_m: ego's own target-lane arc-length position.
+        ego_s_m: ego's own SIGNED target-lane longitudinal position
+            (see ``project_point_to_polyline_signed``), not the
+            polyline-domain-clamped ``arc_length_m``.
         ego_id: ego's object id (excluded from candidates).
         frame_index: which frame of `object_ids`/`x`/`y`/`valid`/`yaw`
             to use (all object-indexed arrays here are assumed already
@@ -270,7 +291,16 @@ def find_target_lane_front_rear(
         ):
             continue
 
-        relative_s = projection["arc_length_m"] - ego_s_m
+        # SIGNED projection for longitudinal ordering only (Stage B-0
+        # fix) -- lateral/heading gating above already used the
+        # ordinary clamped projection, which is correct for those
+        # proximity checks.
+        signed_projection = project_point_to_polyline_signed(
+            target_polyline, float(x[i]), float(y[i])
+        )
+        candidate_s = signed_projection["arc_length_m"]
+
+        relative_s = candidate_s - ego_s_m
 
         if abs(relative_s) > config.max_distance_m:
             continue
@@ -279,12 +309,12 @@ def find_target_lane_front_rear(
             if best_front_gap_s is None or relative_s < best_front_gap_s:
                 best_front_gap_s = relative_s
                 front_id = candidate_id
-                front_s = projection["arc_length_m"]
+                front_s = candidate_s
         elif relative_s < 0.0:
             if best_rear_gap_s is None or relative_s > best_rear_gap_s:
                 best_rear_gap_s = relative_s
                 rear_id = candidate_id
-                rear_s = projection["arc_length_m"]
+                rear_s = candidate_s
 
     return front_id, front_s, rear_id, rear_s
 
@@ -378,14 +408,24 @@ def extract_interaction_features(
     ego_projection = project_point_to_polyline(
         target_polyline, ego_x, ego_y
     )
-    ego_s = ego_projection["arc_length_m"]
     ego_longitudinal_speed_mps = _longitudinal_speed(
         ego_vel_x, ego_vel_y, ego_projection["heading_rad"]
     )
 
+    # Signed (unclamped) target-lane longitudinal coordinate for
+    # relative front/rear ORDERING only (Stage B-0 fix). The clamped
+    # `ego_projection["arc_length_m"]` above is deliberately kept for
+    # `ego_longitudinal_speed_mps`'s heading and is otherwise unused
+    # here -- see `project_point_to_polyline_signed`'s docstring for
+    # why the clamped value corrupts front/rear selection whenever ego
+    # (or a candidate) projects before the target lane's own start.
+    ego_s_signed = project_point_to_polyline_signed(
+        target_polyline, ego_x, ego_y
+    )["arc_length_m"]
+
     front_id, front_s, rear_id, rear_s = find_target_lane_front_rear(
         target_polyline,
-        ego_s,
+        ego_s_signed,
         ego_id,
         frame_index,
         object_ids,
@@ -416,7 +456,7 @@ def extract_interaction_features(
         )
 
         front_gap_m = float(
-            (front_s - ego_s) - 0.5 * (front_length + ego_length_m)
+            (front_s - ego_s_signed) - 0.5 * (front_length + ego_length_m)
         )
         front_relative_speed_mps = float(
             ego_longitudinal_speed_mps - front_longitudinal_speed
@@ -442,7 +482,7 @@ def extract_interaction_features(
         )
 
         rear_gap_m = float(
-            (ego_s - rear_s) - 0.5 * (rear_length + ego_length_m)
+            (ego_s_signed - rear_s) - 0.5 * (rear_length + ego_length_m)
         )
         rear_relative_speed_mps = float(
             rear_longitudinal_speed - ego_longitudinal_speed_mps
