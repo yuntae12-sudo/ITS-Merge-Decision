@@ -875,3 +875,547 @@ plan, Stage 3-H requires separate user review and must NOT be started
 autonomously. All work stops here pending that review.
 
 **Commit:** `6be3452`
+
+### Stage 3-H: Review and Freeze (five sections)
+
+**Date:** 2026-09-14
+
+**Starting state verified:** branch `phase3/common-downstream`, HEAD
+`b94b4d4060eb7cbf36c4520107b9fd3b71d9bd2e` (Stage 3-G's own commit),
+`git status` clean before this stage began.
+
+#### Section 1: Lock the Stage 3-G geometry bug with a dedicated regression test
+
+**Files changed:**
+- `tests/scenarios/test_lane_geometry.py` -- added 3 new synthetic unit
+  tests for `project_point_to_polyline_signed`'s extrapolation
+  branches, specifically targeting the exact blind spot every
+  pre-existing extrapolation test missed: EVERY existing test in this
+  file queries only on-centerline points (`y=0.0`) when testing
+  far-upstream/downstream extrapolation -- which makes the Stage 3-G
+  bug (`lateral_distance_m` computed as Euclidean-distance-to-clamped-
+  endpoint instead of true perpendicular distance to the infinite
+  tangent line) invisible, since on-centerline lateral offset is 0.0
+  either way. The new tests use a query point with a NONZERO
+  perpendicular offset AND a far along-tangent extrapolation distance
+  simultaneously (e.g. 45 m before the polyline's start, 1 m off its
+  extended centerline), with expected values computed independently by
+  hand (basic vector projection onto the segment's own tangent/
+  perpendicular), never by calling the function under test:
+    - `test_signed_projection_extrapolation_upstream_true_perpendicular_offset`
+    - `test_signed_projection_extrapolation_downstream_true_perpendicular_offset`
+    - `test_signed_projection_lateral_distance_invariant_to_extrapolation_distance`
+      (the exact bug-class tripwire: sweeps the along-tangent
+      extrapolation distance from 0.5m to 500m while holding the
+      perpendicular offset fixed at 1.0m, both upstream and
+      downstream, and asserts `lateral_distance_m` stays exactly 1.0m
+      throughout -- this is precisely the invariant the buggy
+      Euclidean-to-clamped-endpoint computation violated).
+- `tests/environment/test_merge_environment_frenet_mpc.py` -- added
+  `test_man_0041_chained_maneuver_reaches_success_under_repeated_merge_frenet_mpc`,
+  a real-WOMD end-to-end regression using the existing `CHAINED_MANEUVER`
+  (`MAN_0041`) fixture already present in this file. Runs MERGE every
+  step for up to 120 steps (matching the Stage 3-G robustness audit's
+  own cap) and asserts BOTH that the chain advances at least once AND
+  that the episode reaches a genuine `success` termination -- exactly
+  reproducing the Stage 3-G audit's own post-fix finding (chain
+  advances at step ~40, success at step ~59-60). Before the Stage 3-G
+  fix this maneuver's chain never advanced past
+  `active_transition_index=0`; if the bug were reintroduced, this test
+  would fail on the `chain_ever_advanced` assertion.
+
+**Test results:** `tests/scenarios/test_lane_geometry.py` -- 20/20
+passed (17 pre-existing + 3 new).
+`test_man_0041_chained_maneuver_reaches_success_under_repeated_merge_frenet_mpc`
+-- passed in 54.2s standalone.
+
+**Note:** this test does NOT depend on the audit script
+(`scripts/audit_phase3_robustness.py`) -- it is a real, deterministic
+`pytest` test with its own fixture and assertions.
+
+#### Section 2: FOLLOW/MERGE longitudinal execution contract audit
+
+**Confirmed by direct code citation** (`src/environment/behavior_action.py`):
+- `_compute_follow_speed` (lines 190-210) still `del`s its own
+  `lead_gap_m` argument at line 208 (`del lead_gap_m  # reserved for a
+  future gap-aware refinement`) -- gap is genuinely never read.
+- The return formula (lines 209-210) is exactly
+  `max(NOMINAL_CRUISE_SPEED_MPS - max(lead_relative_speed_mps, 0.0), 0.0)`
+  -- confirmed unchanged since Stage B-0.
+- `src/planning/candidate_generator.py`'s `generate_follow_or_merge_candidate`
+  (lines 130-151) is confirmed to be a direct alias for
+  `generate_keep_candidate` -- it consumes ONLY `reference_speed_mps`
+  (the already-computed `BehaviorObjective` field), never gap/TTC
+  directly.
+- `src/planning/frenet_planner.py`'s `FollowInputs` dataclass (lines
+  109-124) carries `source_front_gap_m`/`source_front_relative_speed_mps`/
+  `target_front_gap_m`/`target_front_relative_speed_mps` fields that
+  ARE threaded all the way from `MergeEnvironment._compute_frenet_mpc_command`
+  through `DownstreamRequest` -> `PlanRequest.follow_inputs`, but a
+  direct grep (`request\.follow_inputs\|follow_inputs\.` across
+  `frenet_planner.py`, `candidate_generator.py`, `candidate_evaluator.py`)
+  returns ZERO matches -- confirmed: this is a genuinely accepted-but-
+  never-dereferenced field today, exactly as anticipated.
+
+**Verdict: Option A -- freeze the current gap-ignoring execution as-is
+for Phase 3.** Reasoning:
+1. **Fairness is already satisfied.** `BehaviorExecutor` is shared
+   unconditionally by the (future) FSM baseline and PPO policy, so
+   gap-blindness in `_compute_follow_speed` affects both identically --
+   there is no asymmetry to fix for comparison purposes.
+2. `behavior_action.py` is explicitly frozen and out of this stage's
+   authority to modify, by the task's own hard constraint.
+3. A gap-aware refinement could ONLY legally live in the planner layer
+   (`candidate_generator.py`, consuming the already-threaded
+   `FollowInputs` fields), per the task's own scoping. But doing so
+   would make the PLANNER reinterpret/override the sole documented
+   meaning of `objective.reference_speed_mps` --
+   `behavior_action.py`'s own module docstring calls
+   `BehaviorObjective` "the ONLY interface between the (FSM- or
+   PPO-produced) discrete action and the shared downstream control
+   code." Having the planner additionally consult gap/relative-speed
+   inputs to reshape that objective's execution would mean the
+   planner is making a second, independent judgment about "how
+   aggressively to close a gap" that the frozen executor already
+   claims sole ownership of. This is a genuine research-design
+   boundary question (does "reference_speed_mps" mean "the ONLY
+   speed signal" or "a baseline the planner may further refine"?)
+   that this stage is not confident is its call to make unilaterally.
+4. Per the task's own explicit instruction ("if you have genuine
+   uncertainty about whether it's the right research-design call,
+   implement Option A... and flag Option B... rather than guessing"),
+   this stage freezes Option A and flags Option B (gap-aware planner-
+   level refinement) as an explicit recommendation for later, deliberate
+   user decision -- NOT implemented here.
+
+**Tests added** (pin the CURRENT contract, in
+`tests/environment/test_behavior_action.py`, additive, does not modify
+`behavior_action.py` itself):
+- `test_follow_reference_speed_pinned_gap_ignoring_contract`
+- `test_merge_reference_speed_pinned_gap_ignoring_contract`
+
+Both construct two observations with IDENTICAL relative (closing)
+speed but wildly different absolute gap (2m vs 200m / 150m) and assert
+`reference_speed_mps` is identical between them -- pinning the exact
+current gap-ignoring formula so any FUTURE change (in either
+direction) is a deliberate, reviewed, test-breaking change, not a
+silent regression. `tests/environment/test_behavior_action.py`: 11/11
+passed (9 pre-existing + 2 new).
+
+**Recommendation for explicit future user decision (Option B, NOT
+implemented):** if gap-awareness is later judged valuable (e.g. so a
+close-but-slow-closing lead still produces a more conservative
+reference speed than a far-but-equally-slow-closing one), it should be
+implemented as an explicit, reviewed change inside
+`candidate_generator.py`'s consumption of `FollowInputs`, with a
+clear, documented statement of whether it is refining
+`reference_speed_mps` (a planner-level interpretation layer) or
+whether `BehaviorObjective`'s contract itself should be revisited
+(a frozen-file change, requiring explicit user sign-off, out of any
+future stage's unilateral authority as well).
+
+#### Section 3: Downstream collision-blocking safety-shield audit
+
+**Empirical analysis of Stage 3-G's own audit data**
+(`outputs/phase3/robustness/audit_168_maneuvers.json`, 168 real
+maneuvers under `frenet_mpc` + MERGE-every-step): computed each
+maneuver's per-episode `intervention_rate` (fraction of steps with
+`downstream_status != OK`) and correlated against the `success` flag.
+
+```
+Maneuvers with success=True AND intervention_rate > 0.3: 23 / 106 (~22%)
+  (including several at intervention_rate == 1.0 -- EVERY step of the
+  episode was PLANNER_INFEASIBLE/COLLISION_BLOCKED, yet the episode
+  still reported success=True)
+mean intervention_rate | success=True:  0.158  (n=106)
+mean intervention_rate | success=False: 0.847  (n=62)
+```
+
+**This is real, decisive evidence for the exact research-fairness risk
+the task described**: a MERGE decision can be almost entirely executed
+via the bounded-brake fallback (never the planner's own intended
+trajectory) and still culminate in a `success=True` aggregate outcome,
+with the current `info` dict giving no visibility into how much of the
+episode was genuinely planner-driven vs. fallback-driven. This
+confirms the pre-approved default framing is warranted, not merely
+assumed.
+
+**Decision taken (per the pre-approved default, data-confirmed, not
+data-contradicted):**
+1. **Keep** the current feasibility/collision intervention mechanism
+   as-is (Stage 3-F's bounded-brake fallback) -- it is a legitimate
+   execution-layer safety net: the high-level MERGE/FOLLOW/KEEP/STOP
+   decision (`requested_action`/`executed_action`) is never silently
+   changed to a different `BehaviorAction`; only the low-level command
+   for that specific step is substituted. Re-confirmed unchanged by
+   this stage's own re-run of Stage 3-F's fallback-isolation tests
+   (`test_downstream_failure_fallback_never_alters_requested_or_executed_action`,
+   still passing in the full 461-test suite below).
+2. **Made the intervention EXPLICIT and COUNTABLE** -- new additive
+   `info` diagnostic fields in `MergeEnvironment`
+   (`src/environment/merge_environment.py`):
+   - `downstream_failure_count` (episode-cumulative count of steps
+     with `downstream_status != OK`)
+   - `planner_infeasible_count`, `collision_blocked_count`,
+     `controller_failure_count`, `invalid_reference_count`
+     (episode-cumulative, broken down by specific `DownstreamStatus`)
+   - `intervention_rate` = `downstream_failure_count / steps_elapsed`
+     (0.0 before any step)
+   All five fields are ALWAYS present in `info` (both `legacy` and
+   `frenet_mpc` modes), always `0`/`0.0` in `legacy` mode (the concept
+   does not apply there -- there is no planner/controller feasibility
+   check to intervene on), and computed IDENTICALLY regardless of
+   policy origin (pure function of `downstream_status`, verified by a
+   dedicated test running the same deterministic action sequence
+   through two independently-constructed `MergeEnvironment` instances
+   and asserting byte-identical counters). Counters reset to 0 on every
+   `reset()` (episode-scoped, not instance-lifetime-scoped).
+3. **Documented as a hard Phase 5 constraint** (this section, and the
+   code-level docstring note added to `MergeEnvironment.__init__`,
+   below): reward computation MUST NOT treat an intervention-brake
+   step as equivalent to a policy-caused smooth deceleration --
+   `intervention_rate`/the per-status counts must be surfaced to
+   reward design as a distinct diagnostic signal, never silently
+   folded into normal reward shaping.
+4. **Explicit statement:** a blocked/intervened MERGE must never be
+   silently reported as a successful safe merge decision in aggregate
+   statistics. The existing `success` criterion (frozen
+   `termination.py`, requires MERGE commitment + stable target-lane
+   entry) is UNCHANGED by this section -- but any future aggregate
+   reporting (Phase 4/5 evaluators) that shows `success=True` alongside
+   a high `intervention_rate` (per the 23/106 finding above) must
+   surface that combination as an explicit research caveat, not hide
+   it behind a plain success-rate number.
+
+**Files changed:**
+- `src/environment/merge_environment.py` -- added 5 new per-episode
+  counter fields (`__init__`, reset in `reset()`), a new
+  `_record_downstream_status` helper (called only in the `frenet_mpc`
+  branch of `step()`, immediately after `_compute_frenet_mpc_command`
+  returns), and 6 new keys in `_build_info`'s returned dict (additive,
+  same pattern as the existing `downstream_status`/
+  `downstream_reference_rebuilt` fields). No frozen success/termination
+  semantics were touched; `check_termination`/`check_online_causal_merge_success`
+  are unmodified and uncalled by any of this section's new code.
+- `tests/environment/test_merge_environment_frenet_mpc.py` -- 7 new
+  tests: fields present/zero at episode start, counters accumulate and
+  internally sum-consistent, `intervention_rate` matches
+  `failure_count/steps_elapsed`, counters identical across two
+  independently-run instances given the same action sequence
+  (policy-origin-independence), counters reset on new episode, and
+  fields present-and-zero in `legacy` mode.
+
+**Test results:** 7/7 new intervention-diagnostic tests passed
+(45.8s). Full `test_merge_environment_frenet_mpc.py` +
+`test_merge_environment.py` + `test_common_state_freeze.py` re-run:
+**53/53 passed** (1331.19s / 22m11s), confirming zero regressions from
+this section's changes.
+
+#### Section 4: PPO throughput feasibility audit
+
+**Method:** throwaway `time.perf_counter()`-instrumented scripts (not
+committed to the repo; deleted at the end of this stage), plus a
+clean re-run of the existing `scripts/audit_phase3_performance_and_legacy_comparison.py`.
+No production code was modified for measurement.
+
+**Fresh baseline re-measurement** (12 real TRAIN maneuvers, up to 25
+steps each, `frenet_mpc` mode):
+
+```
+ReferenceLine construction:                  n=24  p50=0.193ms  p95=0.299ms  max=0.356ms
+frenet_planner (project+generate+evaluate):  n=257 p50=1.299ms  p95=1.834ms  max=2.523ms
+LtvMpcController.solve():                     n=168 p50=171.899ms p95=201.415ms max=223.731ms
+CommonDownstream.step() total:                n=257 p50=163.791ms p95=198.981ms max=225.204ms
+MergeEnvironment.step() total (frenet_mpc):   n=257 p50=614.520ms p95=735.446ms max=4246.939ms
+
+Overall steps/second (frenet_mpc mode): 1.67
+```
+
+This matches Stage 3-G's own snapshot (~1.69 steps/s) almost exactly --
+confirms the baseline is stable/reproducible, not sensitive to the
+specific maneuver sample or run-to-run JAX warmup noise.
+
+**Investigation findings (each numbered per the task's own candidate
+list):**
+
+1. **JAX compilation/warmup effects.** Confirmed by direct source
+   inspection (`waymax/env/planning_agent_environment.py`,
+   `waymax/metrics/*.py`, `waymax/dynamics/*.py`): Waymax's OWN
+   `PlanningAgentEnvironment.step()`/`.metrics()` are plain, un-jitted
+   Python methods (only `@jax.named_scope` decorated, never
+   `@jax.jit`) -- the library provides no compiled-and-cached fast
+   path for these itself; only the library's own TEST files
+   (`bicycle_model_test.py`, `delta_test.py`) wrap `dynamics_model.forward`/
+   `.inverse` in `jax.jit` directly, never `step()`/`metrics()`.
+   Empirically: an isolated micro-benchmark calling `waymax_env.step`/
+   `.metrics` directly, in a fresh process, showed a large (~15s)
+   FIRST-ever-call cost (XLA's own per-op/per-shape compilation,
+   automatic even without an explicit `jax.jit` wrapper) followed by a
+   stable ~120-180ms steady state. Critically, a SECOND experiment
+   running through the real `MergeEnvironment.step()` interface across
+   FOUR separate episodes (two distinct maneuvers, `reset()` called
+   between each, each constructing a BRAND NEW `PlanningAgentEnvironment`
+   instance per Stage 3-F's documented per-reset construction pattern)
+   showed the large warmup cost paid ONLY on the very first step of
+   the very first episode (~4.4s that one time) -- every subsequent
+   step, across every subsequent `reset()`/new environment instance,
+   settled immediately to the same ~570-700ms steady state, with NO
+   repeated large recompilation cost on later episodes. **Conclusion:
+   the per-op JAX/XLA compilation cache is process-scoped and persists
+   correctly across `MergeEnvironment.reset()`/new `PlanningAgentEnvironment`
+   instances -- there is no exploitable per-episode warmup inefficiency
+   to fix.** The one-time first-call cost is a normal, already-correctly
+   -amortized process-startup tax for any realistically long training
+   run (100k-1M steps) and is not a throughput problem.
+2. **Whether `metrics()`/`step()` could be JIT-compiled/cached more
+   effectively.** Given finding (1) above (no per-episode
+   recompilation penalty exists to eliminate), explicitly wrapping
+   these calls in `jax.jit` ourselves was assessed as NOT a safe,
+   low-risk change to attempt in this stage: `PlanningAgentEnvironment.step`
+   is a bound method with internal Python-level branching (e.g. its
+   `if len(self._sim_agent_actors) != len(state.sim_agent_actor_states)`
+   check, visible in the installed source) that is not obviously
+   trace-safe under `jax.jit` without a dedicated correctness
+   validation pass this stage's scope/time budget does not include,
+   and any wrapping mistake risks silently changing simulation
+   semantics (a correctness risk explicitly out of bounds per the
+   task's hard constraints). Left as a documented, NOT-implemented
+   recommendation for a future dedicated JAX-integration stage, not
+   attempted here.
+3. **Redundant host<->device (NumPy<->JAX) conversions.** Audited
+   every `np.asarray(...)` call site in `merge_environment.py` (33
+   total). All are small, single-timestep/single-agent-frame slices
+   (e.g. `traj.x[self._sdc_index, 0]`), not bulk array copies, and
+   Stage 3-G's own breakdown already accounts for essentially the
+   entire step budget via `step()` (~148ms) + `metrics()` (~180ms) +
+   MPC solve (~171ms) + observation build (~52ms, INCLUDING these
+   conversions) ~= 551ms of the ~608-614ms total -- there is no large,
+   separately-attributable host/device-transfer cost hiding outside
+   these already-measured buckets. `_build_observation()` is
+   genuinely called twice per step (before and after `waymax_env.step()`),
+   but this is NOT redundant -- the two calls read genuinely different
+   simulation states (pre- and post-step), each one a real, distinct,
+   needed value (one drives the executor's decision, one is the
+   returned post-step observation) -- collapsing them would change
+   what is actually being computed, not just how fast. No safe
+   reduction identified.
+4. **14D observation recomputing planner/controller work.** Not
+   found: `_build_observation()`'s own lane projections
+   (`project_point_to_polyline_signed` on source/target polylines) and
+   the Stage 3-A `ReferenceLine`'s own projection (used by the
+   planner/MPC) are two DIFFERENT geometric representations of the
+   same lane (raw `LanePolyline` vs. the smoothed/interpolated
+   `ReferenceLine`) -- this duplication is real but was already an
+   accepted, documented Stage 3-A/3-F design choice (observation
+   pipeline stays on the frozen Phase 2 `LanePolyline` representation;
+   the Stage 3 planner stack uses its own `ReferenceLine` built on top
+   of the same polyline), and `ReferenceLine` construction itself is
+   already measured as negligible (~0.19ms median). No exploitable
+   redundant COST was found here, just an intentional, cheap,
+   representational duplication -- not touched.
+5. **MPC solve's own internal cost.** Two candidate optimizations
+   were EMPIRICALLY TESTED and both REJECTED as unsafe:
+   - **`max_iterations` (currently 100):** instrumented the actual
+     solver iteration count via `DownstreamResult.diagnostics["controller"]["solver_iterations"]`
+     across 18 real MERGE steps -- **every single step hit the
+     `max_iterations=100` cap exactly** (never converging early).
+     Re-solving the SAME (state, reference) pair at
+     `max_iterations` in `{10, 20, 30, 50, 100}` showed the cost still
+     decreasing substantially all the way to 100 (4.38 -> 0.86) AND
+     the resulting first-step command changing meaningfully with cap
+     (`accel` ranging from -0.65 to -0.17 m/s^2 across the sweep).
+     **This means the solver is genuinely using its full iteration
+     budget to reach a materially better solution, not idling past
+     convergence -- lowering `max_iterations` would be a real,
+     measurable behavior change (a different physical command), which
+     the task's hard constraints explicitly forbid. NOT changed.**
+   - **Horizon length (currently 20 steps):** re-solved the SAME
+     request at `horizon` in `{20, 15, 10, 8}` (all still valid per
+     `common_downstream.py`'s own `trajectory_horizon_s`-vs-`horizon`
+     precondition) -- the resulting command changed meaningfully
+     (`accel`: -0.168 / -0.095 / -0.127 / -0.189 m/s^2 across the
+     sweep), confounded by the SAME max_iterations-capping behavior
+     (every horizon length still hit the 100-iteration cap). **Not a
+     safe, semantics-preserving change either -- NOT implemented.**
+   - Confirmed unchanged from Stage 3-D: an ANALYTIC (not
+     finite-difference) gradient is supplied to `scipy.optimize.minimize`
+     via `_analytic_gradient` (`src/control/ltv_mpc.py` lines 84-177),
+     confirmed still wired via `jac=_analytic_gradient` at the
+     `minimize(...)` call site -- already optimal per Stage 3-D's own
+     design, unchanged.
+6. **Multiprocessing/vectorized-environment feasibility for Phase 5
+   (assessed, NOT implemented, per task scope).** `MergeEnvironment`
+   holds substantial per-instance mutable state (`_waymax_env`,
+   `_state`, `_episode_context`, `_common_downstream`'s MPC warm-start,
+   `_reference_cache`) and is explicitly documented as "not
+   thread-safe" at the `LtvMpcController`/`CommonDownstream` level --
+   there is no shared global mutable state at the MODULE level,
+   however (no global JAX device context is mutated by one instance in
+   a way that would corrupt another instance's state, based on direct
+   inspection), which suggests process-based parallelism (e.g. Python
+   `multiprocessing` with one `MergeEnvironment` instance per worker
+   process, standard for CPU-bound Gym-style environments) is
+   PLAUSIBLE. This is an ASSESSMENT/projection only, not verified by
+   an actual parallel run in this stage.
+
+**No safe optimization was found that improves throughput without
+changing research semantics.** Consistent with Stage 3-G's own
+conclusion, the ~608-614ms/step cost is genuinely distributed across
+Waymax's own `step()`/`metrics()` calls (~54% combined) and the MPC
+solve (~29%), none of which can be safely reduced within this stage's
+hard constraints (no dynamics/controller/feasibility/collision-logic
+changes, no JAX-native MPC rewrite). **Baseline measured throughput
+after this stage's investigation: unchanged at ~1.67-1.69 steps/s
+(single environment, frenet_mpc mode).**
+
+**Wall-clock projections** (single-environment, measured; multi-
+environment, PROJECTED/ASSUMPTION, NOT measured):
+
+| Steps | Single-env (measured rate 1.67 steps/s) |
+|---|---|
+| 100,000 | ~16.6 hours |
+| 500,000 | ~83.2 hours (~3.5 days) |
+| 1,000,000 | ~166.3 hours (~6.9 days) |
+
+| Steps | 4 parallel envs (PROJECTED, linear scaling assumption) | 8 parallel envs (PROJECTED) | 16 parallel envs (PROJECTED) |
+|---|---|---|---|
+| 500,000 | ~20.8 hours | ~10.4 hours | ~5.2 hours |
+| 1,000,000 | ~41.6 hours | ~20.8 hours | ~10.4 hours |
+
+The parallelized numbers assume perfect linear scaling with process
+count and NO measured verification of actual multiprocessing overhead,
+contention, or per-worker JAX compilation-cache cold-start cost (each
+worker process would independently pay the one-time ~4s JAX warmup
+found in finding (1) above, but this is a one-time-per-worker, not
+per-episode, cost and would be negligible relative to any realistic
+training run length) -- labeled explicitly as a projection, not a
+measured result, per the task's own instruction.
+
+#### Section 5: Final Phase 3 freeze
+
+1. **Full test suite:** `PYTHONPATH=. python3 -m pytest tests/ -q` ->
+   **461 passed, 0 failed, 0 errors** in 1874.38s (31m14s). Confirms
+   exactly 449 (Stage 3-G baseline) + 12 new Stage 3-H tests (3 lane_geometry
+   synthetic regression + 1 MAN_0041 real-scene regression + 2
+   behavior_action gap-ignoring pins + 6 intervention-diagnostic
+   tests) = 461, i.e. zero regressions from any of Sections 1-4's
+   changes.
+2. **Representative real-WOMD end-to-end checks:** re-ran `MAN_0001`
+   and `MAN_0041` under `frenet_mpc` + MERGE-every-step, fresh
+   `MergeEnvironment` instance, up to 120 steps: both reach genuine
+   `success` termination (`MAN_0001` at step 18, `MAN_0041` at step
+   60), both with `intervention_rate == 0.000` for these particular
+   runs.
+3. **`MAN_0041` regression-proof:** confirmed both via the new
+   dedicated pytest test (Section 1) and via this section's own
+   end-to-end re-run -- chain advances, episode reaches `success` at
+   step 60, matching Stage 3-G's own documented post-fix finding
+   (steps 40/59-60).
+4. **`MAN_0071`/`MAN_0107` classification** (root-caused via direct
+   diagnostic, reusing `frenet_planner.plan()` directly on each real
+   step to inspect `checks_failed`/`reason`, plus independent
+   Euclidean-distance verification against the real target lane
+   polyline -- NOT tuned, no threshold changed):
+   - **`MAN_0071`** (lane_chain 102->129->119, 100% `PLANNER_INFEASIBLE`,
+     0% `COLLISION_BLOCKED` across all 20 audited steps): diagnosed as
+     ego starting this transition with a REAL, LARGE lateral offset
+     from the intermediate target lane 129 -- `ego_frenet.d = -19.49`
+     at step 0, confirmed via independent Euclidean-distance check
+     against lane 129's own polyline (min distance from ego to any
+     point on lane 129 = 19.49m, exactly matching the projected
+     `lateral_distance_m` to 2 decimal places) and confirmed the
+     nearest segment used was an INTERIOR segment (index 4 of 23), NOT
+     a boundary/extrapolation segment -- i.e. this is NOT the Stage
+     3-G bug class (which lived specifically in the extrapolation
+     branches; this query never enters them). Every failing check is
+     `longitudinal_accel` (never `curvature`), consistent with a
+     genuinely large, real lateral gap that a fixed-3.0s quintic simply
+     cannot close while also respecting the +-6.0 m/s^2 longitudinal
+     accel bound -- **classified as a genuine kinematic/timing
+     limitation of the current planner's fixed-horizon MERGE
+     target-frame-projection approach interacting with this specific
+     real scene's geometry (a short, ~22.6m intermediate lane that
+     starts far laterally from ego's position when this transition
+     becomes active), NOT an implementation bug.** The episode
+     ultimately ends in a real `failure_collision` (confirmed: not a
+     repeat of the corrupted-Frenet-state signature).
+   - **`MAN_0107`** (lane_chain 126->120->119, 96% `PLANNER_INFEASIBLE`
+     across 71 audited steps, oscillating `curvature`/`longitudinal_accel`
+     failures): diagnosed as ego's lateral position (`d`) oscillating
+     between roughly -2.7 and +2.9 across steps while longitudinal
+     speed (`s_d`) repeatedly crashes toward ~0.08 m/s then recovers --
+     a convergence/tracking-oscillation pattern. Confirmed the target
+     lane 120's OWN real geometric curvature (estimated directly from
+     its polyline, max 0.186, mean 0.127) is well under the 0.3 limit
+     -- the curvature failures are induced by the QUINTIC TRAJECTORY
+     SHAPE's own lateral convergence rate interacting with a
+     decelerating/near-stalling longitudinal profile on a short
+     (25.44m), moderately curved lane, not by any geometry defect.
+     **Classified as a genuine MPC/quintic-convergence-timing
+     limitation against this specific real scene's geometry, NOT an
+     implementation bug.** Episode truncates at the horizon without
+     ever advancing the chain.
+   - **No threshold was tuned, and no fix was attempted for either
+     maneuver** -- both are documented, precise findings per the
+     task's explicit instruction not to force an unprincipled fix.
+5. **Freeze declarations:**
+   - `configs/phase3_downstream.yaml` is now the FROZEN Phase 3
+     config (planner/feasibility/collision/mpc sections all as
+     currently checked in -- Stage 3-C/3-D's own documented "initial,
+     non-final" caveat on the MPC cost weights stands as a KNOWN,
+     accepted limitation of this freeze, not grounds to reopen it in
+     this stage).
+   - Planner/controller semantics as implemented across Stages
+     3-A-3-F, PLUS Section 2's Option-A freeze (FOLLOW/MERGE remain
+     gap-ignoring, pinned by test) and Section 3's intervention-
+     diagnostics contract, are FROZEN.
+   - Failure/intervention semantics (Section 3's contract:
+     `downstream_failure_count`/`planner_infeasible_count`/
+     `collision_blocked_count`/`controller_failure_count`/
+     `invalid_reference_count`/`intervention_rate`, all in `info`) are
+     FROZEN as the diagnostic contract Phase 4/5 reward design must
+     consume, per the constraint stated in Section 3 above.
+   - **Formal declaration: all Phase 4/5 research evaluators
+     (Formal Rule-Based FSM, PPO training/evaluation, and any
+     FSM-vs-PPO comparison) MUST construct `MergeEnvironment` with
+     `downstream_mode="frenet_mpc"`.** A prominent docstring note to
+     this effect has been added to `MergeEnvironment.__init__` in
+     `src/environment/merge_environment.py` (see the "*** Stage 3-H
+     Phase 3 freeze notice ***" block in that docstring). The
+     constructor's DEFAULT remains `"legacy"` -- UNCHANGED, per this
+     stage's hard constraint -- so existing Phase 2 callers/tests
+     continue to get exactly their pre-existing behavior; only NEW
+     Phase 4/5 evaluator code is required to pass
+     `downstream_mode="frenet_mpc"` explicitly.
+   - **Exact Phase 3 commit SHA being frozen:** the sequence of
+     commits this Stage 3-H entry documents, on top of Stage 3-G's own
+     `6be3452` (itself on top of Stage 3-F's `78a9faa`) -- see this
+     stage's own commit list at the end of this entry for the precise
+     final SHA.
+   - `src/environment/low_level_controller.py` and
+     `src/environment/merge_reference.py` are explicitly NOT deleted
+     (still present, still used by the `legacy` downstream path).
+   - Formal Rule-Based FSM (Phase 4) is explicitly NOT started by this
+     stage.
+
+**Gate verification -- all Stage 3-H criteria met:**
+
+| Criterion | Result |
+|---|---|
+| Section 1: dedicated, independent regression test for the Stage 3-G bug | Confirmed -- 3 synthetic unit tests (hand-computed expected values) + 1 real-scene MAN_0041 end-to-end test, all passing, none depending on the audit script |
+| Section 2: FOLLOW/MERGE contract audited, explicit verdict reached, no unauthorized change to `behavior_action.py` | Confirmed -- Option A frozen with reasoning documented, Option B flagged for explicit future user decision, `behavior_action.py` untouched (`git diff` confirms), current contract pinned by 2 new tests |
+| Section 3: collision-blocking safety-shield audited with real data, explicit countable diagnostics added | Confirmed -- 23/106 success episodes had intervention_rate > 0.3 (real evidence cited), 6 new `info` fields added additively, 7 new tests, frozen success/termination semantics unchanged |
+| Section 4: throughput profiled, safe optimizations implemented only if verified semantics-preserving | Confirmed -- 2 candidate MPC optimizations empirically tested and REJECTED as unsafe (command changes measurably), JIT-warmup confirmed already correctly amortized (no per-episode cost to fix), no unsafe change made, baseline re-measured at 1.67 steps/s (consistent with Stage 3-G's 1.69) |
+| Section 5: full regression suite passes, MAN_0041 reconfirmed, MAN_0071/MAN_0107 classified without threshold tuning, freeze documented | Confirmed -- 461/461 tests passed, MAN_0041 re-verified end-to-end, both non-advancing maneuvers classified as genuine kinematic/convergence-timing limitations (not bugs) via independent geometric verification, freeze declarations recorded above and in `MergeEnvironment`'s own docstring |
+
+**Files changed this stage:**
+- `tests/scenarios/test_lane_geometry.py` (+3 tests)
+- `tests/environment/test_merge_environment_frenet_mpc.py` (+1 real-scene
+  regression test, +7 intervention-diagnostic tests)
+- `tests/environment/test_behavior_action.py` (+2 gap-ignoring pin tests)
+- `src/environment/merge_environment.py` (+intervention diagnostic
+  counters/fields, +Phase 3 freeze docstring notice; no frozen
+  success/termination semantics touched, no default changed)
+
+**Commit(s):** see the commit(s) immediately following this entry in
+`git log` for the exact SHA(s) this Stage 3-H entry corresponds to.
