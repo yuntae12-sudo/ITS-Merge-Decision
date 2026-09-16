@@ -1,0 +1,17 @@
+{
+  "maneuver_id": "MAN_0107",
+  "split": "train",
+  "lane_chain": [
+    126,
+    120,
+    119
+  ],
+  "steps_run": 71,
+  "terminated": false,
+  "truncated": true,
+  "termination_reason": "truncation_horizon",
+  "frenet_d_min": -2.7147847896458135,
+  "frenet_d_max": 2.9718856933632556,
+  "frenet_s_d_min": 0.03952994522156822,
+  "planner_infeasible_fraction": 0.9577464788732394
+}

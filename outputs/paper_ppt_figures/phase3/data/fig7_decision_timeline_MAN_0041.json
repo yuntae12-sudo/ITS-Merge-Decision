@@ -1,0 +1,9 @@
+{
+  "maneuver_id": "MAN_0041",
+  "split": "validation",
+  "decision_start_frame": 0,
+  "merge_start_frame": 11,
+  "terminal_step_index": 60,
+  "terminal_absolute_frame": 60,
+  "termination_reason": "success"
+}

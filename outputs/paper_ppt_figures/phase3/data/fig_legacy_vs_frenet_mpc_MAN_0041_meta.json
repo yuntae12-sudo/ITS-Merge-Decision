@@ -1,0 +1,11 @@
+{
+  "maneuver_id": "MAN_0041",
+  "legacy": {
+    "steps": 54,
+    "termination_reason": "success"
+  },
+  "frenet_mpc": {
+    "steps": 60,
+    "termination_reason": "success"
+  }
+}

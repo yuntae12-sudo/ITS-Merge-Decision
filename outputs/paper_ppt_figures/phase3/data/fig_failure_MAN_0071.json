@@ -1,0 +1,19 @@
+{
+  "maneuver_id": "MAN_0071",
+  "split": "train",
+  "lane_chain": [
+    102,
+    129,
+    119
+  ],
+  "active_source_lane_id": 102,
+  "active_target_lane_id": 129,
+  "recomputed_frenet_d_m": -19.489899881877445,
+  "independent_euclidean_min_distance_m": 19.489899881877445,
+  "nearest_polyline_index": 5,
+  "target_lane_polyline_point_count": 24,
+  "documented_value_m": -19.49,
+  "matches_documented": true,
+  "rollout_terminal_step": 20,
+  "rollout_termination_reason": "failure_collision"
+}

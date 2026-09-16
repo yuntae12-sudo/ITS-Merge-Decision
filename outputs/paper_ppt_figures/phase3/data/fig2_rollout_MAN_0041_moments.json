@@ -1,0 +1,38 @@
+{
+  "maneuver_id": "MAN_0041",
+  "split": "validation",
+  "moments": [
+    {
+      "label": "decision_start",
+      "step_index": 0,
+      "ego_x": -2951.35693359375,
+      "ego_y": -2444.2880859375,
+      "active_source_lane_id": 618,
+      "active_target_lane_id": 623
+    },
+    {
+      "label": "merge_initiation",
+      "step_index": 41,
+      "ego_x": -3002.238037109375,
+      "ego_y": -2444.339111328125,
+      "active_source_lane_id": 623,
+      "active_target_lane_id": 608
+    },
+    {
+      "label": "mid_merge",
+      "step_index": 50,
+      "ego_x": -3013.480224609375,
+      "ego_y": -2444.724365234375,
+      "active_source_lane_id": 623,
+      "active_target_lane_id": 608
+    },
+    {
+      "label": "terminal",
+      "step_index": 60,
+      "ego_x": -3026.03173828125,
+      "ego_y": -2445.039794921875,
+      "active_source_lane_id": 623,
+      "active_target_lane_id": 608
+    }
+  ]
+}
