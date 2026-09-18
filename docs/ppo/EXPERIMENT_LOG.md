@@ -109,3 +109,56 @@ Format per entry:
     no source/config/test code written, no `pytest` run, no Smoke
     Training run. Documentation-only. Still on `main`, no branch
     created yet. Awaiting final user approval before starting P0.
+
+## 2026-09-18 — P0 Baseline Audit complete
+
+- Phase/Stage: P0 (complete)
+- SHA: `feat/ppo-phase0-5` branch, at the commit immediately following
+  this entry (`chore(ppo): audit frozen training baseline`); prior SHA
+  `aa8cf5b67d51c7bb5005fde0106d773cb8193452`
+- Branch: `feat/ppo-phase0-5` (already created and checked out at
+  session start; no branch-creation step needed this session)
+- W&B run ID: none (P2 scope)
+- Config: none (P1/P2 scope)
+- Result / notes: Confirmed all frozen Phase 1-3 invariants by direct
+  code inspection: `OBSERVATION_DIM == 14` + field order
+  (`observation_builder.py:68-85`), `BehaviorAction`
+  `KEEP=0/FOLLOW=1/MERGE=2/STOP=3` (`behavior_action.py:59-70`),
+  `TerminationReason`'s exactly 5 values (`termination.py:48-53`),
+  MERGE commitment semantics (`decision_state.py`) confirming the
+  pre-step `info_before["merge_committed"]` pattern PPO_PLAN.md §7.1
+  requires is already directly supported by `reset()`/`step()`'s
+  existing return contract (and already used this way in
+  `full_split_evaluator.py::run_episode`), `downstream_mode="frenet_mpc"`
+  wired and tested, and intervention diagnostics present in
+  `_build_info`. Ran the full existing regression suite in the
+  background and waited for the actual process to exit (not a
+  partial/estimated read): **461 passed, 0 failed, 1798.33s (0:29:58,
+  exit code 0)**. An intermediate mid-run snapshot had briefly shown
+  `F` marks around 31% (still-running module); the completed run's own
+  final summary is 100% dots with zero failures, confirming that
+  snapshot was stale/truncated, not a real failure -- final state has
+  no failing tests. Reproduced a deterministic rollout (maneuver
+  MAN_0001, fixed KEEP-only script, frenet_mpc mode, 40 steps):
+  byte-identical observation trace across 2 independent runs
+  (`max_abs_obs_diff = 0.0`); episode did not terminate within 40 KEEP
+  steps (`termination_reason='none'`), with `downstream_status=
+  'COLLISION_BLOCKED'` and `intervention_rate=0.05` -- confirms
+  intervention-diagnostics fields are live and populated, not a test
+  failure. Measured throughput on a separate 60-step timed rollout:
+  ~1.64 steps/sec; that specific subprocess logged a GPU-dlopen
+  failure and ran on CPU fallback (env/library-path issue local to
+  that invocation, not a regression -- the interactive `jax.devices()`
+  check and the full GPU-run pytest suite above both confirm the GPU
+  path works). LTV-MPC L-BFGS-B solve dominates per-step cost
+  regardless of backend -- noted as a real constraint on P5's step
+  budget, not a bug. Recorded dependency versions: Python 3.10.21, JAX/jaxlib 0.6.2,
+  NumPy 2.2.6, TensorFlow 2.21.0, waymo-waymax 0.1.0, GPU RTX 4060 via
+  `jax.devices() == [CudaDevice(id=0)]`. Found `flax==0.10.7`,
+  `optax==0.2.8`, `orbax-checkpoint==0.11.39` already installed and
+  compatible; installed only the missing `wandb` (plain
+  `pip install wandb` -> `wandb==0.30.0`, no `--upgrade` flag, no
+  jax/jaxlib/numpy version change) and re-verified `jax.devices()`
+  still reports the GPU afterward. No contradiction found between
+  PPO_PLAN.md and the current codebase -- no blocker. Next: P1 PPO
+  Foundation scaffolding.
