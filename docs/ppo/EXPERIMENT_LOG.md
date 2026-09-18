@@ -162,3 +162,147 @@ Format per entry:
   still reports the GPU afterward. No contradiction found between
   PPO_PLAN.md and the current codebase -- no blocker. Next: P1 PPO
   Foundation scaffolding.
+
+## 2026-09-18 — P1 PPO Foundation complete
+
+- Phase/Stage: P1 (complete)
+- SHA: `feat/ppo-phase0-5` branch, at the commit immediately following
+  this entry (`feat(ppo): add PPO foundation scaffolding`); prior SHA
+  `bcf2b4c` (P0 completion)
+- Branch: `feat/ppo-phase0-5`
+- W&B run ID: none (P2 scope)
+- Config: `configs/ppo/ppo_base.yaml`, `configs/ppo/ppo_smoke.yaml`,
+  `configs/reward/merge_reward_v0.yaml` (all newly created this Phase;
+  values only, verbatim from PPO_PLAN.md SS5/SS6 -- no reward/PPO
+  algorithm code yet, that is P2/P3)
+- Result / notes: Created every directory/module PPO_PLAN.md SS4 lists
+  (`src/rewards/` + `merge_reward.py`/`reward_wrapper.py`,
+  `src/policies/` + `src/policies/ppo/` +
+  `networks.py`/`distribution.py`/`policy.py`/`loss.py`/`state.py`,
+  `src/training/` + `config.py`/`seeding.py`/`checkpoint.py`/
+  `rollout.py`/`gae.py`/`trainer.py`, `src/tracking/` +
+  `wandb_logger.py`, `tests/rewards/`, `tests/policies/`,
+  `tests/training/` -- all new files, no existing Phase 1-3 file
+  touched or relocated). Real algorithm/reward/rollout logic in the
+  P2/P3/P4/P5-scoped modules is intentionally stubbed as
+  `NotImplementedError` (fixed signatures/dataclasses/constants only --
+  e.g. the `Transition` field contract, the SS11 action-index ->
+  `BehaviorAction` mapping, the SS8 metric/config-key names, the SS6
+  layer sizes) so later phases target an agreed contract from the
+  start. Implemented `src/training/config.py` (YAML config loading for
+  both PPO and reward configs, following this repo's existing
+  `yaml.safe_load` + frozen-dataclass convention already used by
+  `load_mpc_config`/`load_planner_config`/`load_dataset_config`),
+  `src/training/seeding.py` (`make_seed_state`/`split_key` -- one
+  integer seed deterministically produces a JAX PRNGKey + NumPy
+  RandomState), and `src/training/checkpoint.py` (`CheckpointPayload`
+  dataclass carrying every field PPO_PLAN.md SS10 requires: policy/
+  value params, optimizer state, JAX RNG key, global env step, PPO
+  update step, seed, config snapshot, reward version, git SHA, plus
+  `get_git_sha`/`save_checkpoint`/`load_checkpoint` as a P1
+  pickle-based skeleton -- the real JAX-pytree save/load/resume cycle
+  against actual PPO train state is verified end-to-end in P5).
+  Created `scripts/train_ppo.py` (now also accepts `--resume <path>`,
+  echoed as "not yet wired up" per SS10/P5) and
+  `scripts/smoke_train_ppo.py`: both resolve config + seed and (smoke
+  only) deterministically select a small canonical-TRAIN maneuver_id
+  subset via `--max-maneuvers`/`--maneuver-ids`/`--seed` -- explicitly
+  NOT a PPO-FIT/PPO-TUNE split, for pipeline verification only, per
+  PPO_PLAN.md SS0/SS9. No real rollout/training loop yet (explicit P1
+  non-goal). Wrote 28 new P1 tests across `tests/training/test_config.py`
+  (10: PPO/reward config loading + values, config cross-reference,
+  finite-value check, seed determinism/non-determinism-across-seeds,
+  `split_key` shape, non-empty git SHA, checkpoint save->load
+  round-trip), `tests/rewards/test_imports.py` (4), `tests/policies/
+  test_imports.py` (8, including the SS11 action-index mapping
+  regression test), and `tests/training/test_imports.py` (6). Ran the
+  28 new P1 tests alone (28 passed, 7.86s); ran the scripts directly
+  (including `--resume`) and confirmed exit code 0 with the expected
+  printed output. Re-ran the FULL existing regression suite (Phase 1-3
+  tests + new P1 tests together) and waited for the real process exit:
+  first attempt showed 62 failures (`FailedPreconditionError: Failed to
+  allocate scratch buffer for device 0` / TF `TypeSpec` errors);
+  investigation found a second, stale `pytest tests/ -q` process left
+  running concurrently from an earlier session, contending for the same
+  RTX 4060 GPU -- not a real regression, and no source file was touched
+  while diagnosing it. Waited for the stale process to exit on its own,
+  then re-ran the full suite solo: **489 passed**, 0 failed, 0 skipped,
+  1867.61s (0:31:07), exit code 0 (461 pre-existing + 28 new P1 = 489,
+  matching exactly) -- confirms P1 introduced no regression. No
+  contradiction found between PPO_PLAN.md and the current codebase --
+  no blocker. Next: P2 Reward V0 + W&B Foundation.
+
+  **Correction (see next entry below): the 471 figure above was from
+  an earlier in-progress count, taken before all 4 new P1 test files
+  existed.** The final, verified P1 test suite has 28 new tests (not
+  10), giving 489, not 471 -- see the 2026-09-18 "P1 final regression
+  re-verification" entry for the corrected, final numbers. This entry
+  is left as originally written per this log's append-only convention.
+
+## 2026-09-18 — P1 final regression re-verification and commit
+
+- Phase/Stage: P1 (complete -- final verification pass before commit)
+- SHA: `feat/ppo-phase0-5` branch, at the commit immediately following
+  this entry (`feat(ppo): add PPO foundation scaffolding (P1)`); prior
+  SHA `bcf2b4c` (P0 completion)
+- Branch: `feat/ppo-phase0-5`
+- W&B run ID: none (P2 scope)
+- Config: `configs/ppo/ppo_base.yaml`, `configs/ppo/ppo_smoke.yaml`,
+  `configs/reward/merge_reward_v0.yaml` (unchanged from the prior
+  entry)
+- Result / notes: Re-verified the P1 scaffolding described in the
+  prior entry is complete and correct, and corrected that entry's test
+  count. The full P1 file set actually created (all new files, zero
+  existing Phase 1-3 files touched -- confirmed via `git diff --stat`
+  against tracked files, empty) is: `src/rewards/{__init__.py,
+  merge_reward.py,reward_wrapper.py}`, `src/policies/__init__.py`,
+  `src/policies/ppo/{__init__.py,networks.py,distribution.py,policy.py,
+  loss.py,state.py}`, `src/training/{__init__.py,config.py,seeding.py,
+  checkpoint.py,rollout.py,gae.py,trainer.py}`,
+  `src/tracking/{__init__.py,wandb_logger.py}`,
+  `configs/reward/merge_reward_v0.yaml`, `configs/ppo/{ppo_base.yaml,
+  ppo_smoke.yaml}`, `scripts/{train_ppo.py,smoke_train_ppo.py}`,
+  `tests/rewards/{__init__.py,test_imports.py}`,
+  `tests/policies/{__init__.py,test_imports.py}`,
+  `tests/training/{__init__.py,test_config.py,test_imports.py}`. The
+  reward/rollout/GAE/trainer/network/distribution/policy/loss/state
+  modules beyond `config.py`/`seeding.py`/`checkpoint.py` are
+  deliberate P1-scope structural skeletons: fixed constants, function
+  signatures, and dataclass contracts (e.g. the action-index ->
+  `BehaviorAction` mapping, the `Transition` field set, the
+  `CheckpointPayload` contract, W&B's required config keys/metric
+  names) with bodies that raise `NotImplementedError`, so P2/P3/P4 have
+  an agreed-upon shape to implement against; this is correct P1 scope
+  per PPO_PLAN.md SS0.1/P1, not scope creep into P2-P4's algorithm
+  logic.
+
+  Ran the full existing regression suite standalone, with no other
+  pytest process competing for GPU resources (an earlier attempt in
+  this same work had produced 62 spurious failures from exactly that
+  contention -- see the Known Issues / lessons-learned note added to
+  PROGRESS.md this entry). The clean, solo, verified result is
+  **489 passed, 0 failed, in 1867.61s (0:31:07), exit code 0**. This is
+  the TRUE, final P1 regression result, superseding the 471 figure in
+  the immediately preceding entry (which was recorded before all 4 new
+  P1 test files existed). Independently confirmed via
+  `pytest tests/ --collect-only -q` -> "489 tests collected", and the
+  +28 over P0's 461-passed baseline is exactly accounted for by the new
+  P1-specific test files: `tests/training/test_config.py` (10),
+  `tests/training/test_imports.py` (7),
+  `tests/policies/test_imports.py` (7),
+  `tests/rewards/test_imports.py` (4); 10+7+7+4 = 28; 461+28 = 489.
+
+  Confirmed no PPO-FIT/PPO-TUNE dataset split exists anywhere (only
+  comments in `configs/ppo/ppo_smoke.yaml` and
+  `scripts/smoke_train_ppo.py` explicitly stating the smoke maneuver
+  subset is NOT such a split). Confirmed `src/environment/`,
+  `src/planning/`, `src/control/`, `src/scenarios/` are untouched
+  (`git diff --stat` against those paths is empty). Updated
+  PROGRESS.md/HANDOFF.md with the final 489-passed result, the full
+  file tree, and a new lessons-learned note (never run pytest
+  concurrently with another pytest process against this repo -- GPU
+  contention produces spurious failures that look like real
+  regressions). Staged every new P1 file plus the three doc files and
+  made exactly one commit for all of P1, per this effort's
+  one-commit-per-completed-Phase rule. No blocker found. Next: P2
+  Reward V0 + W&B Foundation.

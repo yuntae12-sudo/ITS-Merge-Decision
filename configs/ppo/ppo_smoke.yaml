@@ -1,0 +1,51 @@
+# P5 Smoke Training config (docs/ppo/PPO_PLAN.md SS0.1 P5).
+#
+# Pipeline-verification only: NOT a tuning or performance config. The
+# maneuver subset here is a small, deterministic slice of canonical
+# TRAIN, selected only via --max-maneuvers/--maneuver-ids/--seed flags
+# on scripts/smoke_train_ppo.py -- this is explicitly NOT a
+# PPO-FIT/PPO-TUNE split (PPO_PLAN.md SS0/SS9's "no such split, ever,
+# through P5").
+#
+# Inherits every architecture/hyperparameter value from ppo_base.yaml;
+# only the smoke-specific run-size knobs are set here.
+
+seed: 0
+
+network:
+  observation_dim: 14
+  num_actions: 4
+  hidden_sizes: [256, 64, 32]
+  activation: "tanh"
+
+hyperparameters:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  ppo_epochs: 4
+  num_minibatches: 1  # smoke: too few transitions to usefully split further
+
+rollout:
+  downstream_mode: "frenet_mpc"
+
+reward_config_path: "configs/reward/merge_reward_v0.yaml"
+
+tracking:
+  wandb_project: "its-merge-ppo-smoke"
+  wandb_mode: "offline"
+
+smoke:
+  # Stage 1 defaults (PPO_PLAN.md SS0.1 P5): minimal number of
+  # maneuvers/updates just to exercise every stage of the pipeline
+  # once. Stage 2 (a "somewhat larger" subset) is selected by
+  # overriding these via CLI flags at run time, never by editing this
+  # file to sneak in a larger training run.
+  max_maneuvers: 2
+  num_updates: 2
+  max_episode_steps: 60  # generous vs. MAX_EPISODE_HORIZON_FRAMES=100's
+                          # observed span, kept small given frenet_mpc's
+                          # measured ~0.3-1.6 steps/sec throughput (P0)
