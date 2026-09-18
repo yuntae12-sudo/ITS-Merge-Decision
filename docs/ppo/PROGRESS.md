@@ -8,34 +8,109 @@ Live state, updated at the end of every Phase/Stage. See
 
 ## Current Phase
 
-**P1 COMPLETE** (PPO Foundation)
+**P2 COMPLETE** (Reward V0 + W&B Foundation)
 
 ## Current Stage
 
-P0 and P1 both complete. P0 confirmed the frozen baseline
+P0, P1, and P2 are all complete. P0 confirmed the frozen baseline
 (461 passed, 0 failed) and was audit-only (zero source changes). P1
 added the full PPO scaffolding directory/module structure per
-PPO_PLAN.md §4 (every file listed there now exists, including the
-structural skeletons for `src/rewards/merge_reward.py`,
-`src/rewards/reward_wrapper.py`, `src/policies/ppo/{networks,
-distribution,policy,loss,state}.py`, `src/training/{rollout,gae,
-trainer}.py`, `src/tracking/wandb_logger.py` — all P1-scoped as
-raising-`NotImplementedError` stubs with fixed signatures/constants,
-since their real logic is P2/P3/P4/P5's job), plus YAML config loading
-(PPO + reward configs), seed handling, and a checkpoint save/load
-skeleton, plus the two `scripts/` entry points (`train_ppo.py` now
-also accepts `--resume`, echoed but not yet acted on). All 28 new P1
-tests pass (import checks across every new package, config-load
-checks, seed determinism, checkpoint round-trip, and the §11
-action-index → `BehaviorAction` mapping regression test). Both
-entry-point scripts run successfully end-to-end at their P1 scope
-(config + seed [+ smoke maneuver-subset] resolution only — no real
-training loop, as scoped). The full existing regression suite passes
-with **zero failures**: **489 passed, 0 failed, 0 skipped** (461
-pre-existing Phase 1-3 tests + 28 new P1 tests), confirmed by a clean
-solo run after clearing an unrelated GPU-memory-contention artifact
-(see "Known Issues" below). Ready to begin **P2 — Reward V0 + W&B
-Foundation**.
+PPO_PLAN.md §4. P2 implemented Reward V0 (`src/rewards/merge_reward.py`,
+`src/rewards/reward_wrapper.py`) and the W&B logging foundation
+(`src/tracking/wandb_logger.py`), replacing their P1
+`NotImplementedError` skeletons with real logic, per PPO_PLAN.md
+§0.1/P2, §5, §5.1, §8.
+
+`merge_reward.compute_reward(reward_config, termination_reason,
+is_policy_step, info=None)` performs a pure fixed-table lookup: the
+terminal component comes from `reward_config.terminal` keyed by the
+`TerminationReason.value` string the frozen `MergeEnvironment` already
+computed (`info["termination_reason"]`, or `None` before any
+termination result exists, treated as `"none"`), and the decision-cost
+component comes from `reward_config.decision_cost` keyed purely by the
+caller-supplied pre-step `is_policy_step` flag. It never imports
+anything from `src.environment` or `waymax` (verified both by a
+code-level test asserting those strings are absent from the module
+source, and by the function signature taking `termination_reason`/
+`is_policy_step` as required inputs rather than any observation/state
+it could inspect itself) — satisfying §5.1's source-of-truth rule.
+`MergeRewardWrapper` (in `reward_wrapper.py`) is a thin stateful
+wrapper used by a rollout loop: it calls `compute_reward`, records the
+terminal/decision-cost component breakdown and running per-episode
+sums under the exact `reward/terminal`, `reward/decision_cost`,
+`reward/total` keys §8 requires (via `episode_sums()`), and asserts
+its own component sum agrees with `compute_reward`'s total (a
+same-Phase cross-check, not a second reward path).
+
+`WandbLogger` (`src/tracking/wandb_logger.py`) wraps `wandb.init`/
+`wandb.config.update`/`wandb.log`, supporting both online and
+`WANDB_MODE=offline` modes via the `mode` constructor arg (or the
+`WANDB_MODE` env var, standard `wandb` behavior). `log_config`
+validates that all of §8's `REQUIRED_CONFIG_KEYS` are present (all
+knowable up front — git SHA, reward version, seed, fixed
+hyperparameters, network layer sizes — so a missing one is a caller
+bug, not a not-yet-available metric) and raises `ValueError`
+otherwise. `log_metrics` accepts **any** metric name (not just
+`MINIMUM_METRICS`), by design, so P3/P4/P5 can add `train/*`, `ppo/*`,
+`action/*`, `downstream/*`, `safety/*` metrics without changing this
+module. `run_dir`/`run_id` properties and a context-manager
+(`__enter__`/`__exit__` calling `finish()`) are provided for rollout-
+loop convenience.
+
+`configs/reward/merge_reward_v0.yaml` was already correct from P1
+(values only) and required no changes — confirmed line-by-line against
+the fixed table in this update.
+
+35 new P2 tests were added (per-file counts independently confirmed via
+`pytest --collect-only -q` on each file): `tests/rewards/test_merge_reward.py`
+(32 collected test items — parametrization accounts for most of this:
+the 5-way terminal-outcome table incl. `None`→"none", the
+`TerminationReason.NONE` string-lookup edge case, real-decision-step
+=-0.01/auto-step=0.0 decision cost, 8 total-reward
+terminal+decision-cost sum combinations, a parametrized no-NaN/inf
+sweep across every reason × both `is_policy_step` values (12 combos),
+an unrecognized-reason `ValueError` guard, the code-level
+no-`src.environment`/no-`waymax`-import + required-parameter-name
+check, wrapper-vs-`compute_reward` agreement, and wrapper episode-sum
+accumulation/reset), `tests/tracking/test_wandb_logger.py` (4 — module
+constants, an offline smoke run that logs a config dict + a metric
+point and asserts real files exist on disk under the offline run
+directory, `log_config` rejecting a config missing a required key,
+`log_metrics` accepting an arbitrary metric name not in
+`MINIMUM_METRICS`). `tests/rewards/test_imports.py` (4 collected,
+unchanged count from P1) and `tests/training/test_imports.py` (6
+collected, was 7 in P1 — one redundant stub-`NotImplementedError`
+check for the now-real `wandb_logger.WandbLogger` was consolidated into
+`test_wandb_logger_module_imports`'s constant checks rather than kept
+as a separate stub-only test) were both updated in place so their
+`compute_reward`/`MergeRewardWrapper.compute`/`WandbLogger` assertions
+reflect real, correct behavior instead of `NotImplementedError` —
+`rollout.py`/`gae.py`/`trainer.py` (P4/P5 scope) remain untouched
+`NotImplementedError` stubs and their tests still assert that. Net:
+32 + 4 + (4-4) + (6-7) = 35 new tests over the P1 baseline of 489,
+giving 524 — independently confirmed by `pytest tests/ --collect-only -q`
+→ "524 tests collected" exactly.
+
+A standalone offline W&B smoke run was also run directly (outside
+pytest, `WANDB_MODE=offline`), logging the full §8 config-key set plus
+`reward/terminal`/`reward/decision_cost`/`reward/total`, exit code 0,
+with real files written under
+`<run>/wandb/offline-run-<timestamp>-<id>/` (`run-<id>.wandb`,
+`run-<id>.wandb.syncstate`, `logs/debug.log`,
+`logs/debug-internal.log`, `files/requirements.txt`, etc.) — see
+`docs/ppo/EXPERIMENT_LOG.md` for the exact run directory and
+`wandb sync` command it printed.
+
+The full existing regression suite passes with **zero failures**:
+**524 passed, 0 failed, 0 skipped** in 1769.33s (0:29:29) (489
+pre-existing Phase 1-3 + P1 tests + 35 new P2 tests = 524, matching
+exactly; independently confirmed via `pytest tests/ --collect-only -q`
+→ "524 tests collected"). No other `pytest` process was running
+before or during this run (checked via `ps aux | grep pytest` before
+starting, per the P1 lesson-learned note below), and the real process
+exit (not a mid-run snapshot) was waited for and its final summary
+line read directly from the log file. Ready to begin **P3 — Discrete
+PPO Core**.
 
 ## SHA / Branch
 
@@ -43,7 +118,9 @@ Foundation**.
 - plan-docs commit SHA: `aa8cf5b67d51c7bb5005fde0106d773cb8193452`
 - P0 completion commit SHA: `bcf2b4c` (`chore(ppo): audit frozen
   training baseline`)
-- P1 completion commit SHA: (recorded in `git log` on this branch
+- P1 completion commit SHA: `2f865b6` (`feat(ppo): add PPO foundation
+  scaffolding (P1)`)
+- P2 completion commit SHA: (recorded in `git log` on this branch
   immediately after this update, per the one-commit-per-Phase rule)
 - branch: `feat/ppo-phase0-5`
 
@@ -227,6 +304,62 @@ Foundation**.
         re-ran the full suite solo; the clean, uncontended result is
         the 489-passed figure above, verified directly against the
         log file's final summary line and `EXIT_CODE=0` marker.
+- [x] **P2 Reward V0 + W&B Foundation**:
+  - [x] Implemented `src/rewards/merge_reward.py::compute_reward`:
+        fixed terminal-outcome table lookup (keyed by the frozen
+        `MergeEnvironment`'s own `info["termination_reason"]` string,
+        `None` treated as `"none"`) + fixed decision-cost lookup
+        (keyed by caller-supplied pre-step `is_policy_step`); rejects
+        any unrecognized `termination_reason` string via `ValueError`;
+        asserts the returned total is finite; contains no import of
+        `src.environment` or `waymax` (§5.1 source-of-truth rule)
+  - [x] Implemented `src/rewards/reward_wrapper.py::MergeRewardWrapper`:
+        thin stateful wrapper calling `compute_reward`, exposing
+        `last_terminal_component`/`last_decision_cost_component`/
+        `last_total`, `episode_sums()` (returns
+        `reward/terminal`/`reward/decision_cost`/`reward/total` per
+        §8), and `reset()` for per-episode accumulation; cross-checks
+        its own component sum against `compute_reward`'s total
+  - [x] Implemented `src/tracking/wandb_logger.py::WandbLogger`: real
+        `wandb.init`/`wandb.config.update`/`wandb.log` wiring,
+        online-or-offline via `mode`/`WANDB_MODE`; `log_config`
+        validates all §8 `REQUIRED_CONFIG_KEYS` present
+        (`ValueError` if not); `log_metrics` accepts any metric name;
+        `run_dir`/`run_id` properties; context-manager support
+  - [x] Confirmed `configs/reward/merge_reward_v0.yaml` already
+        matches the Reward V0 spec exactly (P1 had already created it
+        correctly with real values) — no change needed
+  - [x] Confirmed `wandb==0.30.0` (installed in P0) imports and works
+        without reinstall
+  - [x] Wrote 35 new P2 tests over the P1 baseline: net effect across
+        `tests/rewards/test_merge_reward.py` (new file, 32 collected
+        items — most from parametrization), `tests/tracking/test_wandb_logger.py`
+        (new package + 4 tests), `tests/rewards/test_imports.py`
+        (updated in place, 4 collected — unchanged count, contents
+        changed from `NotImplementedError` stub checks to real-behavior
+        assertions), `tests/training/test_imports.py` (updated in
+        place, 6 collected — was 7 in P1, net -1 since the
+        `WandbLogger.__init__`-raises-`NotImplementedError` stub check
+        was removed and folded into `test_wandb_logger_module_imports`'s
+        constant checks). Net: 32 + 4 + 0 + (-1) = 35 new tests over
+        the P1 baseline of 489, giving 524 exactly.
+  - [x] Ran the new P2 tests together with all pre-existing P1 tests
+        (`tests/rewards/ tests/tracking/ tests/training/
+        tests/policies/`): **63 passed** in 1.88s
+  - [x] Ran a standalone offline W&B smoke run directly (outside
+        pytest): logged the full §8 config-key set +
+        `reward/terminal`/`reward/decision_cost`/`reward/total`, exit
+        code 0, real files written to a local offline-run directory
+        (see EXPERIMENT_LOG.md for the exact path)
+  - [x] Confirmed no other `pytest` process was running
+        (`ps aux | grep pytest`) before launching the full regression
+        suite
+  - [x] Ran the FULL existing regression suite (Phase 1-3 + P1 + P2
+        tests together) and waited for the real process to exit (not
+        a partial/estimated read): **524 passed**, 0 failed, 0
+        skipped, 1769.33s (0:29:29) — independently confirmed via
+        `pytest tests/ --collect-only -q` → "524 tests collected"
+        (489 pre-existing + 35 new P2 = 524, matching exactly)
 
 ## Changed Files (this session)
 
@@ -254,6 +387,23 @@ Foundation**.
   - `tests/policies/__init__.py`, `tests/policies/test_imports.py`
   - `tests/training/__init__.py`, `tests/training/test_config.py`,
     `tests/training/test_imports.py`
+- P2 (implementation of existing P1 skeletons + new files; no
+  existing Phase 1-3 file touched):
+  - `src/rewards/merge_reward.py` (implemented; was a P1 stub)
+  - `src/rewards/reward_wrapper.py` (implemented; was a P1 stub)
+  - `src/tracking/wandb_logger.py` (implemented; was a P1 stub)
+  - `configs/reward/merge_reward_v0.yaml` (unchanged — already
+    correct from P1)
+  - `tests/rewards/test_merge_reward.py` (new, 32 collected test items)
+  - `tests/tracking/__init__.py`, `tests/tracking/test_wandb_logger.py`
+    (new package + 4 tests)
+  - `tests/rewards/test_imports.py` (updated: stub-`NotImplementedError`
+    checks replaced with real-behavior assertions; 4 collected,
+    unchanged count)
+  - `tests/training/test_imports.py` (updated: the
+    stub-`NotImplementedError` test for `WandbLogger.__init__` was
+    removed since it is now real; docstring updated; 6 collected, was
+    7 in P1)
 
 ## Current Test Results
 
@@ -271,10 +421,22 @@ Foundation**.
 - P0 throughput check: ~1.64 steps/sec over 60 timed steps (that one
   subprocess ran on CPU fallback due to a GPU dlopen issue local to
   that invocation — see note above; not a regression)
-- Real reward/PPO-algorithm/rollout logic is not implemented yet
-  (P2/P3/P4 scope) — the P1 tests above confirm those modules'
-  structural skeletons import correctly and raise `NotImplementedError`
-  rather than a silent/fake result
+- New P2 tests alone (`tests/rewards/ tests/tracking/ tests/training/
+  tests/policies/`, includes all P1 + P2 tests in those dirs):
+  **63 passed** in 1.88s
+- Full suite after P2 additions (Phase 1-3 + P1 + P2 tests together,
+  no concurrent pytest process, real process exit confirmed):
+  **524 passed**, 0 failed, 0 skipped, 1769.33s (0:29:29) —
+  independently confirmed via `pytest tests/ --collect-only -q` →
+  "524 tests collected" (489 pre-existing + 35 new P2 = 524)
+- Standalone offline W&B smoke run (outside pytest): exit code 0, real
+  files written under a local `wandb/offline-run-<timestamp>-<id>/`
+  directory (see EXPERIMENT_LOG.md for the exact path and contents)
+- Real PPO-algorithm/rollout/GAE logic is still not implemented
+  (P3/P4/P5 scope) — `src/policies/ppo/*.py`, `src/training/rollout.py`,
+  `src/training/gae.py`, `src/training/trainer.py` remain P1
+  structural stubs raising `NotImplementedError`, confirmed still true
+  by the (updated) P1 stub tests
 
 ## Environment / Dependency Versions (recorded per PPO_PLAN.md §0.1 P0)
 
@@ -302,12 +464,18 @@ changed during this session.
 
 ## Current Reward Version
 
-V0. Values are codified in `configs/reward/merge_reward_v0.yaml`
-(spec: [PPO_PLAN.md § 5](PPO_PLAN.md#5-reward-v0-fixed-through-p5)),
-loadable via `src.training.config.load_reward_config`. The actual
-reward-computation code (`src/rewards/merge_reward.py`,
-`src/rewards/reward_wrapper.py`) is still a P1 structural stub raising
-`NotImplementedError` — real logic lands in P2.
+**V0 (implemented).** Values are codified in
+`configs/reward/merge_reward_v0.yaml` (spec:
+[PPO_PLAN.md § 5](PPO_PLAN.md#5-reward-v0-fixed-through-p5)), loadable
+via `src.training.config.load_reward_config`. The reward-computation
+code is now real as of P2: `src/rewards/merge_reward.py::compute_reward`
+performs the fixed terminal-outcome + decision-cost table lookup
+against the caller-supplied `termination_reason`/`is_policy_step`
+(never re-deriving termination itself, per §5.1), and
+`src/rewards/reward_wrapper.py::MergeRewardWrapper` is the rollout-loop
+call-site glue with per-episode component accumulation
+(`episode_sums()`). Fully covered by `tests/rewards/test_merge_reward.py`
+(32 tests) plus the updated `tests/rewards/test_imports.py`.
 
 ## Current PPO Config
 
@@ -355,7 +523,19 @@ max_episode_steps: 60}` block for P5 pipeline verification.)
 
 ## W&B Run ID
 
-None yet (P2 scope).
+No real training run yet (that's P5 scope), but W&B logging itself is
+implemented and verified in P2: a standalone offline smoke run
+(`WANDB_MODE=offline`, project `its-merge-ppo-test`) logged the full
+§8 `REQUIRED_CONFIG_KEYS` config set plus
+`reward/terminal`/`reward/decision_cost`/`reward/total` metric points,
+exited 0, and produced real local files under an
+`offline-run-<timestamp>-<id>/` directory (`run-<id>.wandb`,
+`logs/debug.log`, `logs/debug-internal.log`, `files/requirements.txt`,
+etc. — see `tests/tracking/test_wandb_logger.py` for the automated
+version of this same check, and `docs/ppo/EXPERIMENT_LOG.md` for the
+dated entry). No online W&B run has been started (not required through
+P5; `WANDB_MODE=offline` is the supported no-network-required path per
+§8).
 
 ## Checkpoint Path
 
@@ -369,6 +549,8 @@ state is exercised end-to-end in P5.
 ## Last Command
 
 ```
+pytest tests/ -q                     # P2: 524 passed, 0 failed, 1769.33s (0:29:29)
+pytest tests/rewards/ tests/tracking/ tests/training/ tests/policies/ -q  # new P2 + P1 tests: 63 passed, 1.88s
 pytest tests/ -q                     # P1: 489 passed, 0 failed, 1867.61s (0:31:07)
 pytest tests/policies/ tests/rewards/ tests/training/ -v   # new P1 tests alone: 28 passed, 1.08s
 PYTHONPATH=. python scripts/train_ppo.py
@@ -378,11 +560,15 @@ PYTHONPATH=. python scripts/smoke_train_ppo.py --max-maneuvers 2
 ## Known Issues
 
 No contradiction found between PPO_PLAN.md and the current frozen
-codebase during P0 or P1 — the `info_before`/pre-step pattern required
-by §7.1 is directly supported by the existing `reset()`/`step()` API
-(both return `info` reflecting `merge_committed` state as of that
-call), and an equivalent pattern is already used in
-`src/environment/full_split_evaluator.py`.
+codebase during P0, P1, or P2 — the `info_before`/pre-step pattern
+required by §7.1 is directly supported by the existing
+`reset()`/`step()` API (both return `info` reflecting
+`merge_committed` state as of that call), and an equivalent pattern is
+already used in `src/environment/full_split_evaluator.py`. P2's reward
+module was implemented as a pure fixed-table lookup consuming the
+environment's own `info["termination_reason"]` string with zero
+imports from `src.environment`/`waymax` — no blocker, no deviation
+from §5.1 required.
 
 **Lesson learned (process, not a code issue):** running two `pytest`
 processes against this repo concurrently causes spurious GPU-contention
@@ -392,45 +578,33 @@ dataset-loading errors) that look like real regressions but are not —
 they disappear when the suite is re-run solo. This is because the
 JAX/TF GPU-backed tests in this suite are not designed to share the
 single RTX 4060 across two simultaneous pytest processes. **Future
-phases (P2–P5) must never run `pytest` concurrently with another
+phases (P3–P5) must never run `pytest` concurrently with another
 pytest process** (or any other GPU-heavy process) against this repo —
 always confirm no other `pytest` process is running before starting a
 full-suite run, and if a stale one is found, wait for it to exit (or
 kill it deliberately) rather than trusting a concurrent run's failure
-count.
+count. P2's own full-suite run followed this rule from the start (no
+stale process found) and completed clean on the first attempt, with
+no spurious failures to diagnose.
 
 ## Next Exact Action
 
-**Begin P2 Reward V0 + W&B Foundation.** Per
-[PPO_PLAN.md §0.1/P2](PPO_PLAN.md#p2--reward-v0--wb-foundation):
-
-1. Implement `src/rewards/merge_reward.py`: maps the frozen
-   `MergeEnvironment`'s own `terminated`/`truncated`/
-   `info["termination_reason"]` to the Reward V0 terminal-outcome table
-   already codified in `configs/reward/merge_reward_v0.yaml` (loaded via
-   `src.training.config.load_reward_config`), plus the pre-step
-   decision-cost term (`-0.01` real decision step / `0.0` auto
-   -execution step, decided from `policy_mask`/`is_policy_step`
-   computed BEFORE `env.step()`, per §7.1 — never re-derive
-   success/collision/offroad/timeout; §5.1 explicitly forbids
-   re-implementing any of those detectors)
-2. Implement `src/rewards/reward_wrapper.py`: the actual call-site glue
-   that a rollout loop uses each step to get `(reward, decision_cost,
-   terminal_component)` from one step's `(terminated, truncated, info,
-   is_policy_step)`
-3. Implement `src/tracking/wandb_logger.py`: supports both online and
-   `WANDB_MODE=offline` modes; logs the config fields from §8
-   (`git_sha`, `reward_version`, `seed`, `learning_rate`, `gamma`,
-   `gae_lambda`, `clip_epsilon`, `entropy_coef`, `value_coef`,
-   `batch_size`, `ppo_epochs`, `network_layers`)
-4. Required tests (`tests/rewards/`): SUCCESS=+1, COLLISION=-1,
-   OFFROAD=-1, TIMEOUT/TRUNCATION_HORIZON=-0.5, NONE=0; real decision
-   step=-0.01, auto-committed step=0; total reward = terminal +
-   decision cost, correctly summed; no NaN/inf in any reward path; a
-   W&B smoke run (offline mode is fine) produces logged config + at
-   least one metric point
-5. Re-run the full existing regression suite to confirm nothing broke
-6. Update PROGRESS.md/HANDOFF.md, append an EXPERIMENT_LOG.md entry,
-   commit `feat(ppo): add Reward V0 and W&B tracking foundation` on
-   `feat/ppo-phase0-5` (one commit for all of P2, per this effort's
-   one-commit-per-completed-Phase convention)
+**Begin P3 Discrete PPO Core.** Per
+[PPO_PLAN.md §0.1/P3](PPO_PLAN.md#p3--discrete-ppo-core): implement the
+policy network, value network, categorical distribution, stochastic
+action sampling, deterministic inference, log_prob, entropy, PPO ratio,
+clipped surrogate objective, value loss, entropy regularization,
+gradient clipping, and optimizer/train state in
+`src/policies/ppo/{networks,distribution,policy,loss,state}.py`
+(replacing their P1 `NotImplementedError` skeletons), validated in
+isolation from the real environment (P3 is algorithm-only — no real
+`MergeEnvironment` rollout yet, that's P4). Required tests per §0.1/P3:
+14D input handling, output logits shape == 4, finite logits,
+probability sum == 1, action range 0..3, deterministic inference ==
+argmax, stochastic sampling, finite log_prob/entropy, correct PPO ratio
+and clipping, scalar value output, finite PPO loss/gradients, optimizer
+update changes parameters, same-seed reproducibility, and the §11
+action-mapping regression (`0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`).
+Re-run the full regression suite, update PROGRESS.md/HANDOFF.md, append
+an EXPERIMENT_LOG.md entry, and make exactly one P3 commit on
+`feat/ppo-phase0-5`.

@@ -31,7 +31,8 @@ Unified branch-creation order (see also
 
 ## What's completed so far
 
-**P0 — Baseline Audit and P1 — PPO Foundation are both COMPLETE.**
+**P0 — Baseline Audit, P1 — PPO Foundation, and P2 — Reward V0 + W&B
+Foundation are all COMPLETE.**
 Working on branch
 `feat/ppo-phase0-5` (already created and checked out at session start,
 carrying the approved plan docs from commit `aa8cf5b`).
@@ -160,12 +161,75 @@ stale process was allowed to finish and exit on its own, then the full
 suite was re-run solo; that clean, uncontended run is the **489
 passed, 0 failed** result above and is the one being reported.
 
+**P2 — Reward V0 + W&B Foundation** then implemented the real logic
+behind the P1 structural skeletons in `src/rewards/merge_reward.py`,
+`src/rewards/reward_wrapper.py`, and `src/tracking/wandb_logger.py`
+(no existing Phase 1-3 file touched; `configs/reward/merge_reward_v0.yaml`
+was already correct from P1 and needed no change).
+`merge_reward.compute_reward(reward_config, termination_reason,
+is_policy_step, info=None)` is a pure fixed-table lookup: terminal
+component keyed by the frozen `MergeEnvironment`'s own
+`info["termination_reason"]` string (`None` treated as `"none"`),
+decision-cost component keyed purely by the caller-supplied pre-step
+`is_policy_step` flag — no import of `src.environment` or `waymax`
+anywhere in the module (verified by a code-level test), satisfying
+§5.1's source-of-truth rule. `MergeRewardWrapper` wraps this into
+rollout-loop-friendly per-episode `reward/terminal`/
+`reward/decision_cost`/`reward/total` accumulation
+(`episode_sums()`/`reset()`), cross-checking its own component sum
+against `compute_reward`'s total. `WandbLogger` now does real
+`wandb.init`/`wandb.config.update`/`wandb.log` calls, supporting both
+online and `WANDB_MODE=offline`; `log_config` validates all of §8's
+`REQUIRED_CONFIG_KEYS` are present (raises `ValueError` otherwise);
+`log_metrics` accepts any metric name by design so P3-P5 can add more
+without touching this module.
+
+Added 35 new tests over the P1 baseline:
+`tests/rewards/test_merge_reward.py` (new file, 32 collected items —
+mostly from parametrization: the 5-way terminal-outcome table incl.
+`None`->`"none"`, real-decision-step=-0.01/auto-step=0.0 decision
+cost, 8 total-reward sum combinations, a finite/no-NaN sweep across
+every reason x `is_policy_step` combo, an unrecognized-reason
+`ValueError` guard, a code-level no-`src.environment`/no-`waymax`
+-import check, wrapper-vs-`compute_reward` agreement, and wrapper
+episode-sum accumulation/reset), `tests/tracking/test_wandb_logger.py`
+(new package, 4 tests — module constants, an offline smoke run that
+logs a config dict + a metric point and asserts real files exist on
+disk, `log_config` rejecting a config missing a required key,
+`log_metrics` accepting an arbitrary non-`MINIMUM_METRICS` name).
+`tests/rewards/test_imports.py` (updated in place, still 4 collected)
+and `tests/training/test_imports.py` (updated in place, 6 collected,
+was 7 — the redundant `WandbLogger.__init__`-raises-`NotImplementedError`
+stub check was removed since it is now real, folded into
+`test_wandb_logger_module_imports`'s constant checks) had their
+now-obsolete P1 stub-`NotImplementedError` assertions replaced with
+real-behavior assertions; `rollout.py`/`gae.py`/`trainer.py` (P4/P5
+scope) remain untouched `NotImplementedError` stubs and their tests
+still assert that.
+
+Ran the new P2 tests together with all pre-existing P1 tests
+(`tests/rewards/ tests/tracking/ tests/training/ tests/policies/`):
+**63 passed** in 1.88s. Ran a standalone offline W&B smoke run
+directly (outside pytest, `WANDB_MODE=offline`): logged the full §8
+config-key set plus the three reward metrics, exit code 0, real files
+written under a local `wandb/offline-run-<timestamp>-<id>/` directory
+(`run-<id>.wandb`, `logs/debug.log`, `logs/debug-internal.log`,
+`files/requirements.txt`, etc.). Confirmed no other `pytest` process
+was running (`ps aux | grep pytest`) before launching the full
+regression suite (learning P1's lesson — this run needed no
+mid-course correction). Ran the FULL existing regression suite (Phase
+1-3 + P1 + P2 tests together) and waited for the real process exit:
+**524 passed**, 0 failed, 0 skipped, 1769.33s (0:29:29), independently
+confirmed via `pytest tests/ --collect-only -q` -> "524 tests
+collected" (489 pre-existing + 35 new P2 = 524, matching exactly).
+
 ## Last successful test
 
-`pytest tests/ -q` (after P1, clean solo run) → **489 passed**, 0
-failed, 0 errors, 1867.61s (0:31:07), exit code 0 — waited for real
-process completion, verified directly against the log file's final
-summary line and `EXIT_CODE=0` marker.
+`pytest tests/ -q` (after P2, clean solo run, first attempt — no
+concurrent-pytest contention this time) -> **524 passed**, 0 failed, 0
+skipped, 1769.33s (0:29:29) — waited for real process completion,
+verified directly against the log file's final summary line
+(`524 passed in 1769.33s (0:29:29)`, 100% dots, no `F`/`E` marks).
 
 ## Failed tests
 
@@ -174,16 +238,19 @@ None.
 ## Problems found
 
 None. No contradiction found between PPO_PLAN.md and the current
-codebase in P0 or P1.
+codebase in P0, P1, or P2.
 
 ## Recent commits (PPO-related)
 
 - `aa8cf5b` — `docs(ppo): add approved PPO P0-P5 plan and context-resume docs`
   (pre-existing at session start)
 - `bcf2b4c` — `chore(ppo): audit frozen training baseline` (P0 completion)
-- P1 completion commit: see `git log` on `feat/ppo-phase0-5` for the
-  exact SHA (`feat(ppo): add PPO foundation scaffolding`) — committed
-  immediately after this HANDOFF.md update.
+- `2f865b6` — `feat(ppo): add PPO foundation scaffolding (P1)` (P1
+  completion)
+- P2 completion commit: see `git log` on `feat/ppo-phase0-5` for the
+  exact SHA (`feat(ppo): implement Reward V0 and W&B logging
+  foundation (P2)`) — committed immediately after this HANDOFF.md
+  update.
 
 ## Running processes
 
@@ -194,43 +261,45 @@ None.
 None yet (P1 only defines the `CheckpointPayload` contract + a pickle
 -based save/load skeleton with no real PPO train state to save; P5
 exercises the full save→load→resume→update cycle against real
-policy/value params and optimizer state).
+policy/value params and optimizer state). P2 did not touch checkpoint
+code.
 
 ## Next command to run
 
-Begin P2 per [PROGRESS.md § Next Exact Action](PROGRESS.md#next-exact-action):
-implement `src/rewards/merge_reward.py` + `src/rewards/reward_wrapper.py`
-(Reward V0) and `src/tracking/wandb_logger.py`, add `tests/rewards/`
-tests, re-run the full regression suite, then commit.
+Begin P3 per [PROGRESS.md § Next Exact Action](PROGRESS.md#next-exact-action):
+implement `src/policies/ppo/{networks,distribution,policy,loss,state}.py`
+(discrete PPO core, algorithm-only, no real environment yet), add
+`tests/policies/` behavioral tests per §0.1/P3, re-run the full
+regression suite, then commit.
 
 ## Next file to modify
 
-`src/rewards/merge_reward.py` (new file — P2's first task).
+`src/policies/ppo/networks.py` (P3's first task — policy/value
+network definitions).
 
 ---
 
 ## NEXT OWNER ACTION
 
-**P0 and P1 are both complete.** Begin **Phase P2 — Reward V0 + W&B
-Foundation** per
-[PPO_PLAN.md §0.1/P2](PPO_PLAN.md#p2--reward-v0--wb-foundation). Do not
-skip ahead to P3–P5. Do not perform any reward/hyperparameter tuning,
-W&B sweeps, full training, or FSM-vs-PPO comparisons — those remain out
-of scope through P5 and are reserved for the user to do manually
-afterward. Remember: no PPO-FIT/PPO-TUNE split, ever, through P5.
-Remember §5.1: the reward module must consume the frozen
-`MergeEnvironment`'s own `terminated`/`truncated`/
-`info["termination_reason"]` as sole source of truth and must NEVER
-re-implement a success/collision/offroad/timeout detector itself.
+**P0, P1, and P2 are all complete.** Begin **Phase P3 — Discrete PPO
+Core** per
+[PPO_PLAN.md §0.1/P3](PPO_PLAN.md#p3--discrete-ppo-core). Do not skip
+ahead to P4/P5. P3 validates the PPO algorithm in isolation only — no
+real `MergeEnvironment` rollout yet (that's P4). Preserve the fixed
+§11 action-index -> `BehaviorAction` mapping
+(`0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`) exactly as already
+established in P1's constant + regression test.
 
 **Fixed constraint for the rest of this entire P0–P5 effort (applies
 to every remaining Phase): exactly ONE commit per Phase.** No
 intermediate "-A"/"-B", sub-stage, or WIP commits within a Phase. Do
 all of a Phase's implementation, its required tests, and its doc
 updates first, and only commit once, at the very end of that Phase,
-with everything for that Phase staged together in a single commit. P0
-and P1 already followed this rule (`chore(ppo): audit frozen training
-baseline`, `feat(ppo): add PPO foundation scaffolding`). P2 through P5
-must each get exactly one commit the same way — four more commits
-total across the rest of the effort, on top of the pre-existing
-`aa8cf5b` docs commit and the two already-landed P0/P1 commits.
+with everything for that Phase staged together in a single commit. P0,
+P1, and P2 already followed this rule (`chore(ppo): audit frozen
+training baseline`, `feat(ppo): add PPO foundation scaffolding (P1)`,
+`feat(ppo): implement Reward V0 and W&B logging foundation (P2)`). P3
+through P5 must each get exactly one commit the same way — three more
+commits total across the rest of the effort, on top of the
+pre-existing `aa8cf5b` docs commit and the three already-landed
+P0/P1/P2 commits.

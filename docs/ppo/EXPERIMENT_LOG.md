@@ -306,3 +306,174 @@ Format per entry:
   made exactly one commit for all of P1, per this effort's
   one-commit-per-completed-Phase rule. No blocker found. Next: P2
   Reward V0 + W&B Foundation.
+
+## 2026-09-18 — P2 Reward V0 + W&B Foundation complete
+
+- Phase/Stage: P2 (complete)
+- SHA: `feat/ppo-phase0-5` branch, at the commit immediately following
+  this entry (`feat(ppo): implement Reward V0 and W&B logging
+  foundation (P2)`); prior SHA `2f865b6` (P1 completion)
+- Branch: `feat/ppo-phase0-5`
+- W&B run ID: `33p1io2d` (standalone offline smoke run, project
+  `its-merge-ppo`, run name `p2-smoke-run`, `WANDB_MODE=offline`) --
+  local run directory
+  `wandb/offline-run-20260918_213126-33p1io2d/` under the scratchpad
+  path used for that ad hoc verification run (this directory is not
+  part of the repo; the automated equivalent lives in
+  `tests/tracking/test_wandb_logger.py::test_offline_smoke_run_logs_config_and_metric`,
+  which uses a pytest `tmp_path` and is safe to re-run anywhere).
+  Logged config: `git_sha` (this branch's HEAD at time of the smoke
+  run), `reward_version=v0`, `seed=0`, `learning_rate=3e-4`,
+  `gamma=0.99`, `gae_lambda=0.95`, `clip_epsilon=0.2`,
+  `entropy_coef=0.01`, `value_coef=0.5`, `batch_size=64`,
+  `ppo_epochs=4`, `network_layers=[256,64,32]`. Logged metrics:
+  `reward/terminal=1.0`, `reward/decision_cost=-0.01`,
+  `reward/total=0.99`, at step 0. Exit code 0. `wandb sync` command
+  printed by the run (not executed -- no online sync performed, per
+  scope: online W&B auth/sweeps are out of scope through P5).
+- Config: `configs/reward/merge_reward_v0.yaml` (unchanged from P1 --
+  confirmed to already match the Reward V0 spec exactly, values only:
+  `terminal.success=1.0`, `terminal.failure_collision=-1.0`,
+  `terminal.failure_offroad=-1.0`, `terminal.truncation_horizon=-0.5`,
+  `terminal.none=0.0`, `decision_cost.real_decision_step=-0.01`,
+  `decision_cost.auto_execution_step=0.0`)
+- Result / notes: Implemented the real logic behind P1's structural
+  skeletons -- `src/rewards/merge_reward.py::compute_reward`,
+  `src/rewards/reward_wrapper.py::MergeRewardWrapper`,
+  `src/tracking/wandb_logger.py::WandbLogger` -- with zero changes to
+  any existing Phase 1-3 file and zero changes needed to
+  `configs/reward/merge_reward_v0.yaml`.
+
+  `compute_reward(reward_config, termination_reason, is_policy_step,
+  info=None)` performs a pure fixed-dict-lookup: the terminal
+  component is keyed by the frozen `MergeEnvironment`'s own
+  `info["termination_reason"]` string value (one of `"success"`,
+  `"failure_collision"`, `"failure_offroad"`, `"truncation_horizon"`,
+  `"none"`, or Python `None` -- treated identically to `"none"`, since
+  `MergeEnvironment._build_info` produces `None` only before any
+  `TerminationResult` has ever been computed, e.g. at `reset()` time);
+  the decision-cost component is keyed purely by the caller-supplied
+  pre-step `is_policy_step` boolean. Confirmed by direct inspection of
+  `src/environment/merge_environment.py:978-980`
+  (`"termination_reason": termination_reason.value if
+  termination_reason else None`) that `TerminationReason.NONE` -- an
+  enum member, hence truthy in Python even though its `.value` is the
+  string `"none"` -- correctly produces the string `"none"`, not
+  `None`, confirming the reward config's `terminal.none` key is reached
+  by the intended code path, not merely by the `None`-fallback branch.
+  An unrecognized `termination_reason` string raises `ValueError`
+  rather than being silently accepted, guarding against ever inventing
+  a 6th outcome. The module contains zero references to
+  `src.environment` or `waymax` anywhere in its source (verified by a
+  code-level test using `inspect.getsource`), and its function
+  signature takes `termination_reason`/`is_policy_step` as required
+  parameters rather than any state it could inspect on its own --
+  jointly satisfying PPO_PLAN.md §5.1's source-of-truth rule: this
+  module is structurally incapable of re-deriving
+  success/collision/offroad/timeout, since it never has access to
+  anything that could compute them independently.
+
+  `MergeRewardWrapper` is a thin stateful wrapper for rollout-loop
+  convenience: `compute()` delegates to `compute_reward`, records
+  `last_terminal_component`/`last_decision_cost_component`/
+  `last_total`, and accumulates per-episode sums retrievable via
+  `episode_sums()` under the exact `reward/terminal`,
+  `reward/decision_cost`, `reward/total` keys PPO_PLAN.md §8 names;
+  `reset()` clears accumulation at episode boundaries. The wrapper
+  cross-checks its own component sum against `compute_reward`'s
+  returned total on every call (a within-P2 consistency assertion, not
+  a second independent reward computation).
+
+  `WandbLogger` wraps `wandb.init`/`wandb.config.update`/`wandb.log`,
+  selecting online vs. `WANDB_MODE=offline` via the standard `mode`
+  constructor argument or the `WANDB_MODE` environment variable (no
+  new W&B-mode-selection mechanism invented). `log_config` validates
+  that every key in §8's `REQUIRED_CONFIG_KEYS` tuple is present in the
+  supplied dict and raises `ValueError` naming the missing keys if not
+  -- these are all knowable at run-start (git SHA, reward version,
+  seed, the six fixed hyperparameters, network layer sizes), so a
+  missing one signals a caller bug rather than a metric that simply
+  isn't available yet. `log_metrics` deliberately accepts **any**
+  metric name (not restricted to `MINIMUM_METRICS`), since most of §8's
+  full metric list (`train/*`, `ppo/*`, `action/*`, `downstream/*`,
+  `safety/*`) only becomes computable in P3/P4/P5 as those signals are
+  implemented -- restricting `log_metrics` to a fixed allowlist now
+  would have forced a logger-code change in every later Phase, which
+  the plan's "supports logging arbitrary scalar metrics by name" intent
+  explicitly rules out. `run_dir`/`run_id` properties and
+  `__enter__`/`__exit__` (calling `finish()`) support both introspection
+  and `with WandbLogger(...) as logger:` usage.
+
+  `get_git_sha()` (from P1's `src/training/checkpoint.py`, reused
+  unmodified) supplied the `git_sha` config value for the standalone
+  smoke run above -- no new git-SHA-reading code was written in P2.
+
+  Added 35 new tests over the P1 baseline (489), verified item-by-item
+  via `pytest <file> --collect-only -q` on each file individually
+  before combining: `tests/rewards/test_merge_reward.py` (new file, 32
+  collected items -- the 5-way terminal-outcome-table parametrization,
+  the `None`->`"none"` edge case, the real/auto decision-cost pair, 8
+  parametrized total-reward sum combinations, a parametrized
+  no-NaN/no-inf sweep across every termination-reason value (including
+  `None`) crossed with both `is_policy_step` values, the unrecognized
+  -reason `ValueError` guard, the code-level no-`src.environment`/
+  no-`waymax`-import + required-parameter check, wrapper-vs-
+  `compute_reward` numeric agreement across 3 example steps, and
+  wrapper episode-sum accumulation + `reset()` correctness),
+  `tests/tracking/test_wandb_logger.py` (new package via
+  `tests/tracking/__init__.py`, 4 tests -- module-constant sanity, the
+  required offline smoke-run test asserting both "no exception" and
+  "real files exist on disk" under a pytest `tmp_path`-scoped
+  `WANDB_DIR`, `log_config` rejecting an incomplete config via
+  `ValueError`, `log_metrics` accepting a metric name absent from
+  `MINIMUM_METRICS`). Updated 2 pre-existing P1 files in place rather
+  than leaving their now-incorrect `NotImplementedError`-stub
+  assertions in place: `tests/rewards/test_imports.py` (both
+  stub-raises tests replaced with real-behavior assertions; 4 collected
+  items, same count as P1) and `tests/training/test_imports.py` (the
+  `WandbLogger.__init__`-raises-`NotImplementedError` test removed
+  since that constructor is now real, with its docstring updated to
+  note that `rollout.py`/`gae.py`/`trainer.py` remain genuine P4/P5
+  -scope stubs; 6 collected items, down from 7 in P1 -- net -1).
+  Arithmetic: 32 (new) + 4 (new) + 0 (net, test_imports.py for rewards)
+  + (-1) (net, test_imports.py for training) = 35 new tests;
+  489 + 35 = 524.
+
+  Ran the new/updated P2-adjacent test files together first
+  (`tests/rewards/ tests/tracking/ tests/training/ tests/policies/`):
+  **63 passed** in 1.88s, confirming the new behavior and the updated
+  stub tests before touching the full suite. Ran the standalone offline
+  W&B smoke run directly (outside pytest, described above under "W&B
+  run ID"): exit code 0, real files confirmed on disk
+  (`run-33p1io2d.wandb`, `run-33p1io2d.wandb.syncstate`,
+  `logs/debug.log`, `logs/debug-internal.log`,
+  `files/requirements.txt`).
+
+  Before running the full regression suite, checked `ps aux | grep
+  pytest` and confirmed no other pytest process was running (applying
+  the P1 lesson-learned note from the start, rather than discovering
+  contention after the fact). The first background-launch attempt
+  omitted `PYTHONPATH=.` and failed at collection with 29
+  `ModuleNotFoundError: No module named 'src'` errors across every test
+  file (not a code regression -- a launch-command mistake, corrected by
+  relaunching with `PYTHONPATH=.` set; the failed attempt made no
+  source changes and produced no false "passed" count, so it is
+  recorded here for completeness rather than omitted). The corrected,
+  properly-configured run was launched in the background, and the
+  actual process exit was waited for via a `kill -0 <pid>` polling loop
+  wrapped in Bash `run_in_background` (never a fixed-duration sleep
+  substituted for waiting on the real process) -- not inferred from a
+  partial or mid-run read. Final result, read directly from the
+  completed run's own summary line: **524 passed in 1769.33s
+  (0:29:29)**, 100% dots, zero `F`/`E` marks, no other pytest process
+  ever contending this time. Independently cross-checked via
+  `pytest tests/ --collect-only -q` -> "524 tests collected" (exact
+  match). No stale-process cleanup was needed for this run, unlike P1.
+
+  No contradiction found between PPO_PLAN.md and the current codebase
+  -- no blocker. §5.1's source-of-truth rule was satisfiable exactly as
+  specified by the existing `MergeEnvironment`/`TerminationReason` API,
+  with no code-level tension. Reward V0's fixed values were not tuned,
+  no new reward terms were added beyond the exact formula in
+  PPO_PLAN.md §5, and no W&B sweep was performed -- all per this
+  Phase's explicit non-goals. Next: P3 Discrete PPO Core.

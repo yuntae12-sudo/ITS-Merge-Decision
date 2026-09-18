@@ -1,7 +1,10 @@
-"""P1 import checks for the training/tracking packages (docs/ppo/
-PPO_PLAN.md SS0.1/P1). Real rollout/GAE/trainer/W&B logic lands in
-P2/P4/P5 -- these tests only confirm module structure/imports and that
-P1 stubs raise ``NotImplementedError`` rather than silently no-op'ing.
+"""P1/P2 import checks for the training/tracking packages (docs/ppo/
+PPO_PLAN.md SS0.1/P1, P2). Real rollout/GAE/trainer logic lands in
+P4/P5 -- those module tests only confirm structure/imports and that
+their stubs still raise ``NotImplementedError`` rather than silently
+no-op'ing. ``wandb_logger`` is real as of P2 (see
+``tests/tracking/test_wandb_logger.py`` for its behavioral tests) --
+this file only checks its module-level constants here.
 """
 
 import pytest
@@ -60,6 +63,3 @@ def test_training_stubs_raise_not_implemented():
         gae.normalize_advantages_masked([], [])
 
 
-def test_wandb_logger_init_not_yet_implemented():
-    with pytest.raises(NotImplementedError):
-        wandb_logger.WandbLogger(project="its-merge-ppo")
