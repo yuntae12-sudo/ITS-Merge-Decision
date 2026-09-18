@@ -1,18 +1,21 @@
 """PPO policy/value networks (docs/ppo/PPO_PLAN.md SS6, SS0.1 P3).
 
-P1 scope: structural skeleton only. Fixed architecture (not tuned in
-P0-P5):
+Fixed architecture (not tuned in P0-P5):
 
     Policy: 14 -> 256 -> 64 -> 32 -> 4 logits, tanh activations
     Value:  14 -> 256 -> 64 -> 32 -> 1,        tanh activations
 
-Policy and value networks are separate (no shared parameters) per
-SS7.2's Actor-vs-Critic separation of concerns. Real Flax module
-definitions land in P3; this module currently only fixes the layer
-sizes so ``configs/ppo/*.yaml`` and this code agree from the start.
+Policy and value networks are separate Flax modules with independent
+parameters (no shared trunk) per SS7.2's Actor-vs-Critic separation of
+concerns. Implemented with ``flax.linen`` (P0 confirmed ``flax==0.10.7``
+already installed, compatible with the pinned ``jax==0.6.2``/
+``jaxlib==0.6.2`` stack -- no upgrade performed).
 """
 
 from typing import Sequence
+
+import flax.linen as nn
+import jax
 
 # Fixed baseline architecture (PPO_PLAN.md SS6). Not tuned in P0-P5.
 POLICY_HIDDEN_SIZES: Sequence[int] = (256, 64, 32)
@@ -22,27 +25,76 @@ NUM_ACTIONS = 4
 ACTIVATION = "tanh"
 
 
-def build_policy_network(*args, **kwargs):
-    """Builds the PPO policy (Actor) network.
+class PolicyNetwork(nn.Module):
+    """Actor network: 14D observation -> 4 categorical logits.
 
-    P1 skeleton: not yet implemented. Real Flax ``nn.Module`` definition
-    lands in P3 per PPO_PLAN.md SS0.1/P3.
+    ``hidden_sizes`` defaults to the fixed PPO_PLAN.md SS6 architecture
+    (256, 64, 32) with tanh activations between every layer, including
+    between the last hidden layer and the final logits layer (SS6
+    specifies tanh activations throughout; the final logits layer
+    itself has no activation applied to its output, matching a
+    standard categorical-logits head).
     """
 
-    raise NotImplementedError(
-        "PPO policy network construction lands in P3 (docs/ppo/PPO_PLAN.md "
-        "SS0.1/P3). P1 only fixes the architecture constants."
-    )
+    hidden_sizes: Sequence[int] = POLICY_HIDDEN_SIZES
+    num_actions: int = NUM_ACTIONS
+
+    @nn.compact
+    def __call__(self, observation):
+        x = observation
+        for hidden_size in self.hidden_sizes:
+            x = nn.Dense(hidden_size)(x)
+            x = nn.tanh(x)
+        logits = nn.Dense(self.num_actions)(x)
+        return logits
 
 
-def build_value_network(*args, **kwargs):
-    """Builds the PPO value (Critic) network.
+class ValueNetwork(nn.Module):
+    """Critic network: 14D observation -> scalar state-value estimate."""
 
-    P1 skeleton: not yet implemented. Real Flax ``nn.Module`` definition
-    lands in P3 per PPO_PLAN.md SS0.1/P3.
-    """
+    hidden_sizes: Sequence[int] = VALUE_HIDDEN_SIZES
 
-    raise NotImplementedError(
-        "PPO value network construction lands in P3 (docs/ppo/PPO_PLAN.md "
-        "SS0.1/P3). P1 only fixes the architecture constants."
-    )
+    @nn.compact
+    def __call__(self, observation):
+        x = observation
+        for hidden_size in self.hidden_sizes:
+            x = nn.Dense(hidden_size)(x)
+            x = nn.tanh(x)
+        value = nn.Dense(1)(x)
+        # Squeeze the trailing size-1 dimension: (..., 1) -> (...,)
+        return value.squeeze(-1)
+
+
+def build_policy_network(
+    hidden_sizes: Sequence[int] = POLICY_HIDDEN_SIZES,
+    num_actions: int = NUM_ACTIONS,
+) -> PolicyNetwork:
+    """Builds the PPO policy (Actor) network module."""
+
+    return PolicyNetwork(hidden_sizes=tuple(hidden_sizes), num_actions=num_actions)
+
+
+def build_value_network(
+    hidden_sizes: Sequence[int] = VALUE_HIDDEN_SIZES,
+) -> ValueNetwork:
+    """Builds the PPO value (Critic) network module."""
+
+    return ValueNetwork(hidden_sizes=tuple(hidden_sizes))
+
+
+def init_policy_params(
+    policy_network: PolicyNetwork, rng_key: jax.Array, observation_dim: int = OBSERVATION_DIM
+):
+    """Initializes policy network parameters given a PRNG key."""
+
+    dummy_obs = jax.numpy.zeros((observation_dim,))
+    return policy_network.init(rng_key, dummy_obs)
+
+
+def init_value_params(
+    value_network: ValueNetwork, rng_key: jax.Array, observation_dim: int = OBSERVATION_DIM
+):
+    """Initializes value network parameters given a PRNG key."""
+
+    dummy_obs = jax.numpy.zeros((observation_dim,))
+    return value_network.init(rng_key, dummy_obs)

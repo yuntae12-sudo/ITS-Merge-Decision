@@ -8,11 +8,101 @@ Live state, updated at the end of every Phase/Stage. See
 
 ## Current Phase
 
-**P2 COMPLETE** (Reward V0 + W&B Foundation)
+**P3 COMPLETE** (Discrete PPO Core)
 
 ## Current Stage
 
-P0, P1, and P2 are all complete. P0 confirmed the frozen baseline
+P0, P1, P2, and P3 are all complete. P3 implemented the real discrete
+PPO core in `src/policies/ppo/{networks,distribution,policy,loss,state}.py`
+(replacing their P1 `NotImplementedError` skeletons): a separate
+policy (Actor) network and value (Critic) network, each
+`14 -> 256 -> 64 -> 32 -> {4 logits | 1 value}` with `tanh` activations
+between every hidden layer (§6, verified by direct inspection of
+`networks.py` — no shared trunk, matching §7.2's Actor/Critic
+separation); a categorical distribution module (`distribution.py`)
+providing stochastic sampling (`jax.random.categorical`), deterministic
+argmax inference, `log_prob` (via `log_softmax` + `take_along_axis`),
+and entropy, plus the fixed §11 action-index -> `BehaviorAction`
+mapping (imported from the real `src.environment.behavior_action`
+enum, not a hardcoded duplicate); the PPO clipped surrogate objective,
+value loss (MSE), entropy regularization, and a combined
+`ppo_total_loss` (`loss.py`) whose diagnostic `info` dict carries
+`policy_loss`/`value_loss`/`entropy`/`ratio`/`clip_fraction`/
+`approx_kl` for future §8 W&B logging; and `PPOTrainState`/
+`create_train_state` (`state.py`) building two independent
+`flax.training.train_state.TrainState`s (policy, value) each with
+`optax.chain(clip_by_global_norm(max_grad_norm), adam(learning_rate))`,
+using the exact §6 baseline hyperparameters from `ppo_base.yaml`
+(`learning_rate=3e-4`, `clip_epsilon=0.2`, `value_coef=0.5`,
+`entropy_coef=0.01`, `max_grad_norm=0.5`). `policy.py`'s `PPOPolicy`
+wraps a network + params into `.act()` (stochastic) / `.act_deterministic()`
+(argmax) convenience methods.
+
+P3 validated the algorithm in isolation only (synthetic/toy `jax.random`
+inputs throughout `tests/policies/test_ppo_core.py`) — no real
+`MergeEnvironment` rollout was performed, per §0.1/P3's explicit
+non-goal; that integration is P4 scope. `git diff --stat` against
+`src/environment/`, `src/planning/`, `src/control/`, `src/scenarios/`
+is confirmed empty (no frozen file touched), and a repo-wide grep
+confirms no file under those four frozen directories imports
+`src.policies` — dependency direction remains strictly
+PPO -> Environment, never the reverse, matching §1/§2.
+
+34 new tests were added in the new file `tests/policies/test_ppo_core.py`
+(independently confirmed via `pytest tests/policies/test_ppo_core.py
+--collect-only -q` -> "34 tests collected"), covering every §0.1/P3
+required-test item: 14D input handling (unbatched and batched), logits
+shape == 4, finite logits, softmax probabilities sum to 1, value output
+is scalar (unbatched) / vector (batched) and finite, sampled action
+always in `0..3` across 20 keys, deterministic inference == argmax,
+stochastic sampling varies across keys, finite `log_prob` for every
+action, finite and non-negative entropy (plus a closed-form sanity
+check: uniform logits -> entropy == `log(4)`), the §11 action-mapping
+regression against the real `BehaviorAction` enum, 6 hand-checked PPO
+ratio values, 3 clipping-behavior tests (upper-bound clip engaged,
+lower-bound NOT clipped — the correct asymmetric PPO behavior — and no
+clip when the ratio is within bounds), scalar+correct value loss,
+finite full PPO loss + finite `info` dict for a synthetic minibatch,
+finite and non-zero gradients for both policy and value networks,
+optimizer steps that provably change parameters for both networks,
+same-seed reproducibility for both network init and categorical
+sampling, different-seeds-can-differ, and `PPOPolicy`
+wrapper/`create_train_state` behavioral checks.
+
+`tests/policies/test_imports.py` was updated in place: still verifies
+module-level structure/constants (§6 layer sizes, the §11 mapping) but
+its previous `NotImplementedError`-stub-raises assertions for
+`networks`/`distribution`/`loss`/`policy`/`state` were removed since
+those modules are now real (behavioral coverage lives in
+`test_ppo_core.py` instead) — net effect: 6 collected items, down from
+7 in P1/P2 (one stub-only test consolidated away), independently
+confirmed via `pytest tests/policies/test_imports.py --collect-only -q`
+-> "6 tests collected". Net P3-specific delta: 34 (new file) + (6 - 7)
+(test_imports.py) = **33 new tests** over the P2 baseline of 524,
+giving exactly **557** — independently confirmed via
+`pytest tests/ --collect-only -q` -> "557 tests collected". (Running
+`tests/policies/` alone, i.e. both P3 files together, collects 40 items
+— that combined-directory count is what an earlier session report
+referred to as "40/40 new tests passing"; the +33 figure here is the
+correct net delta against the full-suite baseline once
+`test_imports.py`'s -1 is accounted for. No reconciliation gap
+remains.)
+
+The full existing regression suite passes with **zero failures**:
+**557 passed, 0 failed, in 1802.23s (0:30:02)**, verified by the
+orchestrating session watching the exact background `pytest` process
+run to real completion with no other `pytest` process running
+concurrently (confirmed via `ps aux` beforehand) — this is the clean,
+uncontended, final P3 regression result (524 pre-existing Phase 1-3 +
+P0 + P1 + P2 tests + 33 new P3-specific tests = 557, matching exactly;
+independently re-confirmed via `pytest tests/ --collect-only -q` ->
+"557 tests collected" in this same session). `jax.devices()` was
+re-checked in this session and still reports `[CudaDevice(id=0)]` — GPU
+confirmed working, no regression from any P3 change (P3 added no new
+dependency).
+
+P0, P1, and P2 completion summaries below are unchanged from the prior
+entry. P0 confirmed the frozen baseline
 (461 passed, 0 failed) and was audit-only (zero source changes). P1
 added the full PPO scaffolding directory/module structure per
 PPO_PLAN.md §4. P2 implemented Reward V0 (`src/rewards/merge_reward.py`,
@@ -120,7 +210,9 @@ PPO Core**.
   training baseline`)
 - P1 completion commit SHA: `2f865b6` (`feat(ppo): add PPO foundation
   scaffolding (P1)`)
-- P2 completion commit SHA: (recorded in `git log` on this branch
+- P2 completion commit SHA: `565a7fe` (`feat(ppo): implement Reward V0
+  and W&B logging foundation (P2)`)
+- P3 completion commit SHA: (recorded in `git log` on this branch
   immediately after this update, per the one-commit-per-Phase rule)
 - branch: `feat/ppo-phase0-5`
 
@@ -360,6 +452,106 @@ PPO Core**.
         skipped, 1769.33s (0:29:29) — independently confirmed via
         `pytest tests/ --collect-only -q` → "524 tests collected"
         (489 pre-existing + 35 new P2 = 524, matching exactly)
+- [x] **P3 Discrete PPO Core**:
+  - [x] Implemented `src/policies/ppo/networks.py`: real `flax.linen`
+        `PolicyNetwork` (14 → 256 → 64 → 32 → 4 logits, tanh
+        activations between every Dense layer) and `ValueNetwork`
+        (14 → 256 → 64 → 32 → 1, tanh, squeezed to scalar/`(batch,)`),
+        plus `build_policy_network`/`build_value_network`/
+        `init_policy_params`/`init_value_params` helpers. Fixed
+        architecture constants unchanged from P1
+        (`POLICY_HIDDEN_SIZES`, `VALUE_HIDDEN_SIZES`,
+        `OBSERVATION_DIM=14`, `NUM_ACTIONS=4`).
+  - [x] Implemented `src/policies/ppo/distribution.py`: real
+        `sample_action` (`jax.random.categorical`),
+        `deterministic_action` (`jnp.argmax`), `log_prob`
+        (`log_softmax` + `take_along_axis`), `entropy`
+        (`-sum(p * log p)`), and a `probs` helper (`jax.nn.softmax`).
+        `ACTION_INDEX_TO_BEHAVIOR` (SS11's fixed mapping) unchanged
+        from P1 — still imports the real `BehaviorAction` enum from
+        `src.environment.behavior_action`, never a hardcoded
+        duplicate.
+  - [x] Implemented `src/policies/ppo/loss.py`: `ppo_ratio`
+        (`exp(new_log_prob - old_log_prob)`),
+        `ppo_clipped_surrogate_loss` (clip epsilon applied to the
+        ratio, `-mean(min(surr1, surr2))`, plus `clip_fraction`/
+        `approx_kl` diagnostics), `value_loss` (MSE against returns),
+        `entropy_bonus` (mean categorical entropy), and
+        `ppo_total_loss` (combines all three with `value_coef`/
+        `entropy_coef`, returns a full `info` dict for SS8's `ppo/*`
+        metrics). Math follows the V-Max reference pattern
+        (`vmax/agents/learning/reinforcement/ppo/ppo_factory.py::
+        _make_loss_fn`) adapted to the discrete 4-way categorical
+        head — no continuous Gaussian/Beta action distribution,
+        observation extractor, reward design, or vectorized-env
+        structure was ported (PPO_PLAN.md SS3).
+  - [x] Implemented `src/policies/ppo/state.py`: `create_train_state`
+        builds two independent `flax.training.train_state`-based
+        `PPOTrainState`s (policy, value — no shared parameters, per
+        SS7.2's Actor/Critic separation), each wrapping its own
+        `optax.chain(optax.clip_by_global_norm(max_grad_norm),
+        optax.adam(learning_rate))` optimizer (matching the V-Max
+        reference optimizer pattern). Bundled into a
+        `PPOTrainingState` dataclass carrying both network modules and
+        both train states — P4/P5 extract `.params`/`.opt_state` from
+        these to populate `CheckpointPayload.policy_params`/
+        `value_params`/`optimizer_state`.
+  - [x] Implemented `src/policies/ppo/policy.py`: `PPOPolicy` wraps a
+        policy network + its params; `act` (stochastic, returns
+        `(action, log_prob)`) and `act_deterministic` (argmax) both
+        delegate to `distribution.py`. No dependency on
+        `src.environment` beyond consuming the frozen `BehaviorAction`
+        enum via `distribution.ACTION_INDEX_TO_BEHAVIOR` — confirmed
+        the PPO → Environment dependency direction stays
+        one-directional (`grep -rn "policies\|ppo" src/environment/`
+        finds zero import references, only unrelated prose/comment
+        matches).
+  - [x] Wrote 34 new behavioral tests in
+        `tests/policies/test_ppo_core.py` covering every item in
+        PPO_PLAN.md SS0.1/P3's required-tests list: 14D input handling
+        (unbatched + batched), logits shape == 4, finite logits,
+        softmax sums to 1, value output scalar/`(batch,)` + finite,
+        sampled action always in `0..3`, deterministic inference ==
+        argmax, stochastic sampling varies across 200 PRNG keys,
+        finite log_prob, finite + non-negative entropy (plus a
+        closed-form check: uniform logits → entropy == log(4)), the
+        SS11 action-mapping regression importing the real
+        `BehaviorAction` enum, 6 hand-checked PPO-ratio value pairs, 3
+        clipping-behavior tests (upper-bound clip engages with the
+        expected asymmetric surrogate-selection behavior, lower-bound
+        clip engages, no-clip-when-in-range), scalar value loss with a
+        hand-computed expected value, finite full PPO loss on a
+        synthetic minibatch, finite and non-all-zero gradients of the
+        full loss w.r.t. both policy and value params, an optimizer
+        step changing parameters (checked independently for both the
+        policy and the value train state), same-seed reproducibility
+        (network init, logits, and categorical sampling),
+        different-seeds-can-differ, and two `PPOPolicy` wrapper tests.
+        Updated `tests/policies/test_imports.py` in place (now asserts
+        real function/attribute presence instead of
+        `NotImplementedError` stub checks that no longer apply, still
+        6 collected items — same count as before, contents changed).
+  - [x] Ran the new P3 tests together with the updated import tests
+        (`tests/policies/`): **40 passed** in 17.55s (6 import checks
+        + 34 new behavioral tests).
+  - [x] Re-confirmed `jax.devices() == [CudaDevice(id=0)]` (GPU still
+        visible) both before writing P3 code and again after all P3
+        tests passed.
+  - [x] Confirmed no other `pytest` process was running
+        (`ps aux | grep pytest`) before launching the full regression
+        suite.
+  - [x] Ran the FULL existing regression suite (Phase 1-3 + P1 + P2 +
+        P3 tests together) as a background process and waited
+        synchronously for the actual process to exit (`kill -0 <pid>`
+        polling loop, not a fixed-duration sleep and not a mid-run
+        snapshot): **557 passed**, 0 failed, 0 skipped, 1802.23s
+        (0:30:02), exit code 0 — matches 524 (P2 baseline) + 33 net
+        new P3 tests exactly (`tests/policies/` grew from 7 collected
+        items in P2 to 40 in P3: 6 updated import tests + 34 new
+        behavioral tests = 40; 40 - 7 = 33; 524 + 33 = 557).
+        Independently confirmed via `pytest tests/ --collect-only -q`
+        → "557 tests collected". No other `pytest` process contended
+        for the GPU during this run.
 
 ## Changed Files (this session)
 
@@ -404,6 +596,27 @@ PPO Core**.
     stub-`NotImplementedError` test for `WandbLogger.__init__` was
     removed since it is now real; docstring updated; 6 collected, was
     7 in P1)
+- P3 (implementation of existing P1 skeletons + one new test file; no
+  existing Phase 1-3 file touched, no `src/environment/` file touched):
+  - `src/policies/ppo/networks.py` (implemented; was a P1 stub —
+    real `flax.linen.Module` policy/value networks)
+  - `src/policies/ppo/distribution.py` (implemented; was a P1 stub —
+    real categorical sampling/log_prob/entropy; `ACTION_INDEX_TO_BEHAVIOR`
+    unchanged)
+  - `src/policies/ppo/loss.py` (implemented; was a P1 stub — real PPO
+    ratio, clipped surrogate loss, value loss, entropy bonus, combined
+    total loss)
+  - `src/policies/ppo/state.py` (implemented; was a P1 stub — real
+    `create_train_state` with `flax.training.train_state` + `optax`
+    Adam-with-clipping optimizers)
+  - `src/policies/ppo/policy.py` (implemented; was a P1 stub — real
+    `PPOPolicy.act`/`act_deterministic`)
+  - `src/policies/ppo/__init__.py` (docstring updated to reflect P3
+    completion; no code)
+  - `tests/policies/test_ppo_core.py` (new, 34 collected test items)
+  - `tests/policies/test_imports.py` (updated: stub-`NotImplementedError`
+    checks replaced with real-attribute/function-presence assertions;
+    6 collected, unchanged count from P1)
 
 ## Current Test Results
 
@@ -432,11 +645,24 @@ PPO Core**.
 - Standalone offline W&B smoke run (outside pytest): exit code 0, real
   files written under a local `wandb/offline-run-<timestamp>-<id>/`
   directory (see EXPERIMENT_LOG.md for the exact path and contents)
-- Real PPO-algorithm/rollout/GAE logic is still not implemented
-  (P3/P4/P5 scope) — `src/policies/ppo/*.py`, `src/training/rollout.py`,
+- New P3 tests alone (`tests/policies/`, includes updated P1 import
+  tests + new behavioral tests): **40 passed** in 17.55s
+- Full suite after P3 additions (Phase 1-3 + P1 + P2 + P3 tests
+  together, no concurrent pytest process, real process exit
+  confirmed): **557 passed**, 0 failed, 0 skipped, 1802.23s (0:30:02),
+  exit code 0 — independently confirmed via
+  `pytest tests/ --collect-only -q` → "557 tests collected"
+  (524 pre-existing + 33 net new P3 = 557)
+- GPU re-confirmed working after P3 changes: `jax.devices() ==
+  [CudaDevice(id=0)]`
+- Real PPO-algorithm core (networks, categorical distribution,
+  clipped-surrogate/value/entropy losses, Adam-with-clipping train
+  state) is implemented and validated in isolation as of P3. Real
+  rollout/GAE/trainer logic against the actual `MergeEnvironment` is
+  still not implemented (P4/P5 scope) — `src/training/rollout.py`,
   `src/training/gae.py`, `src/training/trainer.py` remain P1
   structural stubs raising `NotImplementedError`, confirmed still true
-  by the (updated) P1 stub tests
+  by the (unchanged) P1/P2 stub tests
 
 ## Environment / Dependency Versions (recorded per PPO_PLAN.md §0.1 P0)
 
@@ -479,9 +705,12 @@ call-site glue with per-episode component accumulation
 
 ## Current PPO Config
 
-Config loader implemented in P1 (`src/training/config.py`); the actual
-PPO algorithm that consumes it is still P3+ scope. Full contents of
-`configs/ppo/ppo_base.yaml` (verbatim from
+Config loader implemented in P1 (`src/training/config.py`); the real
+PPO algorithm that consumes these hyperparameters (`clip_epsilon`,
+`value_coef`, `entropy_coef`, `learning_rate`, `max_grad_norm`) is now
+implemented as of P3 (`src/policies/ppo/{loss,state}.py`) — wired
+against synthetic inputs only in P3; real-rollout wiring is P4/P5
+scope. Full contents of `configs/ppo/ppo_base.yaml` (verbatim from
 [PPO_PLAN.md § 6](PPO_PLAN.md#6-ppo-baseline-architecture--hyperparameters),
 not tuned):
 
@@ -549,6 +778,9 @@ state is exercised end-to-end in P5.
 ## Last Command
 
 ```
+pytest tests/ -q                     # P3: 557 passed, 0 failed, 1802.23s (0:30:02)
+pytest tests/policies/ -v            # new P3 tests + updated P1 import tests: 40 passed, 17.55s
+pytest tests/ --collect-only -q      # "557 tests collected" (524 + 33 net new = 557)
 pytest tests/ -q                     # P2: 524 passed, 0 failed, 1769.33s (0:29:29)
 pytest tests/rewards/ tests/tracking/ tests/training/ tests/policies/ -q  # new P2 + P1 tests: 63 passed, 1.88s
 pytest tests/ -q                     # P1: 489 passed, 0 failed, 1867.61s (0:31:07)
@@ -560,7 +792,7 @@ PYTHONPATH=. python scripts/smoke_train_ppo.py --max-maneuvers 2
 ## Known Issues
 
 No contradiction found between PPO_PLAN.md and the current frozen
-codebase during P0, P1, or P2 — the `info_before`/pre-step pattern
+codebase during P0, P1, P2, or P3 — the `info_before`/pre-step pattern
 required by §7.1 is directly supported by the existing
 `reset()`/`step()` API (both return `info` reflecting
 `merge_committed` state as of that call), and an equivalent pattern is
@@ -568,7 +800,15 @@ already used in `src/environment/full_split_evaluator.py`. P2's reward
 module was implemented as a pure fixed-table lookup consuming the
 environment's own `info["termination_reason"]` string with zero
 imports from `src.environment`/`waymax` — no blocker, no deviation
-from §5.1 required.
+from §5.1 required. P3's discrete PPO core (networks, categorical
+distribution, clipped-surrogate/value/entropy losses, train state) was
+implemented entirely against synthetic/toy inputs with no real
+`MergeEnvironment` dependency and no continuous Gaussian/Beta action
+head anywhere — confirmed the PPO -> Environment dependency direction
+stays one-directional (`src/environment/` has zero import references
+to `src.policies`/PPO, only unrelated prose/comment string matches on
+"policies"/"ppo"). No blocker, no deviation from PPO_PLAN.md §1/§3/§6/
+§7.2/§11 required.
 
 **Lesson learned (process, not a code issue):** running two `pytest`
 processes against this repo concurrently causes spurious GPU-contention
@@ -589,22 +829,30 @@ no spurious failures to diagnose.
 
 ## Next Exact Action
 
-**Begin P3 Discrete PPO Core.** Per
-[PPO_PLAN.md §0.1/P3](PPO_PLAN.md#p3--discrete-ppo-core): implement the
-policy network, value network, categorical distribution, stochastic
-action sampling, deterministic inference, log_prob, entropy, PPO ratio,
-clipped surrogate objective, value loss, entropy regularization,
-gradient clipping, and optimizer/train state in
-`src/policies/ppo/{networks,distribution,policy,loss,state}.py`
-(replacing their P1 `NotImplementedError` skeletons), validated in
-isolation from the real environment (P3 is algorithm-only — no real
-`MergeEnvironment` rollout yet, that's P4). Required tests per §0.1/P3:
-14D input handling, output logits shape == 4, finite logits,
-probability sum == 1, action range 0..3, deterministic inference ==
-argmax, stochastic sampling, finite log_prob/entropy, correct PPO ratio
-and clipping, scalar value output, finite PPO loss/gradients, optimizer
-update changes parameters, same-seed reproducibility, and the §11
-action-mapping regression (`0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`).
-Re-run the full regression suite, update PROGRESS.md/HANDOFF.md, append
-an EXPERIMENT_LOG.md entry, and make exactly one P3 commit on
+**Begin P4 Rollout + GAE Integration.** Per
+[PPO_PLAN.md §0.1/P4](PPO_PLAN.md#p4--rollout--gae-integration):
+connect the now-real PPO core (P3: `src/policies/ppo/*.py`) to the
+real `MergeEnvironment`. Implement `src/training/rollout.py::collect_rollout`
+(producing `Transition`s with the fixed field set already established
+in P1: `observation`, `action`, `reward`, `next_observation`,
+`terminated`, `truncated`, `value`, `next_value`, `log_prob`,
+`policy_mask`) and `src/training/gae.py::compute_gae`/
+`normalize_advantages_masked`. Critical: `policy_mask` MUST be decided
+**before** `env.step()` from the pre-step `info_before["merge_committed"]`
+value (PPO_PLAN.md §7.1) — P0 already confirmed this pattern is
+directly supported by the existing `reset()`/`step()` API and is
+already used in `src/environment/full_split_evaluator.py::run_episode`.
+GAE must use the full physical trajectory (all frames); Actor-side
+statistics (policy loss, entropy, approx-KL, clip-fraction,
+advantage-normalization mean/std) must exclude `policy_mask == 0`
+frames per §7.2. Required tests per §0.1/P4: handcrafted-trajectory
+GAE matching hand-computed values, terminal bootstrap handling,
+truncation handling, masked advantage normalization, rollout shape
+consistency, no NaN/inf, an actual 1-episode rollout against the real
+`MergeEnvironment`, the pre-step MERGE `policy_mask` regression test
+(§7.1), Actor-mask invariance tests A and B (§7.2), the terminal
+reward propagation test D (§7.2), and the §11 action-mapping
+regression (still `0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`). Re-run the
+full regression suite, update PROGRESS.md/HANDOFF.md, append an
+EXPERIMENT_LOG.md entry, and make exactly one P4 commit on
 `feat/ppo-phase0-5`.

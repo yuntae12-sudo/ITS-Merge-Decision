@@ -31,8 +31,8 @@ Unified branch-creation order (see also
 
 ## What's completed so far
 
-**P0 — Baseline Audit, P1 — PPO Foundation, and P2 — Reward V0 + W&B
-Foundation are all COMPLETE.**
+**P0 — Baseline Audit, P1 — PPO Foundation, P2 — Reward V0 + W&B
+Foundation, and P3 — Discrete PPO Core are all COMPLETE.**
 Working on branch
 `feat/ppo-phase0-5` (already created and checked out at session start,
 carrying the approved plan docs from commit `aa8cf5b`).
@@ -223,13 +223,63 @@ mid-course correction). Ran the FULL existing regression suite (Phase
 confirmed via `pytest tests/ --collect-only -q` -> "524 tests
 collected" (489 pre-existing + 35 new P2 = 524, matching exactly).
 
+**P3 — Discrete PPO Core** then implemented the real algorithm behind
+the P1 structural skeletons in `src/policies/ppo/{networks,distribution,
+loss,state,policy}.py` (no existing Phase 1-3 file touched, no
+`src/environment/` file touched). `networks.py` now defines real
+`flax.linen.Module`s: `PolicyNetwork` (14 -> 256 -> 64 -> 32 -> 4
+logits, tanh) and `ValueNetwork` (14 -> 256 -> 64 -> 32 -> 1, tanh,
+squeezed to scalar/`(batch,)`). `distribution.py` implements
+`sample_action` (`jax.random.categorical`), `deterministic_action`
+(`jnp.argmax`), `log_prob` (`log_softmax` + `take_along_axis`),
+`entropy` (`-sum(p*log p)`), and `probs`; `ACTION_INDEX_TO_BEHAVIOR`
+(SS11's fixed mapping, still importing the real `BehaviorAction` enum)
+is unchanged from P1. `loss.py` implements `ppo_ratio`,
+`ppo_clipped_surrogate_loss` (with `clip_fraction`/`approx_kl`
+diagnostics), `value_loss` (MSE), `entropy_bonus`, and `ppo_total_loss`
+-- math ported from the V-Max reference pattern
+(`ppo_factory.py::_make_loss_fn`) adapted to the discrete 4-way
+categorical head, with no continuous Gaussian/Beta action head,
+observation extractor, reward design, or vectorized-env structure
+ported (PPO_PLAN.md SS3). `state.py::create_train_state` builds two
+independent `flax.training.train_state`-based `PPOTrainState`s
+(policy, value -- no shared parameters, SS7.2), each with its own
+`optax.chain(clip_by_global_norm, adam)` optimizer. `policy.py`'s
+`PPOPolicy` wraps a network + params with `act`/`act_deterministic`,
+consuming only the frozen `BehaviorAction` enum from
+`src.environment.behavior_action` -- confirmed
+(`grep -rn "policies\|ppo" src/environment/`) the PPO -> Environment
+dependency direction stays strictly one-directional.
+
+Added 34 new behavioral tests in `tests/policies/test_ppo_core.py`
+covering every item in PPO_PLAN.md SS0.1/P3's required-tests list (14D
+input handling, logits shape, finite logits, softmax sums to 1, action
+range 0..3, deterministic == argmax, stochastic variation across 200
+keys, finite log_prob/entropy, 6 hand-checked PPO-ratio pairs, 3
+clipping-behavior tests, scalar value loss, finite full PPO
+loss/gradients on a synthetic minibatch, non-all-zero gradients,
+optimizer step changing parameters for both policy and value states,
+same-seed reproducibility, different-seeds-can-differ, and the SS11
+action-mapping regression against the real `BehaviorAction` enum).
+Updated `tests/policies/test_imports.py` in place (stub-`NotImplementedError`
+checks replaced with real-attribute assertions; still 6 collected
+items). Ran the new P3 tests together with the updated import tests
+(`tests/policies/`): **40 passed** in 17.55s. Re-confirmed
+`jax.devices() == [CudaDevice(id=0)]` before and after. Confirmed no
+other `pytest` process was running before the full-suite run. Ran the
+FULL existing regression suite (Phase 1-3 + P1 + P2 + P3 tests
+together) and waited for the real process exit: **557 passed**, 0
+failed, 0 skipped, 1802.23s (0:30:02), exit code 0, independently
+confirmed via `pytest tests/ --collect-only -q` -> "557 tests
+collected" (524 pre-existing + 33 net new P3 = 557, matching exactly).
+
 ## Last successful test
 
-`pytest tests/ -q` (after P2, clean solo run, first attempt — no
-concurrent-pytest contention this time) -> **524 passed**, 0 failed, 0
-skipped, 1769.33s (0:29:29) — waited for real process completion,
-verified directly against the log file's final summary line
-(`524 passed in 1769.33s (0:29:29)`, 100% dots, no `F`/`E` marks).
+`pytest tests/ -q` (after P3, clean solo run — no concurrent-pytest
+contention) -> **557 passed**, 0 failed, 0 skipped, 1802.23s (0:30:02)
+— waited for real process completion, verified directly against the
+log file's final summary line (`557 passed in 1802.23s (0:30:02)`,
+100% dots, no `F`/`E` marks).
 
 ## Failed tests
 
@@ -238,7 +288,7 @@ None.
 ## Problems found
 
 None. No contradiction found between PPO_PLAN.md and the current
-codebase in P0, P1, or P2.
+codebase in P0, P1, P2, or P3.
 
 ## Recent commits (PPO-related)
 
@@ -247,10 +297,11 @@ codebase in P0, P1, or P2.
 - `bcf2b4c` — `chore(ppo): audit frozen training baseline` (P0 completion)
 - `2f865b6` — `feat(ppo): add PPO foundation scaffolding (P1)` (P1
   completion)
-- P2 completion commit: see `git log` on `feat/ppo-phase0-5` for the
-  exact SHA (`feat(ppo): implement Reward V0 and W&B logging
-  foundation (P2)`) — committed immediately after this HANDOFF.md
-  update.
+- `565a7fe` — `feat(ppo): implement Reward V0 and W&B logging
+  foundation (P2)` (P2 completion)
+- P3 completion commit: see `git log` on `feat/ppo-phase0-5` for the
+  exact SHA (`feat(ppo): implement discrete PPO core (P3)`) —
+  committed immediately after this HANDOFF.md update.
 
 ## Running processes
 
@@ -261,34 +312,47 @@ None.
 None yet (P1 only defines the `CheckpointPayload` contract + a pickle
 -based save/load skeleton with no real PPO train state to save; P5
 exercises the full save→load→resume→update cycle against real
-policy/value params and optimizer state). P2 did not touch checkpoint
+policy/value params and optimizer state). P3 built the real
+`PPOTrainingState`/`PPOTrainState` structures that will populate that
+contract's `policy_params`/`value_params`/`optimizer_state` fields
+once P4/P5 wire in real rollouts, but did not itself touch checkpoint
 code.
 
 ## Next command to run
 
-Begin P3 per [PROGRESS.md § Next Exact Action](PROGRESS.md#next-exact-action):
-implement `src/policies/ppo/{networks,distribution,policy,loss,state}.py`
-(discrete PPO core, algorithm-only, no real environment yet), add
-`tests/policies/` behavioral tests per §0.1/P3, re-run the full
-regression suite, then commit.
+Begin P4 per [PROGRESS.md § Next Exact Action](PROGRESS.md#next-exact-action):
+implement `src/training/rollout.py::collect_rollout` and
+`src/training/gae.py::compute_gae`/`normalize_advantages_masked`
+against the real `MergeEnvironment`, wiring in the now-real P3 PPO
+core. Add the required P4 tests (handcrafted GAE, terminal
+bootstrap/truncation handling, masked advantage normalization, rollout
+shape consistency, no NaN/inf, a real 1-episode rollout, the pre-step
+MERGE `policy_mask` regression per §7.1, Actor-mask invariance tests A
+and B, terminal reward propagation test D, and the §11 action-mapping
+regression), re-run the full regression suite, then commit.
 
 ## Next file to modify
 
-`src/policies/ppo/networks.py` (P3's first task — policy/value
-network definitions).
+`src/training/rollout.py` (P4's first task — real rollout collection
+against `MergeEnvironment`, replacing its P1 `NotImplementedError`
+skeleton).
 
 ---
 
 ## NEXT OWNER ACTION
 
-**P0, P1, and P2 are all complete.** Begin **Phase P3 — Discrete PPO
-Core** per
-[PPO_PLAN.md §0.1/P3](PPO_PLAN.md#p3--discrete-ppo-core). Do not skip
-ahead to P4/P5. P3 validates the PPO algorithm in isolation only — no
-real `MergeEnvironment` rollout yet (that's P4). Preserve the fixed
-§11 action-index -> `BehaviorAction` mapping
-(`0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`) exactly as already
-established in P1's constant + regression test.
+**P0, P1, P2, and P3 are all complete.** Begin **Phase P4 — Rollout +
+GAE Integration** per
+[PPO_PLAN.md §0.1/P4](PPO_PLAN.md#p4--rollout--gae-integration). Do
+not skip ahead to P5. P4 connects the now-real P3 PPO core to the real
+`MergeEnvironment`: `policy_mask` MUST be decided **before**
+`env.step()` from the pre-step `info_before["merge_committed"]` value
+(§7.1) — never from post-step `info`. GAE uses the full physical
+trajectory; Actor-side statistics (policy loss, entropy, approx-KL,
+clip-fraction, advantage-normalization mean/std) exclude
+`policy_mask == 0` frames (§7.2). Preserve the fixed §11 action-index
+-> `BehaviorAction` mapping (`0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`)
+exactly as already established and re-tested in P1/P3.
 
 **Fixed constraint for the rest of this entire P0–P5 effort (applies
 to every remaining Phase): exactly ONE commit per Phase.** No
@@ -296,10 +360,10 @@ intermediate "-A"/"-B", sub-stage, or WIP commits within a Phase. Do
 all of a Phase's implementation, its required tests, and its doc
 updates first, and only commit once, at the very end of that Phase,
 with everything for that Phase staged together in a single commit. P0,
-P1, and P2 already followed this rule (`chore(ppo): audit frozen
+P1, P2, and P3 already followed this rule (`chore(ppo): audit frozen
 training baseline`, `feat(ppo): add PPO foundation scaffolding (P1)`,
-`feat(ppo): implement Reward V0 and W&B logging foundation (P2)`). P3
-through P5 must each get exactly one commit the same way — three more
-commits total across the rest of the effort, on top of the
-pre-existing `aa8cf5b` docs commit and the three already-landed
-P0/P1/P2 commits.
+`feat(ppo): implement Reward V0 and W&B logging foundation (P2)`,
+`feat(ppo): implement discrete PPO core (P3)`). P4 and P5 must each
+get exactly one commit the same way — two more commits total across
+the rest of the effort, on top of the pre-existing `aa8cf5b` docs
+commit and the four already-landed P0/P1/P2/P3 commits.
