@@ -1,15 +1,14 @@
-"""P1/P2/P4 import checks for the training/tracking packages (docs/ppo/
-PPO_PLAN.md SS0.1/P1, P2, P4). ``rollout``/``gae``/``trainer.build_training_batch``
-are real as of P4 (behavioral coverage lives in ``tests/training/
-test_rollout.py`` and ``tests/training/test_gae.py``) -- this file only
-checks module-level structure/constants. ``trainer.run_training`` (the
-P5-scope multi-update loop) remains a ``NotImplementedError`` stub.
+"""P1/P2/P4/P5 import checks for the training/tracking packages (docs/ppo/
+PPO_PLAN.md SS0.1/P1, P2, P4, P5). ``rollout``/``gae``/
+``trainer.build_training_batch`` are real as of P4 (behavioral coverage
+lives in ``tests/training/test_rollout.py`` and ``tests/training/
+test_gae.py``); ``trainer.run_training``/``run_update`` are real as of
+P5 (behavioral coverage lives in ``tests/training/test_run_training.py``)
+-- this file only checks module-level structure/constants.
 ``wandb_logger`` is real as of P2 (see ``tests/tracking/
 test_wandb_logger.py`` for its behavioral tests) -- this file only
 checks its module-level constants here.
 """
-
-import pytest
 
 from src.tracking import wandb_logger
 from src.training import gae, rollout, trainer
@@ -47,6 +46,7 @@ def test_gae_module_imports():
 
 def test_trainer_module_imports():
     assert hasattr(trainer, "run_training")
+    assert hasattr(trainer, "run_update")
     assert hasattr(trainer, "build_training_batch")
 
 
@@ -57,12 +57,4 @@ def test_wandb_logger_module_imports():
     assert "seed" in wandb_logger.REQUIRED_CONFIG_KEYS
     assert "train/episode_return" in wandb_logger.MINIMUM_METRICS
     assert "ppo/policy_loss" in wandb_logger.MINIMUM_METRICS
-
-
-def test_run_training_stub_raises_not_implemented():
-    # The multi-update parameter loop remains P5 scope; only
-    # run_training is still a stub as of P4 (rollout/gae/
-    # build_training_batch are real -- see test_rollout.py/test_gae.py).
-    with pytest.raises(NotImplementedError):
-        trainer.run_training(None, None)
 

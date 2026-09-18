@@ -1,32 +1,54 @@
 """PPO trainer loop: rollout -> GAE -> PPO update -> logging (docs/ppo/
 PPO_PLAN.md SS0.1 P5).
 
-P4 scope (this module): wires enough of the pipeline to produce ONE
-complete PPO-ready training batch end-to-end -- rollout (P4:
-``src.training.rollout``) -> Reward V0 (P2: ``src.rewards``) -> GAE
-(P4: ``src.training.gae``) -> masked Actor-side advantage normalization
-(SS7.2) -> a flat batch dict ready for a PPO update. The actual
-multi-epoch parameter-UPDATE loop (gradient steps, minibatching across
-epochs, checkpointing, W&B run orchestration) is explicit P5 scope
-(SS0.1/P4's completion criteria: "the actual multi-update training loop
-belongs to P5") and is NOT implemented here.
+P4 built ``build_training_batch``: rollout (``src.training.rollout``)
+-> Reward V0 (``src.rewards``) -> GAE (``src.training.gae``) -> masked
+Actor-side advantage normalization (SS7.2) -> a flat batch dict ready
+for a PPO update.
 
-``build_training_batch`` is this module's P4 deliverable: given a
-rollout's ``Transition`` list plus the PPO hyperparameters, it computes
-GAE over the FULL physical trajectory (SS7.2 Critic scope) and returns
-a dict whose ``policy_mask``-relevant fields (advantages used for the
-policy loss) are ALREADY the masked-normalized ones, while ``returns``/
-``values`` remain full-trajectory (Critic scope) -- exactly what a P5
-PPO update loop will consume directly.
+P5 implements ``run_training``: the real multi-update PPO training
+loop against the real ``MergeEnvironment``. Each update:
+
+  1. collect a small rollout (``src.training.rollout.collect_rollout``)
+     over the given maneuvers
+  2. build a training batch (``build_training_batch``: rollout -> GAE
+     -> masked-normalized advantages)
+  3. filter every ACTOR-side quantity (observation, action, old
+     log_prob, advantages, policy_mask) to ``policy_mask == 1`` rows
+     ONLY (SS7.2 -- ``build_training_batch`` does not do this itself)
+  4. run ``ppo_epochs`` inner-epoch passes over ``num_minibatches``
+     minibatches of the masked Actor rows, each minibatch:
+       - policy loss + entropy computed via ``jax.grad`` of
+         ``ppo_clipped_surrogate_loss``/``entropy_bonus`` w.r.t. the
+         POLICY train state's params only, applied via
+         ``policy_state.apply_gradients``
+       - value loss computed over the FULL (unmasked) trajectory
+         (SS7.2 Critic scope) via ``jax.grad`` of ``value_loss``
+         w.r.t. the VALUE train state's params only, applied via
+         ``value_state.apply_gradients``
+  5. log metrics (``src.tracking.wandb_logger``) and advance the
+     global env-step / PPO-update-step counters
+
+This is pipeline-verification only (PPO_PLAN.md SS0.1/P5): no
+hyperparameter tuning, no long training, no TRAIN/TUNE split.
 """
 
-from typing import Any, Dict, List
+import dataclasses
+from typing import Any, Callable, Dict, List, Optional
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+import optax
 
+from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
+from src.policies.ppo import distribution
+from src.policies.ppo.loss import entropy_bonus, ppo_clipped_surrogate_loss, value_loss
+from src.policies.ppo.policy import PPOPolicy
+from src.policies.ppo.state import PPOTrainingState
 from src.training.config import PPOConfig, RewardConfig
 from src.training.gae import compute_gae, normalize_advantages_masked
-from src.training.rollout import Transition
+from src.training.rollout import Transition, collect_rollout
 
 
 def build_training_batch(
@@ -111,24 +133,265 @@ def build_training_batch(
     return batch
 
 
-def run_training(ppo_config: PPOConfig, reward_config: RewardConfig, *args, **kwargs):
-    """Runs the full PPO training loop (rollout -> GAE -> update ->
-    checkpoint -> W&B logging) for one config.
+def _filter_actor_rows(batch: Dict[str, np.ndarray], mask: np.ndarray) -> Dict[str, np.ndarray]:
+    """Filters a training batch's Actor-relevant fields down to
+    ``policy_mask == 1`` rows only (SS7.2). ``build_training_batch``
+    deliberately does NOT do this itself (its Critic-side arrays must
+    stay full-length in the same dict), so callers filter here."""
 
-    P4 scope note: ``build_training_batch`` above (rollout -> GAE ->
-    masked-normalized batch) is implemented and tested as of P4. The
-    actual multi-epoch PARAMETER-UPDATE loop this function is meant to
-    drive (minibatching across ``ppo_epochs``, applying gradients,
-    checkpoint save/load/resume, W&B run orchestration) lands in P5 per
-    PPO_PLAN.md SS0.1/P5 -- P4's explicit non-goal is "no actual
-    multi-update training loop yet."
+    return {
+        "observation": batch["observation"][mask],
+        "action": batch["action"][mask],
+        "log_prob": batch["log_prob"][mask],
+        "advantages": batch["advantages"][mask],
+    }
+
+
+def _minibatch_indices(num_rows: int, num_minibatches: int, rng: np.random.RandomState):
+    """Shuffles ``num_rows`` row indices and splits them into
+    ``num_minibatches`` (nearly) equal chunks. ``num_minibatches`` is
+    clamped to ``num_rows`` so a tiny smoke batch never produces an
+    empty minibatch."""
+
+    num_minibatches = max(1, min(num_minibatches, num_rows))
+    order = rng.permutation(num_rows)
+    return np.array_split(order, num_minibatches)
+
+
+def _policy_loss_fn(policy_params, policy_apply_fn, observations, old_log_prob, actions, advantages, clip_epsilon, entropy_coef):
+    logits = policy_apply_fn(policy_params, observations)
+    new_log_prob = distribution.log_prob(logits, actions)
+    policy_loss, surrogate_info = ppo_clipped_surrogate_loss(
+        old_log_prob=old_log_prob,
+        new_log_prob=new_log_prob,
+        advantages=advantages,
+        clip_epsilon=clip_epsilon,
+    )
+    entropy = entropy_bonus(logits)
+    total = policy_loss - entropy_coef * entropy
+    info = {
+        "policy_loss": policy_loss,
+        "entropy": entropy,
+        **surrogate_info,
+    }
+    return total, info
+
+
+def _value_loss_fn(value_params, value_apply_fn, observations, returns):
+    values = value_apply_fn(value_params, observations)
+    v_loss = value_loss(values, returns)
+    return v_loss, {"value_loss": v_loss, "values": values}
+
+
+def run_update(
+    training_state: PPOTrainingState,
+    batch: Dict[str, np.ndarray],
+    ppo_config: PPOConfig,
+    numpy_rng: np.random.RandomState,
+) -> Dict[str, Any]:
+    """Runs ONE PPO update (``ppo_epochs`` inner-epoch passes over
+    ``num_minibatches`` minibatches) against one already-built training
+    batch, returning ``(new_training_state, metrics)``.
+
+    Per SS7.2: Actor-side quantities (policy loss, entropy, approx-KL,
+    clip-fraction, action-distribution stats) are computed ONLY over
+    ``policy_mask == 1`` rows; the value loss uses the FULL trajectory
+    (every row, regardless of ``policy_mask``).
     """
 
-    raise NotImplementedError(
-        "The full PPO training loop (multi-epoch parameter updates, "
-        "checkpointing, W&B run orchestration) lands in P5 (docs/ppo/"
-        "PPO_PLAN.md SS0.1/P5). P4 implements and tests "
-        "src.training.trainer.build_training_batch (rollout -> GAE -> "
-        "masked-normalized PPO-ready batch), which this function will "
-        "call once P5 wires in the update loop."
+    hp = ppo_config.hyperparameters
+    policy_mask = batch["policy_mask"].astype(bool)
+    if not np.any(policy_mask):
+        raise ValueError(
+            "run_update: batch has no policy_mask==1 rows -- cannot run "
+            "any Actor-side PPO update."
+        )
+
+    actor_batch = _filter_actor_rows(batch, policy_mask)
+    num_actor_rows = actor_batch["observation"].shape[0]
+    num_critic_rows = batch["observation"].shape[0]
+
+    policy_state = training_state.policy_state
+    value_state = training_state.value_state
+
+    policy_grad_fn = jax.value_and_grad(_policy_loss_fn, has_aux=True)
+    value_grad_fn = jax.value_and_grad(_value_loss_fn, has_aux=True)
+
+    last_policy_info: Dict[str, Any] = {}
+    last_value_info: Dict[str, Any] = {}
+    policy_grad_norms: List[float] = []
+    value_grad_norms: List[float] = []
+
+    for _epoch in range(hp.ppo_epochs):
+        # --- Actor update: policy_mask==1 rows only, minibatched.
+        for idx in _minibatch_indices(num_actor_rows, hp.num_minibatches, numpy_rng):
+            mb_obs = jnp.asarray(actor_batch["observation"][idx])
+            mb_old_log_prob = jnp.asarray(actor_batch["log_prob"][idx])
+            mb_actions = jnp.asarray(actor_batch["action"][idx])
+            mb_advantages = jnp.asarray(actor_batch["advantages"][idx])
+
+            (_loss, last_policy_info), grads = policy_grad_fn(
+                policy_state.params,
+                policy_state.apply_fn,
+                mb_obs,
+                mb_old_log_prob,
+                mb_actions,
+                mb_advantages,
+                hp.clip_epsilon,
+                hp.entropy_coef,
+            )
+            policy_grad_norms.append(float(optax.global_norm(grads)))
+            policy_state = policy_state.apply_gradients(grads=grads)
+
+        # --- Critic update: FULL trajectory, minibatched.
+        for idx in _minibatch_indices(num_critic_rows, hp.num_minibatches, numpy_rng):
+            mb_obs = jnp.asarray(batch["observation"][idx])
+            mb_returns = jnp.asarray(batch["returns"][idx])
+
+            (_loss, last_value_info), grads = value_grad_fn(
+                value_state.params,
+                value_state.apply_fn,
+                mb_obs,
+                mb_returns,
+            )
+            value_grad_norms.append(float(optax.global_norm(grads)))
+            value_state = value_state.apply_gradients(grads=grads)
+
+    new_training_state = dataclasses.replace(
+        training_state, policy_state=policy_state, value_state=value_state
     )
+
+    # Action-distribution stats: policy_mask==1 rows only (SS7.2/SS8).
+    actor_actions = actor_batch["action"]
+    action_counts = {i: int(np.sum(actor_actions == i)) for i in range(4)}
+    total_actions = max(1, int(actor_actions.shape[0]))
+
+    metrics = {
+        "ppo/policy_loss": float(last_policy_info["policy_loss"]),
+        "ppo/value_loss": float(last_value_info["value_loss"]),
+        "ppo/entropy": float(last_policy_info["entropy"]),
+        "ppo/approx_kl": float(last_policy_info["approx_kl"]),
+        "ppo/clip_fraction": float(last_policy_info["clip_fraction"]),
+        "ppo/grad_norm": float(np.mean(policy_grad_norms + value_grad_norms)),
+        "action/keep_ratio": action_counts[0] / total_actions,
+        "action/follow_ratio": action_counts[1] / total_actions,
+        "action/merge_ratio": action_counts[2] / total_actions,
+        "action/stop_ratio": action_counts[3] / total_actions,
+    }
+
+    if not all(np.isfinite(v) for v in metrics.values()):
+        raise ValueError(f"run_update produced a non-finite metric: {metrics}")
+
+    return {"training_state": new_training_state, "metrics": metrics}
+
+
+def run_training(
+    ppo_config: PPOConfig,
+    reward_config: RewardConfig,
+    env: MergeEnvironment,
+    maneuvers: List[ManeuverSpec],
+    training_state: PPOTrainingState,
+    rng_key: jax.Array,
+    numpy_rng: np.random.RandomState,
+    num_updates: int,
+    max_steps_per_episode: int,
+    global_env_step: int = 0,
+    ppo_update_step: int = 0,
+    wandb_logger: Optional[Any] = None,
+    on_update: Optional[Callable[[int, PPOTrainingState, jax.Array, int, int], None]] = None,
+) -> Dict[str, Any]:
+    """Runs ``num_updates`` real PPO updates against the real
+    ``MergeEnvironment`` (docs/ppo/PPO_PLAN.md SS0.1/P5).
+
+    Each update: collect one rollout over ``maneuvers`` -> build a
+    training batch (rollout -> GAE -> masked-normalized advantages) ->
+    filter Actor-side quantities to ``policy_mask == 1`` -> run
+    ``ppo_epochs``/``num_minibatches`` gradient steps for both the
+    policy and value train states (independent parameters, SS7.2) ->
+    log metrics.
+
+    ``global_env_step``/``ppo_update_step`` are the counters to CONTINUE
+    from (0 for a fresh run, or whatever a resumed checkpoint recorded)
+    -- this is what makes ``--resume`` a real continuation rather than a
+    restart (PPO_PLAN.md SS10). ``on_update`` is an optional callback
+    invoked after every update with
+    ``(update_index, training_state, global_env_step, ppo_update_step)``
+    -- used by callers (e.g. ``scripts/train_ppo.py``) to save periodic
+    checkpoints without this function needing to know about the
+    checkpoint contract itself.
+
+    Returns a dict with the final ``training_state``, the final
+    ``rng_key`` (the advanced PRNG state after all rollouts -- callers
+    should persist THIS into a checkpoint, never the key they passed
+    in, so a resumed run continues the RNG stream rather than replaying
+    it), the final ``global_env_step``/``ppo_update_step``, and a list
+    of per-update metrics dicts (``updates``).
+    """
+
+    update_metrics: List[Dict[str, Any]] = []
+
+    for update_index in range(num_updates):
+        rng_key, rollout_key = jax.random.split(rng_key)
+
+        ppo_policy = PPOPolicy(training_state.policy_network, training_state.policy_state.params)
+        transitions: List[Transition] = collect_rollout(
+            env=env,
+            maneuvers=maneuvers,
+            ppo_policy=ppo_policy,
+            value_network=training_state.value_network,
+            value_params=training_state.value_state.params,
+            reward_config=reward_config,
+            rng_key=rollout_key,
+            max_steps_per_episode=max_steps_per_episode,
+        )
+        global_env_step += len(transitions)
+
+        batch = build_training_batch(transitions, ppo_config)
+
+        update_result = run_update(training_state, batch, ppo_config, numpy_rng)
+        training_state = update_result["training_state"]
+        ppo_update_step += 1
+
+        episode_returns = {}
+        for t in transitions:
+            episode_returns.setdefault(t.episode_id, 0.0)
+            episode_returns[t.episode_id] += t.reward
+        mean_episode_return = float(np.mean(list(episode_returns.values()))) if episode_returns else 0.0
+
+        # reward/terminal: the terminal-outcome component only (the
+        # final transition's reward on a truly-terminated episode --
+        # SUCCESS/COLLISION/OFFROAD, per Reward V0's fixed table).
+        # reward/decision_cost: every step's reward MINUS that terminal
+        # component (i.e. every step's -0.01/0.0 decision-cost
+        # component, summed over the whole rollout).
+        reward_terminal = float(sum(t.reward for t in transitions if t.terminated))
+        reward_total = float(np.sum(batch["reward"]))
+        reward_decision_cost = reward_total - reward_terminal
+
+        metrics = {
+            "train/episode_return": mean_episode_return,
+            "train/episode_length": float(len(transitions) / max(1, len(episode_returns))),
+            "reward/terminal": reward_terminal,
+            "reward/decision_cost": reward_decision_cost,
+            "reward/total": reward_total,
+            **update_result["metrics"],
+        }
+
+        if not all(np.isfinite(v) for v in metrics.values()):
+            raise ValueError(f"run_training: non-finite metric at update {update_index}: {metrics}")
+
+        if wandb_logger is not None:
+            wandb_logger.log_metrics(metrics, step=ppo_update_step)
+
+        update_metrics.append(metrics)
+
+        if on_update is not None:
+            on_update(update_index, training_state, rng_key, global_env_step, ppo_update_step)
+
+    return {
+        "training_state": training_state,
+        "rng_key": rng_key,
+        "global_env_step": global_env_step,
+        "ppo_update_step": ppo_update_step,
+        "updates": update_metrics,
+    }

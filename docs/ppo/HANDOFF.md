@@ -32,9 +32,13 @@ Unified branch-creation order (see also
 ## What's completed so far
 
 **P0 — Baseline Audit, P1 — PPO Foundation, P2 — Reward V0 + W&B
-Foundation, P3 — Discrete PPO Core, and P4 — Rollout + GAE Integration
-are all COMPLETE.**
-Working on branch
+Foundation, P3 — Discrete PPO Core, P4 — Rollout + GAE Integration, and
+P5 — Smoke Training are all COMPLETE. The entire P0-P5 PPO effort is
+DONE.** State: **P5 COMPLETE — WAITING FOR USER TUNING**. See
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the full P5
+report (architecture, exact smoke-run conditions/results, checkpoint
+location, verified resume command, regression numbers, known
+limitations, reproduction commands). Working on branch
 `feat/ppo-phase0-5` (already created and checked out at session start,
 carrying the approved plan docs from commit `aa8cf5b`).
 
@@ -328,13 +332,83 @@ code 0, independently confirmed via `pytest tests/ --collect-only -q`
 -> "579 tests collected" (557 pre-existing + 22 net new P4 = 579,
 matching exactly: 11 gae + 8 rollout + 3 trainer = 22).
 
+**P5 — Smoke Training** then implemented the real multi-update PPO
+training loop (`src/training/trainer.py::run_update`/`run_training`,
+both previously `NotImplementedError` stubs), wired both
+`scripts/train_ppo.py` and `scripts/smoke_train_ppo.py` into real
+working entry points (real config/env/train-state setup, real
+`--resume` handling, real checkpoint save at the end), and ran two
+real smoke-training stages against the real `MergeEnvironment`
+(`downstream_mode="frenet_mpc"`, `WANDB_MODE=offline`, seed 0):
+
+- **Stage 1** (fresh init): 2 maneuvers (`MAN_0001`, `MAN_0002`), 2
+  updates, 60 max steps/episode. Finished in 61.1s;
+  `global_env_step=70`, `ppo_update_step=2`. Checkpoint saved to
+  `outputs/ppo_checkpoints/smoke_stage1_final.pkl`.
+- **Stage 2** (`--resume` from Stage 1's checkpoint, a **separate**
+  `python` process invocation): 4 maneuvers, 3 more updates, 60 max
+  steps/episode. Printed `Resumed: global_env_step=70,
+  ppo_update_step=2`, then finished in 211.0s with
+  `global_env_step=403`, `ppo_update_step=5` — counters genuinely
+  CONTINUED (never reset to 0) across the resume boundary. Checkpoint
+  saved to `outputs/ppo_checkpoints/smoke_stage2_final.pkl` (md5
+  differs from Stage 1's checkpoint, confirming genuinely different
+  parameters after the additional updates).
+
+`run_update` filters every Actor-side quantity (`observation`,
+`action`, `log_prob`, `advantages`) to `policy_mask == 1` rows before
+computing policy loss/entropy/gradients (§7.2 -- `build_training_batch`
+deliberately does not do this filtering itself); the value-loss pass
+uses the full, unfiltered trajectory. Both policy and value network
+parameters were confirmed to provably differ (leaf-by-leaf numpy
+comparison) before vs. after `run_update`/`run_training`, in both a
+dedicated unit test
+(`tests/training/test_run_training.py::test_run_update_changes_both_policy_and_value_params`)
+and via the real Stage1->Stage2 checkpoint md5 difference above. The
+full save -> load -> resume -> additional-update cycle (§10) was
+verified both via the real two-process CLI run above and independently
+via `tests/training/test_checkpoint.py::test_full_save_load_resume_additional_update_cycle`,
+which round-trips real Flax/optax pytrees through `save_checkpoint`/
+`load_checkpoint` and confirms an additional real update happens on
+top of the loaded state with step counters continuing.
+
+Added net **7 new P5 tests** over the P4 baseline:
+`tests/training/test_checkpoint.py` (new file, 3 -- real-JAX-pytree
+round-trip, params usable for a real forward pass after reload, full
+save->load->resume->additional-update cycle), `tests/training/
+test_run_training.py` (new file, 5 -- `run_update` changes both
+policy/value params + finite metrics, `run_update` raises on an
+all-masked-out batch, `run_training` end-to-end changes parameters,
+`run_training` continues step counters from a nonzero starting point,
+action-ratio metrics reflect only `policy_mask==1` rows), plus
+`tests/training/test_trainer.py` (net 0 -- the old
+`run_training`-still-raises-`NotImplementedError` test was replaced
+with `test_run_training_is_real_not_a_stub`, and the SS7.2 test-B-at-
+the-real-PPO-loss-level test `test_masked_frames_do_not_affect_real_ppo_loss_statistics`
+was already present from P4's own commit) and `tests/training/
+test_imports.py` (-1 -- the now-obsolete `run_training`-stub check was
+removed). See [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §10
+for the exact reconciliation (580 P4-baseline + 7 = 587).
+
+Confirmed no other `pytest` process was running before the full-suite
+run. Ran the FULL existing regression suite (Phase 1-3 + P1 + P2 + P3
++ P4 + P5 tests together) and waited for the real process exit (PID
+495630, watched via a `Monitor` until-loop polling the actual PID, not
+a fixed-duration sleep): **587 passed**, 0 failed, 80 warnings (all
+`optax.global_norm`-deprecation warnings, not failures), in 1948.37s
+(0:32:28), exit code 0, independently confirmed via `pytest tests/
+--collect-only -q` -> "587 tests collected". `git diff --stat --
+src/environment/ src/planning/ src/control/ src/scenarios/` confirmed
+empty -- zero frozen Phase 1-3 files touched across the ENTIRE P0-P5
+effort, including P5.
+
 ## Last successful test
 
-`pytest tests/ -q` (after P4, clean solo run — no concurrent-pytest
-contention) -> **579 passed**, 0 failed, 1920.04s (0:32:00) — waited
-for real process completion, verified directly against the log file's
-final summary line (`579 passed in 1920.04s (0:32:00)`, 100% dots, no
-`F`/`E` marks).
+`pytest tests/ -q` (after P5, clean solo run — no concurrent-pytest
+contention) -> **587 passed**, 0 failed, 80 warnings, 1948.37s
+(0:32:28) — waited for real process completion, verified directly
+against the completed log file's final summary line, 100% dots, no
+`F`/`E` marks.
 
 ## Failed tests
 
@@ -343,7 +417,9 @@ None.
 ## Problems found
 
 None. No contradiction found between PPO_PLAN.md and the current
-codebase in P0, P1, P2, P3, or P4.
+codebase in P0, P1, P2, P3, P4, or P5. The entire P0-P5 effort
+completed with zero blockers and zero deviations from the frozen
+design or the approved plan.
 
 ## Recent commits (PPO-related)
 
@@ -356,9 +432,12 @@ codebase in P0, P1, P2, P3, or P4.
   foundation (P2)` (P2 completion)
 - `334e4c6` — `feat(ppo): implement discrete PPO core (P3)` (P3
   completion)
-- P4 completion commit: see `git log` on `feat/ppo-phase0-5` for the
-  exact SHA (`feat(ppo): implement rollout and GAE integration (P4)`)
-  — committed immediately after this HANDOFF.md update.
+- `fe8edc9` — `feat(ppo): implement rollout and GAE integration (P4)`
+  (P4 completion)
+- P5 completion commit (`test(ppo): validate smoke training pipeline
+  (P5)`): see `git log` on `feat/ppo-phase0-5` for the exact SHA —
+  the sixth and FINAL commit of the entire P0-P5 effort, committed
+  immediately after this HANDOFF.md update.
 
 ## Running processes
 
@@ -366,70 +445,67 @@ None.
 
 ## Latest checkpoint
 
-None yet (P1 only defines the `CheckpointPayload` contract + a pickle
--based save/load skeleton with no real PPO train state to save; P5
-exercises the full save→load→resume→update cycle against real
-policy/value params and optimizer state). P3 built the real
-`PPOTrainingState`/`PPOTrainState` structures that will populate that
-contract's `policy_params`/`value_params`/`optimizer_state` fields;
-P4 built the real rollout/GAE/batch-building pipeline that will feed
-the P5 update loop, but did not itself touch checkpoint code.
+Real checkpoints from P5's two smoke-training stages:
+`outputs/ppo_checkpoints/smoke_stage1_final.pkl` (fresh run) and
+`outputs/ppo_checkpoints/smoke_stage2_final.pkl` (resumed from Stage
+1, 3 more updates). Both carry the full §10 contract (policy params,
+value params, optimizer state for both networks, JAX PRNG key,
+`global_env_step`, `ppo_update_step`, seed, config snapshot, reward
+version, git SHA) as a plain-`pickle` dump of `CheckpointPayload`.
+Round-trip and resume verified both by real script runs and by
+`tests/training/test_checkpoint.py`. See
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §11 for the exact
+verified `--resume` command.
 
 ## Next command to run
 
-Begin P5 per [PROGRESS.md § Next Exact Action](PROGRESS.md#next-exact-action):
-wire the actual multi-epoch parameter-update loop into
-`src/training/trainer.py::run_training` (currently a
-`NotImplementedError` stub), consuming P4's `build_training_batch`
-output. Verify env reset, action sampling/mapping, rollout, reward,
-GAE, PPO loss (filtering to `policy_mask == 1` for every Actor-side
-quantity per §7.2 -- `build_training_batch` does not do this
-filtering itself), parameter update/backprop, finite loss/gradients,
-checkpoint save/load/resume (full §10 contract), and W&B logging, all
-on a small deterministic TRAIN-subset "smoke" run (Stage 1: 1-3
-maneuvers, minimal updates; Stage 2 only if Stage 1 succeeds). No
-long/full-TRAIN run, no TUNE split, no sweeps, no VAL evaluation, no
-FSM-vs-PPO comparison. Re-run the full regression suite, update
-PROGRESS.md/HANDOFF.md, append an EXPERIMENT_LOG.md entry, then make
-exactly one P5 commit -- the final commit of this entire P0-P5 effort.
+None queued — the P0-P5 effort is complete. If resuming this repo
+later for P6+ work (reward/hyperparameter tuning, a real TRAIN/TUNE
+split, longer training, VAL evaluation, FSM-vs-PPO comparison), start
+by reading [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) in
+full, then follow the NEXT OWNER ACTION below.
 
 ## Next file to modify
 
-`src/training/trainer.py::run_training` (P5's core task — the real
-multi-epoch update loop, replacing its current `NotImplementedError`
-stub; consumes `build_training_batch`'s P4 output directly).
+None queued for this effort. A future P6+ session would most likely
+start by adding the remaining §8 `MINIMUM_METRICS` W&B fields to
+`src/training/trainer.py::run_training` (success/collision/offroad/
+timeout rates, downstream intervention diagnostics — see
+SMOKE_TRAINING_REPORT.md §8/§13's "Known limitations"), but that is a
+user decision, not a queued action.
 
 ---
 
 ## NEXT OWNER ACTION
 
-**P0, P1, P2, P3, and P4 are all complete.** Begin **Phase P5 — Smoke
-Training** per
-[PPO_PLAN.md §0.1/P5](PPO_PLAN.md#p5--smoke-training). This is the
-FINAL Phase of the entire P0-P5 effort. P5 wires the actual PPO
-parameter-update loop (`trainer.py::run_training`) on top of P4's
-real rollout -> GAE -> masked-normalized batch pipeline
-(`build_training_batch`), verified against the real `MergeEnvironment`
-on a small deterministic TRAIN subset -- pipeline correctness, not
-performance, is the goal (§0.1/P5's explicit non-goals: no long
-training, no millions of steps, no reward-curve tuning, no
-hyperparameter tuning, no TRAIN/TUNE split, no W&B sweeps, no VAL
-evaluation, no FSM-vs-PPO comparison). Exercise the full checkpoint
-save→load→resume→additional-update cycle per §10 (full state, not
-just weights). When P5 succeeds, the state becomes **P5 COMPLETE —
-WAITING FOR USER TUNING** and this entire P0-P5 effort is done; P6+ is
-reserved for the user to run manually.
+**The entire P0-P5 PPO effort is COMPLETE.** State:
+**P5 COMPLETE — WAITING FOR USER TUNING**. Every item in
+[PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) holds — see
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the itemized
+evidence (architecture as implemented, exact smoke-run conditions,
+real results, checkpoint/resume verification, full regression
+numbers, known limitations, reproduction commands).
 
-**Fixed constraint (already applied to every prior Phase): exactly
-ONE commit per Phase.** No intermediate "-A"/"-B", sub-stage, or WIP
-commits within a Phase. Do all of P5's implementation, its required
-tests, and its doc updates first, and only commit once, at the very
-end, with everything staged together in a single commit. P0, P1, P2,
-P3, and P4 already followed this rule (`chore(ppo): audit frozen
-training baseline`, `feat(ppo): add PPO foundation scaffolding (P1)`,
-`feat(ppo): implement Reward V0 and W&B logging foundation (P2)`,
-`feat(ppo): implement discrete PPO core (P3)`,
-`feat(ppo): implement rollout and GAE integration (P4)`). P5 must get
-exactly one commit the same way — the final commit of this effort, on
-top of the pre-existing `aa8cf5b` docs commit and the five
-already-landed P0/P1/P2/P3/P4 commits.
+**The user must review the P5 smoke-training W&B results themselves
+before any further PPO work is done.** Concretely: read
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §9 (or run
+`wandb sync` on the two local offline run directories it references
+to view them in the W&B UI), form their own judgment about the
+observed episode returns / entropy / action distributions / loss
+curves from the two smoke stages, and decide — based on that review,
+not on any recommendation baked into this codebase or these docs —
+whether/how to proceed into P6+ (reward-term additions or reweighting,
+hyperparameter tuning, creating a real PPO-FIT/PPO-TUNE dataset split,
+longer training runs, canonical VAL evaluation, or an FSM-vs-PPO
+comparison). None of that P6+ work has been started, scoped, or
+recommended by this effort — P0-P5 deliberately stayed pipeline-
+verification-only throughout (§0.1's non-goals for every Phase), and
+the choice of what (if anything) to tune next is explicitly the user's
+call to make, not an automated next step for a future session to take
+on its own initiative.
+
+If a future session is asked to continue this work, it should treat
+that as the START of a new, separately-scoped effort (its own plan,
+its own branch decision, its own commit cadence) built on top of this
+frozen P0-P5 foundation — not as "P6" of this same effort, since no P6
+scope was ever defined or approved.

@@ -105,12 +105,45 @@ def test_build_training_batch_empty_transitions_raises(ppo_core):
         build_training_batch([], ppo_core["ppo_config"])
 
 
-def test_run_training_still_raises_not_implemented(ppo_core, reward_config):
-    """P4 explicit non-goal: no actual multi-update training loop yet
-    (that's P5's job) -- run_training remains a stub."""
+def test_run_training_is_real_not_a_stub(ppo_core, reward_config, env):
+    """P5: run_training is now the real multi-update PPO training loop
+    (no longer a NotImplementedError stub, per P4's non-goal note this
+    test previously guarded). Full behavioral coverage (parameter
+    updates, finite metrics, resume-style step continuation, SS7.2
+    action-stat masking) lives in tests/training/test_run_training.py
+    -- this is a minimal smoke check that the call itself succeeds and
+    returns the expected result shape, using a real PPOTrainingState
+    (ppo_core's own fixture only builds a bare PPOPolicy, not a full
+    train state with independent optax optimizers, so one is built
+    fresh here the same way run_training's own dedicated tests do)."""
 
-    with pytest.raises(NotImplementedError):
-        run_training(ppo_core["ppo_config"], reward_config)
+    from src.policies.ppo.state import create_train_state
+    from src.training.seeding import make_seed_state
+    from tests.training.test_rollout import SINGLE_MANEUVER
+
+    seed_state = make_seed_state(ppo_core["ppo_config"].seed)
+    training_state = create_train_state(
+        seed_state.jax_key,
+        learning_rate=ppo_core["ppo_config"].hyperparameters.learning_rate,
+        max_grad_norm=ppo_core["ppo_config"].hyperparameters.max_grad_norm,
+        policy_hidden_sizes=ppo_core["ppo_config"].network.hidden_sizes,
+        value_hidden_sizes=ppo_core["ppo_config"].network.hidden_sizes,
+    )
+    result = run_training(
+        ppo_config=ppo_core["ppo_config"],
+        reward_config=reward_config,
+        env=env,
+        maneuvers=[SINGLE_MANEUVER],
+        training_state=training_state,
+        rng_key=seed_state.jax_key,
+        numpy_rng=seed_state.numpy_rng,
+        num_updates=1,
+        max_steps_per_episode=15,
+    )
+    assert "training_state" in result
+    assert "rng_key" in result
+    assert result["ppo_update_step"] == 1
+    assert len(result["updates"]) == 1
 
 
 # ======================================================================

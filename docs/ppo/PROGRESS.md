@@ -8,7 +8,21 @@ Live state, updated at the end of every Phase/Stage. See
 
 ## Current Phase
 
-**P4 COMPLETE** (Rollout + GAE Integration)
+**P5 COMPLETE — WAITING FOR USER TUNING**
+
+The entire P0–P5 PPO implementation effort is complete. P5 (Smoke
+Training) implemented the real multi-update PPO training loop
+(`src/training/trainer.py::run_training`/`run_update`), verified the
+full save→load→resume→additional-update checkpoint cycle against real
+JAX pytrees, wired both `scripts/train_ppo.py` and
+`scripts/smoke_train_ppo.py` into real, working entry points, and ran
+two real smoke-training stages against the real `MergeEnvironment`.
+Full details in [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md).
+P6+ (reward/hyperparameter tuning, full training, VAL evaluation,
+FSM-vs-PPO comparison) is reserved for the user — see
+[HANDOFF.md](HANDOFF.md)'s NEXT OWNER ACTION.
+
+### P4 COMPLETE (Rollout + GAE Integration) — prior phase summary below
 
 ## Current Stage
 
@@ -380,8 +394,11 @@ PPO Core**.
   and W&B logging foundation (P2)`)
 - P3 completion commit SHA: `334e4c6` (`feat(ppo): implement discrete
   PPO core (P3)`)
-- P4 completion commit SHA: (recorded in `git log` on this branch
-  immediately after this update, per the one-commit-per-Phase rule)
+- P4 completion commit SHA: `fe8edc9` (`feat(ppo): implement rollout
+  and GAE integration (P4)`)
+- P5 completion commit SHA: (recorded in `git log` on this branch
+  immediately after this update — the final commit of the entire
+  P0-P5 effort, per the one-commit-per-Phase rule)
 - branch: `feat/ppo-phase0-5`
 
 ## Completed Tasks
@@ -793,6 +810,141 @@ PPO Core**.
         → "579 tests collected". No other `pytest` process contended
         for the GPU during this run. `jax.devices()` re-confirmed
         `[CudaDevice(id=0)]` immediately after.
+- [x] **P5 Smoke Training** (final Phase of the P0-P5 effort):
+  - [x] Implemented the real multi-update PPO training loop in
+        `src/training/trainer.py`: `run_update` (one PPO update —
+        filters the batch to `policy_mask==1` rows for every Actor-side
+        quantity per SS7.2, runs `ppo_epochs` inner-epoch passes over
+        `num_minibatches` minibatches, computes policy gradients via
+        `jax.value_and_grad` of a policy-loss closure built on P3's
+        `ppo_clipped_surrogate_loss`/`entropy_bonus`, applies them via
+        `policy_state.apply_gradients`; separately computes value
+        gradients via `jax.value_and_grad` of P3's `value_loss` over
+        the FULL trajectory per SS7.2's Critic scope, applies via
+        `value_state.apply_gradients`) and `run_training` (the outer
+        loop: collect a rollout via P4's `collect_rollout` -> P4's
+        `build_training_batch` -> `run_update` -> log metrics ->
+        advance `global_env_step`/`ppo_update_step`, repeated
+        `num_updates` times; accepts starting step counters so a
+        resumed run continues rather than restarts, per SS10).
+  - [x] Verified (did not need to fix) `src/training/checkpoint.py`'s
+        P1 pickle-based `save_checkpoint`/`load_checkpoint` against
+        REAL JAX pytrees (Flax params as plain `dict`s in this repo's
+        flax version, optax `opt_state` NamedTuples, JAX PRNG keys) —
+        confirmed byte-identical round-trip via direct leaf-wise
+        comparison AND via a real `.apply()` forward pass through the
+        reloaded params producing identical logits/values. No format
+        change (e.g. to orbax) was necessary; `dataclasses.asdict`
+        correctly recurses through the payload without corrupting
+        nested pytree structure.
+  - [x] Wired `--resume` for real in `scripts/train_ppo.py` and
+        `scripts/smoke_train_ppo.py`: loads a `CheckpointPayload`,
+        restores both the policy and value `PPOTrainState`s (params +
+        optimizer state) via `dataclasses.replace`, continues the JAX
+        RNG stream from the checkpoint's own saved key (never
+        re-derived from `--seed`), and continues `global_env_step`/
+        `ppo_update_step` from the checkpoint rather than restarting at
+        0.
+  - [x] Completed `scripts/smoke_train_ppo.py` as the real Stage 1/2
+        smoke-training entry point: resolves the deterministic
+        canonical-TRAIN maneuver subset via `full_split_evaluator.
+        load_maneuver_specs("train")`, builds/resumes a
+        `PPOTrainingState`, calls `run_training`, logs to W&B
+        (`WANDB_MODE=offline` works without auth), and saves a real
+        checkpoint at the end (plus optional `--checkpoint-every`
+        intermediate saves).
+  - [x] Ran two REAL smoke-training stages against the real
+        `MergeEnvironment` (`downstream_mode="frenet_mpc"`):
+        **Stage 1** (fresh, `MAN_0001`/`MAN_0002`, 2 updates,
+        `max_episode_steps=60`, seed 0): 61.1s wall-clock, both
+        episodes reached real SUCCESS terminal outcomes each update,
+        all metrics finite, checkpoint saved
+        (`outputs/ppo_checkpoints/smoke_stage1_final.pkl`, 542445
+        bytes). **Stage 2** (`--resume` from Stage 1's checkpoint,
+        expanded to `MAN_0001..MAN_0004`, 3 more updates): 211.0s
+        wall-clock, correctly printed `Resumed: global_env_step=70,
+        ppo_update_step=2` and continued to
+        `global_env_step=403, ppo_update_step=5` (not a restart), all
+        metrics finite throughout, checkpoint saved
+        (`outputs/ppo_checkpoints/smoke_stage2_final.pkl`). Full
+        per-update numbers (policy/value loss, entropy, approx-KL,
+        clip-fraction, grad-norm, action ratios) recorded in
+        [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §10 —
+        reported honestly as pipeline-verification-scale numbers, not
+        a performance claim (explicit P5 non-goal).
+  - [x] Directly verified every SS0.1/P5 + §12 required-verification
+        item (env reset, stochastic action sampling, action mapping,
+        rollout, reward, GAE, finite PPO loss, an actual parameter
+        update — policy AND value params provably differ before/after,
+        both via dedicated tests and via a real checkpoint diff during
+        interactive verification —, finite loss/gradients throughout,
+        checkpoint save, checkpoint load, full
+        save->load->resume->additional-update cycle [twice: a
+        dedicated in-process test AND the real Stage1->Stage2 CLI
+        invocation across two separate `python` process launches],
+        W&B offline logging producing real files, no NaN/inf/crash/OOM
+        across the whole run) — full evidence for each item recorded
+        in [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §12.
+  - [x] Wrote 8 new P5-specific tests across 2 new files:
+        `tests/training/test_run_training.py` (5 — `run_update`
+        changes both policy AND value params with finite metrics, an
+        all-masked-out batch raises `ValueError`, a full
+        `run_training` end-to-end call against the real environment
+        changes parameters with finite metrics throughout, starting
+        `run_training` from nonzero step counters correctly continues
+        them, and action-distribution stats are confirmed to reflect
+        ONLY `policy_mask==1` rows on a single-decision-frame
+        maneuver), `tests/training/test_checkpoint.py` (3 — real-JAX-
+        pytree round-trip via leaf-wise comparison, round-tripped
+        params are usable in a real `.apply()` forward pass producing
+        identical output, and the full
+        save->load->resume->additional-update cycle against a real
+        rollout). Updated `tests/training/test_imports.py` in place
+        (removed the now-obsolete `run_training`-raises-`NotImplementedError`
+        stub check since the function is real; added a
+        `run_update`-attribute-presence check; net -1 collected item).
+        Updated `tests/training/test_trainer.py`'s old
+        `test_run_training_still_raises_not_implemented` in place —
+        replaced with `test_run_training_is_real_not_a_stub`, a minimal
+        real-call smoke check (full behavioral coverage lives in the
+        new `test_run_training.py`); net 0 collected-item change in
+        that file.
+  - [x] Ran the new P5 test files together with the updated import/
+        trainer tests (`tests/training/test_checkpoint.py
+        tests/training/test_run_training.py tests/training/test_imports.py`):
+        **13 passed** in 121.54s. Then ran
+        `tests/training/ tests/policies/ tests/rewards/ tests/tracking/`
+        together as an intermediate sanity check: **126 passed** in
+        277.52s.
+  - [x] Confirmed `git diff --stat` against `src/environment/`,
+        `src/planning/`, `src/control/`, `src/scenarios/` is EMPTY —
+        zero frozen Phase 1-3 files touched, matching every prior
+        Phase.
+  - [x] Confirmed no other `pytest` process was running before
+        launching the full regression suite.
+  - [x] Ran the FULL existing regression suite (Phase 1-3 + P1 + P2 +
+        P3 + P4 + P5 tests together) as a background process, watched
+        via a `Monitor` until-loop polling the real PID (not a
+        fixed-duration sleep, not a mid-run snapshot) to actual exit:
+        **587 passed**, 0 failed, 0 errors, in 1948.37s (0:32:28),
+        100% dots, zero `F`/`E` marks — matches 580 (P4's ACTUAL
+        `--collect-only` count, verified via a `git worktree` checkout
+        of the P4 completion SHA `fe8edc9` in this same environment;
+        one more than the 579 figure this document's own P4 entries
+        recorded at the time, a pre-existing off-by-one in that prior
+        record this session did not introduce and is not silently
+        correcting retroactively elsewhere in this file) + 7 net new
+        P5 tests exactly (5 test_run_training.py + 3
+        test_checkpoint.py + 0 test_trainer.py net + (-1)
+        test_imports.py net = 7; 580 + 7 = 587). Independently
+        confirmed via `pytest tests/ --collect-only -q` → "587 tests
+        collected". No other `pytest` process contended for the GPU
+        during this run.
+        `jax.devices()` re-confirmed `[CudaDevice(id=0)]` immediately
+        after.
+  - [x] Wrote `docs/ppo/SMOKE_TRAINING_REPORT.md` (final architecture/
+        results/reproduction-commands report for the whole P0-P5
+        effort).
 
 ## Changed Files (this session)
 
@@ -877,6 +1029,40 @@ PPO Core**.
     checks for `rollout`/`gae`/`trainer.build_training_batch` replaced
     with real-attribute assertions; `run_training`-stub check
     narrowed/kept; still 6 collected, unchanged count from P2/P3)
+- P5 (implementation of the P4 `run_training` stub + new files; no
+  existing Phase 1-3 file touched, `git diff --stat` against
+  `src/environment/`, `src/planning/`, `src/control/`,
+  `src/scenarios/` confirmed empty; `src/training/checkpoint.py` was
+  inspected/tested but not modified -- its P1 pickle implementation
+  was verified correct against real JAX pytrees, not changed):
+  - `src/training/trainer.py` (implemented `run_update` and
+    `run_training`; both were P1/P4 `NotImplementedError` stubs —
+    now the real multi-update PPO training loop, per SS0.1/P5)
+  - `scripts/train_ppo.py` (implemented: real config/env/train-state
+    setup, real `--resume` wiring, calls `run_training`, saves a real
+    checkpoint at the end — was a P1 skeleton that only echoed
+    resolved config/seed)
+  - `scripts/smoke_train_ppo.py` (implemented: real config/env/
+    train-state/maneuver-subset setup, real `--resume` wiring, calls
+    `run_training`, W&B config+metric logging, real checkpoint
+    save/optional intermediate saves — was a P1 skeleton that only
+    printed the resolved maneuver subset)
+  - `tests/training/test_run_training.py` (new, 5 collected test items)
+  - `tests/training/test_checkpoint.py` (new, 3 collected test items)
+  - `tests/training/test_imports.py` (updated: removed the now-obsolete
+    `run_training`-raises-`NotImplementedError` stub check; added a
+    `run_update`-attribute-presence check; net -1 collected item)
+  - `tests/training/test_trainer.py` (updated in place: replaced
+    `test_run_training_still_raises_not_implemented` with
+    `test_run_training_is_real_not_a_stub`; net 0 collected-item
+    change)
+  - `docs/ppo/SMOKE_TRAINING_REPORT.md` (new — final P0-P5 report)
+  - `outputs/ppo_checkpoints/smoke_stage1_final.pkl`,
+    `outputs/ppo_checkpoints/smoke_stage2_final.pkl` (new — real
+    checkpoints from the two real smoke-training stages)
+  - `wandb/offline-run-20260919_024059-dodmdn2z/`,
+    `wandb/offline-run-20260919_024226-bsp9erzm/` (new — real offline
+    W&B run files from the two smoke-training stages)
 
 ## Current Test Results
 
@@ -936,6 +1122,35 @@ PPO Core**.
   multi-epoch parameter-UPDATE loop (`trainer.py::run_training`)
   remains a `NotImplementedError` stub — P5 scope, confirmed still true
   by the updated `tests/training/test_imports.py`/`test_trainer.py`
+- New P5 tests: `tests/training/test_checkpoint.py`,
+  `tests/training/test_run_training.py`, `tests/training/test_imports.py`
+  together: **13 passed** in 121.54s. `tests/training/ tests/policies/
+  tests/rewards/ tests/tracking/` together: **126 passed** in 277.52s
+  (intermediate sanity check before the full suite)
+- Full suite after P5 additions (Phase 1-3 + P1 + P2 + P3 + P4 + P5
+  tests together, no concurrent pytest process, real process exit
+  confirmed via a `Monitor` until-loop polling the real PID, not a
+  fixed-duration sleep): **587 passed**, 0 failed, 0 errors, in
+  1948.37s (0:32:28), 100% dots, zero `F`/`E` marks — independently
+  confirmed via `pytest tests/ --collect-only -q` → "587 tests
+  collected". Per-file P5 delta: +3 (`test_checkpoint.py`, new) +5
+  (`test_run_training.py`, new) +0 (`test_trainer.py`, net) -1
+  (`test_imports.py`, net) = **+7 new P5 tests** (checking out the P4
+  completion commit `fe8edc9`'s own `tests/` tree against the current
+  environment collects 580, not the "579" figure recorded for that
+  commit at the time — a pre-existing one-test off-by-one in that
+  prior session's own count, not introduced or corrected retroactively
+  here; 580 + 7 = 587 reconciles exactly against what was actually
+  measured this session; see SMOKE_TRAINING_REPORT.md §10 for detail)
+- GPU re-confirmed working after P5 changes: `jax.devices() ==
+  [CudaDevice(id=0)]`
+- Real PPO multi-update training against the actual `MergeEnvironment`
+  is now implemented and validated as of P5: `trainer.py::run_update`/
+  `run_training` are real, both `scripts/train_ppo.py` and
+  `scripts/smoke_train_ppo.py` are real working entry points, and two
+  real smoke-training stages (fresh + resumed) ran successfully — see
+  [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for full
+  results. **This is the final Phase — the P0-P5 effort is complete.**
 
 ## Environment / Dependency Versions (recorded per PPO_PLAN.md §0.1 P0)
 
@@ -1025,32 +1240,43 @@ max_episode_steps: 60}` block for P5 pipeline verification.)
 
 ## W&B Run ID
 
-No real training run yet (that's P5 scope), but W&B logging itself is
-implemented and verified in P2: a standalone offline smoke run
-(`WANDB_MODE=offline`, project `its-merge-ppo-test`) logged the full
-§8 `REQUIRED_CONFIG_KEYS` config set plus
-`reward/terminal`/`reward/decision_cost`/`reward/total` metric points,
-exited 0, and produced real local files under an
-`offline-run-<timestamp>-<id>/` directory (`run-<id>.wandb`,
-`logs/debug.log`, `logs/debug-internal.log`, `files/requirements.txt`,
-etc. — see `tests/tracking/test_wandb_logger.py` for the automated
-version of this same check, and `docs/ppo/EXPERIMENT_LOG.md` for the
-dated entry). No online W&B run has been started (not required through
-P5; `WANDB_MODE=offline` is the supported no-network-required path per
-§8).
+Real smoke-training runs as of P5 (`WANDB_MODE=offline`, no auth
+required): Stage 1 project `its-merge-ppo-smoke`, run dir
+`wandb/offline-run-20260919_024059-dodmdn2z/`; Stage 2 (resumed), same
+project, run dir `wandb/offline-run-20260919_024226-bsp9erzm/`. Both
+logged the full §8 `REQUIRED_CONFIG_KEYS` config set plus every
+per-update metric listed in
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §9, exited 0, and
+produced real local files (`run-<id>.wandb`, `logs/debug.log`,
+`logs/debug-internal.log`, `files/requirements.txt`, etc.). No online
+W&B run has been started (not required through P5; `WANDB_MODE=offline`
+is the supported no-network-required path per §8) — starting one is a
+P6+/user decision.
 
 ## Checkpoint Path
 
-None yet — no real training run has produced one. P1 implemented and
-tested the `CheckpointPayload` contract and `save_checkpoint`/
-`load_checkpoint` (pickle-based skeleton, round-trip verified in
-`tests/training/test_config.py::test_checkpoint_save_load_roundtrip`);
-the full JAX-pytree save/load/resume cycle against real PPO train
-state is exercised end-to-end in P5.
+Real checkpoints from P5's two smoke-training stages:
+`outputs/ppo_checkpoints/smoke_stage1_final.pkl` (fresh run, 542445
+bytes) and `outputs/ppo_checkpoints/smoke_stage2_final.pkl` (resumed
+from Stage 1). Both contain the full §10 contract (policy/value params,
+optimizer state, JAX RNG key, global env step, PPO update step, seed,
+config snapshot, reward version, git SHA), verified to round-trip real
+JAX pytrees byte-identically (`tests/training/test_checkpoint.py`) and
+to support a real resume → additional-update cycle (both via a
+dedicated test and via the real Stage1→Stage2 CLI invocation, in two
+separate `python` process launches). See
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §11 for the exact
+resume command.
 
 ## Last Command
 
 ```
+pytest tests/ -q                     # P5: 587 passed, 0 failed, 1948.37s (0:32:28)
+pytest tests/training/test_checkpoint.py tests/training/test_run_training.py tests/training/test_imports.py -v  # new P5 tests: 13 passed, 121.54s
+pytest tests/training/ tests/policies/ tests/rewards/ tests/tracking/ -q   # intermediate sanity: 126 passed, 277.52s
+pytest tests/ --collect-only -q      # "587 tests collected" (580 P4-baseline + 7 net new P5 = 587; see SMOKE_TRAINING_REPORT.md SS10)
+WANDB_MODE=offline PYTHONPATH=. python scripts/smoke_train_ppo.py --checkpoint-path outputs/ppo_checkpoints/smoke_stage1_final.pkl   # Stage 1
+WANDB_MODE=offline PYTHONPATH=. python scripts/smoke_train_ppo.py --resume outputs/ppo_checkpoints/smoke_stage1_final.pkl --max-maneuvers 4 --num-updates 3 --max-episode-steps 60 --checkpoint-path outputs/ppo_checkpoints/smoke_stage2_final.pkl   # Stage 2 (resume)
 pytest tests/ -q                     # P4: 579 passed, 0 failed, 1920.04s (0:32:00)
 pytest tests/training/test_gae.py tests/training/test_rollout.py tests/training/test_trainer.py -v  # new P4 tests
 pytest tests/training/ tests/policies/ tests/rewards/ -q   # intermediate sanity: 114 passed, 148.94s
@@ -1061,14 +1287,22 @@ pytest tests/ -q                     # P2: 524 passed, 0 failed, 1769.33s (0:29:
 pytest tests/rewards/ tests/tracking/ tests/training/ tests/policies/ -q  # new P2 + P1 tests: 63 passed, 1.88s
 pytest tests/ -q                     # P1: 489 passed, 0 failed, 1867.61s (0:31:07)
 pytest tests/policies/ tests/rewards/ tests/training/ -v   # new P1 tests alone: 28 passed, 1.08s
-PYTHONPATH=. python scripts/train_ppo.py
-PYTHONPATH=. python scripts/smoke_train_ppo.py --max-maneuvers 2
 ```
 
 ## Known Issues
 
 No contradiction found between PPO_PLAN.md and the current frozen
-codebase during P0, P1, P2, P3, or P4 — the `info_before`/pre-step
+codebase during P0, P1, P2, P3, P4, or P5 — the entire P0-P5 effort
+completed with zero blockers and zero deviations from the frozen
+design. P5 specifically: the checkpoint contract (§10) was directly
+implementable against real JAX pytrees using plain `pickle` (verified,
+not assumed — see SMOKE_TRAINING_REPORT.md §14); the SS7.2 Actor-vs-
+Critic `policy_mask` scope extended cleanly from P4's rollout/GAE level
+into P5's update-loop level with no special-casing needed; `--resume`
+composed cleanly with `run_training`'s `global_env_step`/
+`ppo_update_step` starting-value parameters. No reward/hyperparameter/
+network change was made anywhere in P5 (per its explicit non-goals).
+The `info_before`/pre-step
 pattern required by §7.1 is directly supported by the existing
 `reset()`/`step()` API (both return `info` reflecting
 `merge_committed` state as of that call), and an equivalent pattern is
@@ -1112,35 +1346,13 @@ no spurious failures to diagnose.
 
 ## Next Exact Action
 
-**Begin P5 Smoke Training.** Per
-[PPO_PLAN.md §0.1/P5](PPO_PLAN.md#p5--smoke-training): verify the
-end-to-end training pipeline runs correctly on the real
-`MergeEnvironment` (not to obtain good PPO performance). Stage 1:
-deterministic 1-3 maneuvers from canonical TRAIN, a minimal number of
-updates, exercising every pipeline stage once (env reset, action
-sampling, action mapping, rollout, reward, GAE, PPO loss, parameter
-update/backprop, finite loss/gradients, checkpoint save/load/resume,
-W&B logging, no NaN/inf/crash/OOM). Stage 2 (only if Stage 1 succeeds):
-a somewhat larger deterministic subset and a few more updates, still
-bounded by pipeline-correctness, not performance. Wire the actual
-multi-epoch parameter-update loop into `src/training/trainer.py::run_training`
-(currently a `NotImplementedError` stub) — consuming P4's
-`build_training_batch` output directly, applying `ppo_epochs`/
-`num_minibatches` from `ppo_base.yaml`/`ppo_smoke.yaml`, and remember
-that any Actor-side loss/entropy/KL/clip-fraction computation inside
-the update loop must filter to `policy_mask == 1` rows of the batch
-(per §7.2 — `build_training_batch` does NOT do this filtering itself,
-only the masked advantage normalization). Exercise the full checkpoint
-save → load → resume → additional-update cycle per §10 (full state:
-policy/value params, optimizer state, JAX PRNG key, global env step,
-PPO update step, seed, config snapshot, reward version, git SHA — not
-just weights). Verify W&B metric + config logging (online-or-offline).
-Explicitly forbidden in P5: long full-TRAIN training, millions of
-steps, W&B-curve-based reward revision, hyperparameter tuning, a
-TRAIN/TUNE split, W&B sweeps, canonical VAL evaluation, FSM-vs-PPO
-comparison/conclusions. Completion criteria per §12: all P5 items
-hold, and state is left as **P5 COMPLETE — WAITING FOR USER TUNING**
-(the final state for this entire P0-P5 effort). Re-run the full
-regression suite, update PROGRESS.md/HANDOFF.md, append an
-EXPERIMENT_LOG.md entry, and make exactly one P5 commit on
-`feat/ppo-phase0-5`.
+**None — the entire P0-P5 effort is COMPLETE.** All items in
+[PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) hold (see
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the itemized
+evidence) and the state is **P5 COMPLETE — WAITING FOR USER TUNING**.
+There is no further automated PPO work queued in this effort. P6+
+(reward/hyperparameter tuning, a real TRAIN/TUNE split, longer
+training, canonical VAL evaluation, FSM-vs-PPO comparison) is reserved
+for the user to decide on and run manually after reviewing the P5
+smoke-training W&B results themselves — see
+[HANDOFF.md](HANDOFF.md)'s NEXT OWNER ACTION.
