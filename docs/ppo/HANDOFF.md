@@ -32,7 +32,8 @@ Unified branch-creation order (see also
 ## What's completed so far
 
 **P0 — Baseline Audit, P1 — PPO Foundation, P2 — Reward V0 + W&B
-Foundation, and P3 — Discrete PPO Core are all COMPLETE.**
+Foundation, P3 — Discrete PPO Core, and P4 — Rollout + GAE Integration
+are all COMPLETE.**
 Working on branch
 `feat/ppo-phase0-5` (already created and checked out at session start,
 carrying the approved plan docs from commit `aa8cf5b`).
@@ -273,13 +274,67 @@ failed, 0 skipped, 1802.23s (0:30:02), exit code 0, independently
 confirmed via `pytest tests/ --collect-only -q` -> "557 tests
 collected" (524 pre-existing + 33 net new P3 = 557, matching exactly).
 
+**P4 — Rollout + GAE Integration** then connected the real P3 PPO core
+to the real `MergeEnvironment` (`downstream_mode="frenet_mpc"`, SS2).
+`src/training/rollout.py::collect_episode_rollout` mirrors the exact
+pre-step `info_before["merge_committed"]` pattern P0 confirmed is
+already used by `full_split_evaluator.py::run_episode`:
+`is_policy_step = not info_before.get("merge_committed", False)` is
+computed from the PREVIOUS `reset()`/`step()` call's info, never the
+current step's own post-step info. On an auto-execution step, the PPO
+policy network is not called for action selection at all --
+`BehaviorAction.MERGE` is submitted directly. Every physical frame
+(regardless of `policy_mask`) becomes one `Transition` covering the
+fixed field set; reward comes from P2's `MergeRewardWrapper.compute`,
+fed the same pre-step `is_policy_step` flag plus the environment's own
+post-step `info["termination_reason"]` (SS5.1, never re-derived).
+`src/training/gae.py::compute_gae` implements standard backward-
+recursion GAE over the FULL physical trajectory
+(`gamma=0.99`/`gae_lambda=0.95`), correctly distinguishing true
+termination (no bootstrap) from truncation (does bootstrap from
+`next_value`); `normalize_advantages_masked`/`masked_mean_std` compute
+the Actor-side normalization mean/std using ONLY `policy_mask == 1`
+positions via boolean-mask indexing before the reduction (SS7.2) --
+structurally excluded, not merely down-weighted.
+`src/training/trainer.py::build_training_batch` wires rollout -> GAE
+-> masked normalization into one flat PPO-ready batch dict end to end;
+`run_training` (the actual multi-epoch update loop) correctly remains
+a `NotImplementedError` stub, per P4's explicit non-goal (P5 scope).
+
+Added 38 new P4 tests: `tests/training/test_gae.py` (11),
+`tests/training/test_rollout.py` (8), `tests/training/test_trainer.py`
+(3), plus `tests/training/test_imports.py` updated in place (still 6
+collected). **The single most important test in this Phase**,
+`test_prestep_merge_policy_mask_regression`, runs a scripted-MERGE
+policy against the real `MergeEnvironment` on a single-transition
+maneuver (`MAN_CAUSALITY`) and confirms the VERY FIRST transition (the
+decision frame where MERGE is selected) has `policy_mask == 1`, while
+every transition strictly after it (auto-execution) has
+`policy_mask == 0` -- directly guarding against SS7.1's reversed
+post-step bug. **PASSED.** The SS7.2 test D
+(`test_terminal_reward_propagates_to_merge_decision_frame`) confirms a
+real terminal SUCCESS/COLLISION reward's GAE credit propagates back
+through the intervening auto-execution frames to the MERGE decision
+frame's return. **PASSED.** `git diff --stat` against
+`src/environment/`, `src/planning/`, `src/control/`, `src/scenarios/`
+confirmed empty -- zero frozen files touched.
+
+Ran the new tests file-by-file, then `tests/training/ tests/policies/
+tests/rewards/` together (114 passed, 148.94s) as an intermediate
+check. Confirmed no other `pytest` process was running before the full
+suite. Ran the FULL existing regression suite and waited for the real
+process exit: **579 passed**, 0 failed, in 1920.04s (0:32:00), exit
+code 0, independently confirmed via `pytest tests/ --collect-only -q`
+-> "579 tests collected" (557 pre-existing + 22 net new P4 = 579,
+matching exactly: 11 gae + 8 rollout + 3 trainer = 22).
+
 ## Last successful test
 
-`pytest tests/ -q` (after P3, clean solo run — no concurrent-pytest
-contention) -> **557 passed**, 0 failed, 0 skipped, 1802.23s (0:30:02)
-— waited for real process completion, verified directly against the
-log file's final summary line (`557 passed in 1802.23s (0:30:02)`,
-100% dots, no `F`/`E` marks).
+`pytest tests/ -q` (after P4, clean solo run — no concurrent-pytest
+contention) -> **579 passed**, 0 failed, 1920.04s (0:32:00) — waited
+for real process completion, verified directly against the log file's
+final summary line (`579 passed in 1920.04s (0:32:00)`, 100% dots, no
+`F`/`E` marks).
 
 ## Failed tests
 
@@ -288,7 +343,7 @@ None.
 ## Problems found
 
 None. No contradiction found between PPO_PLAN.md and the current
-codebase in P0, P1, P2, or P3.
+codebase in P0, P1, P2, P3, or P4.
 
 ## Recent commits (PPO-related)
 
@@ -299,9 +354,11 @@ codebase in P0, P1, P2, or P3.
   completion)
 - `565a7fe` — `feat(ppo): implement Reward V0 and W&B logging
   foundation (P2)` (P2 completion)
-- P3 completion commit: see `git log` on `feat/ppo-phase0-5` for the
-  exact SHA (`feat(ppo): implement discrete PPO core (P3)`) —
-  committed immediately after this HANDOFF.md update.
+- `334e4c6` — `feat(ppo): implement discrete PPO core (P3)` (P3
+  completion)
+- P4 completion commit: see `git log` on `feat/ppo-phase0-5` for the
+  exact SHA (`feat(ppo): implement rollout and GAE integration (P4)`)
+  — committed immediately after this HANDOFF.md update.
 
 ## Running processes
 
@@ -314,56 +371,65 @@ None yet (P1 only defines the `CheckpointPayload` contract + a pickle
 exercises the full save→load→resume→update cycle against real
 policy/value params and optimizer state). P3 built the real
 `PPOTrainingState`/`PPOTrainState` structures that will populate that
-contract's `policy_params`/`value_params`/`optimizer_state` fields
-once P4/P5 wire in real rollouts, but did not itself touch checkpoint
-code.
+contract's `policy_params`/`value_params`/`optimizer_state` fields;
+P4 built the real rollout/GAE/batch-building pipeline that will feed
+the P5 update loop, but did not itself touch checkpoint code.
 
 ## Next command to run
 
-Begin P4 per [PROGRESS.md § Next Exact Action](PROGRESS.md#next-exact-action):
-implement `src/training/rollout.py::collect_rollout` and
-`src/training/gae.py::compute_gae`/`normalize_advantages_masked`
-against the real `MergeEnvironment`, wiring in the now-real P3 PPO
-core. Add the required P4 tests (handcrafted GAE, terminal
-bootstrap/truncation handling, masked advantage normalization, rollout
-shape consistency, no NaN/inf, a real 1-episode rollout, the pre-step
-MERGE `policy_mask` regression per §7.1, Actor-mask invariance tests A
-and B, terminal reward propagation test D, and the §11 action-mapping
-regression), re-run the full regression suite, then commit.
+Begin P5 per [PROGRESS.md § Next Exact Action](PROGRESS.md#next-exact-action):
+wire the actual multi-epoch parameter-update loop into
+`src/training/trainer.py::run_training` (currently a
+`NotImplementedError` stub), consuming P4's `build_training_batch`
+output. Verify env reset, action sampling/mapping, rollout, reward,
+GAE, PPO loss (filtering to `policy_mask == 1` for every Actor-side
+quantity per §7.2 -- `build_training_batch` does not do this
+filtering itself), parameter update/backprop, finite loss/gradients,
+checkpoint save/load/resume (full §10 contract), and W&B logging, all
+on a small deterministic TRAIN-subset "smoke" run (Stage 1: 1-3
+maneuvers, minimal updates; Stage 2 only if Stage 1 succeeds). No
+long/full-TRAIN run, no TUNE split, no sweeps, no VAL evaluation, no
+FSM-vs-PPO comparison. Re-run the full regression suite, update
+PROGRESS.md/HANDOFF.md, append an EXPERIMENT_LOG.md entry, then make
+exactly one P5 commit -- the final commit of this entire P0-P5 effort.
 
 ## Next file to modify
 
-`src/training/rollout.py` (P4's first task — real rollout collection
-against `MergeEnvironment`, replacing its P1 `NotImplementedError`
-skeleton).
+`src/training/trainer.py::run_training` (P5's core task — the real
+multi-epoch update loop, replacing its current `NotImplementedError`
+stub; consumes `build_training_batch`'s P4 output directly).
 
 ---
 
 ## NEXT OWNER ACTION
 
-**P0, P1, P2, and P3 are all complete.** Begin **Phase P4 — Rollout +
-GAE Integration** per
-[PPO_PLAN.md §0.1/P4](PPO_PLAN.md#p4--rollout--gae-integration). Do
-not skip ahead to P5. P4 connects the now-real P3 PPO core to the real
-`MergeEnvironment`: `policy_mask` MUST be decided **before**
-`env.step()` from the pre-step `info_before["merge_committed"]` value
-(§7.1) — never from post-step `info`. GAE uses the full physical
-trajectory; Actor-side statistics (policy loss, entropy, approx-KL,
-clip-fraction, advantage-normalization mean/std) exclude
-`policy_mask == 0` frames (§7.2). Preserve the fixed §11 action-index
--> `BehaviorAction` mapping (`0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`)
-exactly as already established and re-tested in P1/P3.
+**P0, P1, P2, P3, and P4 are all complete.** Begin **Phase P5 — Smoke
+Training** per
+[PPO_PLAN.md §0.1/P5](PPO_PLAN.md#p5--smoke-training). This is the
+FINAL Phase of the entire P0-P5 effort. P5 wires the actual PPO
+parameter-update loop (`trainer.py::run_training`) on top of P4's
+real rollout -> GAE -> masked-normalized batch pipeline
+(`build_training_batch`), verified against the real `MergeEnvironment`
+on a small deterministic TRAIN subset -- pipeline correctness, not
+performance, is the goal (§0.1/P5's explicit non-goals: no long
+training, no millions of steps, no reward-curve tuning, no
+hyperparameter tuning, no TRAIN/TUNE split, no W&B sweeps, no VAL
+evaluation, no FSM-vs-PPO comparison). Exercise the full checkpoint
+save→load→resume→additional-update cycle per §10 (full state, not
+just weights). When P5 succeeds, the state becomes **P5 COMPLETE —
+WAITING FOR USER TUNING** and this entire P0-P5 effort is done; P6+ is
+reserved for the user to run manually.
 
-**Fixed constraint for the rest of this entire P0–P5 effort (applies
-to every remaining Phase): exactly ONE commit per Phase.** No
-intermediate "-A"/"-B", sub-stage, or WIP commits within a Phase. Do
-all of a Phase's implementation, its required tests, and its doc
-updates first, and only commit once, at the very end of that Phase,
-with everything for that Phase staged together in a single commit. P0,
-P1, P2, and P3 already followed this rule (`chore(ppo): audit frozen
+**Fixed constraint (already applied to every prior Phase): exactly
+ONE commit per Phase.** No intermediate "-A"/"-B", sub-stage, or WIP
+commits within a Phase. Do all of P5's implementation, its required
+tests, and its doc updates first, and only commit once, at the very
+end, with everything staged together in a single commit. P0, P1, P2,
+P3, and P4 already followed this rule (`chore(ppo): audit frozen
 training baseline`, `feat(ppo): add PPO foundation scaffolding (P1)`,
 `feat(ppo): implement Reward V0 and W&B logging foundation (P2)`,
-`feat(ppo): implement discrete PPO core (P3)`). P4 and P5 must each
-get exactly one commit the same way — two more commits total across
-the rest of the effort, on top of the pre-existing `aa8cf5b` docs
-commit and the four already-landed P0/P1/P2/P3 commits.
+`feat(ppo): implement discrete PPO core (P3)`,
+`feat(ppo): implement rollout and GAE integration (P4)`). P5 must get
+exactly one commit the same way — the final commit of this effort, on
+top of the pre-existing `aa8cf5b` docs commit and the five
+already-landed P0/P1/P2/P3/P4 commits.

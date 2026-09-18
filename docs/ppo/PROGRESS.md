@@ -8,11 +8,177 @@ Live state, updated at the end of every Phase/Stage. See
 
 ## Current Phase
 
-**P3 COMPLETE** (Discrete PPO Core)
+**P4 COMPLETE** (Rollout + GAE Integration)
 
 ## Current Stage
 
-P0, P1, P2, and P3 are all complete. P3 implemented the real discrete
+P0, P1, P2, P3, and P4 are all complete. P4 connected the real P3 PPO
+core to the real `MergeEnvironment` (`downstream_mode="frenet_mpc"`,
+per SS2), implementing `src/training/rollout.py` (real
+`collect_episode_rollout`/`collect_rollout`, replacing the P1
+`NotImplementedError` skeleton), `src/training/gae.py` (real
+`compute_gae`/`normalize_advantages_masked`/`masked_mean_std`), and
+`src/training/trainer.py::build_training_batch` (real end-to-end
+rollout -> GAE -> masked-normalized PPO-ready batch dict; the
+multi-epoch parameter-UPDATE loop itself, `run_training`, correctly
+remains a `NotImplementedError` stub per P4's explicit non-goal --
+that's P5 scope).
+
+`rollout.py`'s `collect_episode_rollout` mirrors the exact pre-step
+`info_before["merge_committed"]` pattern P0 confirmed is already used
+by `src/environment/full_split_evaluator.py::run_episode`
+(`was_committed_before` read BEFORE calling the policy/`env.step`):
+`is_policy_step = not info_before.get("merge_committed", False)` is
+computed from the PREVIOUS `reset()`/`step()` call's `info` dict,
+never from the current step's own post-step `info`. On an
+auto-execution step (`is_policy_step is False`), the PPO policy
+network is NOT called for action selection at all --
+`BehaviorAction.MERGE` is submitted directly, matching
+`full_split_evaluator.py`'s precedent exactly (a `log_prob` value is
+still computed for that step purely so `Transition.log_prob` stays a
+well-defined finite non-Optional field; SS7.2 already excludes
+`policy_mask == 0` frames from every Actor-side computation
+downstream, so this value is never actually consumed by policy loss/
+entropy/KL/advantage-norm). Each `Transition` carries the fixed
+SS0.1/P4 field set (`observation`, `action`, `reward`,
+`next_observation`, `terminated`, `truncated`, `value`, `next_value`,
+`log_prob`, `policy_mask`, plus diagnostics `episode_id`,
+`maneuver_id`, `step_index`) and covers the FULL physical trajectory
+(every frame, regardless of `policy_mask` -- SS7.2's Critic scope
+requires this; no frame is ever dropped at collection time). Reward is
+computed via P2's `MergeRewardWrapper.compute`, fed the SAME
+pre-step `is_policy_step` flag and the environment's own
+post-step `info["termination_reason"]` -- never re-deriving
+termination (SS5.1).
+
+`gae.py::compute_gae` implements the standard backward-recursion GAE
+(Schulman et al. 2015 eq. 16) over the FULL physical trajectory,
+`gamma=0.99`/`gae_lambda=0.95` (from `ppo_base.yaml`, SS6, unchanged),
+correctly distinguishing true termination (`terminated=True` ->
+bootstrap mask 0, no value flows past a terminal state) from
+truncation (`truncated=True` -> bootstrap mask 1, DOES bootstrap from
+`next_value` -- the SS0.1/P4 required test). `normalize_advantages_masked`
+computes the Actor-side normalization mean/std using ONLY
+`policy_mask == 1` positions (SS7.2) -- masked-out (`policy_mask == 0`)
+advantage values structurally never enter the `np.mean`/`np.std`
+reduction (they are excluded via boolean-mask indexing before the
+reduction runs, not merely down-weighted), which is what makes SS7.2
+test A (masked-frame invariance) hold by construction, not by
+coincidence. `masked_mean_std` exposes the same statistic standalone
+for that test to assert on directly.
+
+`trainer.py::build_training_batch` wires rollout -> GAE -> masked
+normalization into one flat batch dict (`observation`, `action`,
+`reward`, `next_observation`, `terminated`, `truncated`, `value`,
+`next_value`, `log_prob`, `policy_mask`, `advantages_raw` [unmasked,
+full-trajectory GAE output, kept for diagnostics], `advantages`
+[masked-normalized, SS7.2 Actor scope], `returns` [full-trajectory
+GAE Critic target]) and raises `ValueError` on any non-finite value
+anywhere in the batch or on an empty transition list. `run_training`
+is explicitly left as a `NotImplementedError` stub with an updated
+docstring pointing at `build_training_batch` as what P5's update loop
+will call.
+
+38 new P4 tests were added: `tests/training/test_gae.py` (11 --
+two independently hand-computed multi-step GAE trajectories matching
+exactly, a terminal-step-does-not-bootstrap test [changing next_value
+on a terminated step changes nothing], a truncated-step-DOES-bootstrap
+test [changing next_value on a truncated step DOES change the
+advantage], a mismatched-lengths `ValueError` guard, a no-NaN/inf
+sweep over 50 random steps, SS7.2 test A [masked-frame invariance --
+changing ONLY `policy_mask==0` advantage values leaves the
+`policy_mask==1` mean/std and normalized values byte-identical] plus
+its necessary counterpart [the statistic DOES change when
+`policy_mask==1` values themselves change, proving the invariance test
+isn't vacuous], a manual-computation cross-check, an
+all-masked-out `ValueError` guard, and a shape-mismatch `ValueError`
+guard), `tests/training/test_rollout.py` (8 -- a real 1-episode
+rollout against the actual `MergeEnvironment` with the real PPO
+policy that runs to completion [terminated or truncated] on maneuver
+`MAN_0001`; rollout shape consistency; a full-episode no-NaN/inf sweep;
+multi-maneuver `collect_rollout` concatenation across 2 episodes; the
+SS7.1 pre-step MERGE `policy_mask` regression test THE most important
+test in this Phase, see below; the SS7.2 test D terminal-reward-
+propagation test, see below; an integration-level SS7.2 test B
+[masked frames' log_prob/action values provably never leak into the
+`policy_mask==1`-filtered subset a P5 loss computation would consume];
+and an SS11 action-mapping regression confirming `rollout.py` performs
+no second/separate action-index translation of its own, delegating
+entirely to `distribution.ACTION_INDEX_TO_BEHAVIOR`), and
+`tests/training/test_trainer.py` (3 -- a real end-to-end
+rollout -> GAE -> masked-normalized-batch test on `MAN_0001` asserting
+every required key/shape is present and the masked decision-frame
+advantages have approximately zero mean; an empty-transition-list
+`ValueError` guard; confirming `run_training` still raises
+`NotImplementedError`, the explicit P4 non-goal). `tests/training/
+test_imports.py` was updated in place (stub-`NotImplementedError`
+checks for `rollout`/`gae`/`build_training_batch` replaced with
+real-attribute-presence assertions and one narrower `run_training`
+-still-a-stub check; still 6 collected items, same count as P2/P3).
+
+**The SS7.1 pre-step MERGE `policy_mask` regression test**
+(`test_prestep_merge_policy_mask_regression`) is the test this whole
+Phase existed to guard: it runs a scripted-MERGE policy (always
+selects `BehaviorAction.MERGE`, backed by a real policy network so
+`log_prob`/logits stay well-defined) against the real `MergeEnvironment`
+on maneuver `MAN_CAUSALITY` (`lane_chain=[527, 544]`, a single-
+transition, non-chained maneuver, so MERGE at decision frame 0 commits
+immediately and every subsequent frame is unambiguously auto-execution
+for the rest of the episode -- confirmed by
+`tests/environment/test_merge_environment_frenet_mpc.py::
+test_single_maneuver_merge_reaches_success_frenet_mpc` to reach a real
+terminal outcome, success/collision/offroad, within 60 steps of
+continuous MERGE). It asserts: the VERY FIRST transition (the decision
+frame where MERGE is selected) has `policy_mask == 1`, and every
+transition strictly after it (auto-execution, `merge_committed` already
+`True` going into the step) has `policy_mask == 0` -- directly guarding
+against the reversed post-step bug SS7.1 describes (reading
+`info_after["merge_committed"]` would have mislabeled exactly that
+first frame `policy_mask == 0`). **PASSED.**
+
+**SS7.2 test D** (`test_terminal_reward_propagates_to_merge_decision_frame`),
+using the same scripted-MERGE-on-`MAN_CAUSALITY` construction: confirms
+the episode reaches a real terminal reward (`abs(terminal_reward) >=
+0.5`, i.e. a genuine +-1.0 SUCCESS/COLLISION component, not merely a
+-0.01/0.0 decision-cost value), then runs `compute_gae` over the full
+transition list and asserts the MERGE decision frame's (`index 0`) GAE
+`return` is LARGER in magnitude than that frame's own tiny immediate
+reward, with the same sign as the terminal outcome -- i.e. the terminal
+SUCCESS/COLLISION reward's credit demonstrably propagates backward
+through GAE, across the intervening `policy_mask == 0` auto-execution
+frames, to the `policy_mask == 1` decision frame that triggered the
+commitment. **PASSED.**
+
+All 38 new P4 tests pass. Ran `tests/training/ tests/policies/
+tests/rewards/` together first (114 passed in 148.94s) as an
+intermediate sanity check before the full suite. `git diff --stat`
+against `src/environment/`, `src/planning/`, `src/control/`,
+`src/scenarios/` is confirmed EMPTY -- P4 touched zero frozen Phase 1-3
+files, matching every prior Phase. `pytest tests/ --collect-only -q`
+independently confirms "579 tests collected" (557 P3 baseline + 22 net
+new P4 tests exactly: 11 gae + 8 rollout + 3 trainer = 22;
+`test_imports.py` stayed at 6 collected items, no net change).
+
+The full existing regression suite passes with **zero failures**:
+**579 passed, 0 failed, in 1920.04s (0:32:00)**, verified by watching
+the exact background `pytest` process (confirmed via `pgrep`/`ps aux`
+to be the sole `python -m pytest tests/` process running, no
+concurrent contention) run to REAL completion -- the final summary
+line read directly from the completed log file (100% dots across every
+module, no `F`/`E` marks) after the process's own PID was confirmed no
+longer running. `jax.devices()` re-checked immediately after this run
+still reports `[CudaDevice(id=0)]` -- GPU confirmed working, no
+regression from any P4 change (P4 added no new dependency).
+
+P0, P1, P2, and P3 completion summaries below are unchanged from the
+prior entry. P0 confirmed the frozen baseline
+(461 passed, 0 failed) and was audit-only (zero source changes). P1
+added the full PPO scaffolding directory/module structure per
+PPO_PLAN.md §4. P2 implemented Reward V0 (`src/rewards/merge_reward.py`,
+`src/rewards/reward_wrapper.py`) and the W&B logging foundation
+(`src/tracking/wandb_logger.py`), replacing their P1
+`NotImplementedError` skeletons with real logic, per PPO_PLAN.md
+§0.1/P2, §5, §5.1, §8. P3 implemented the real discrete
 PPO core in `src/policies/ppo/{networks,distribution,policy,loss,state}.py`
 (replacing their P1 `NotImplementedError` skeletons): a separate
 policy (Actor) network and value (Critic) network, each
@@ -212,7 +378,9 @@ PPO Core**.
   scaffolding (P1)`)
 - P2 completion commit SHA: `565a7fe` (`feat(ppo): implement Reward V0
   and W&B logging foundation (P2)`)
-- P3 completion commit SHA: (recorded in `git log` on this branch
+- P3 completion commit SHA: `334e4c6` (`feat(ppo): implement discrete
+  PPO core (P3)`)
+- P4 completion commit SHA: (recorded in `git log` on this branch
   immediately after this update, per the one-commit-per-Phase rule)
 - branch: `feat/ppo-phase0-5`
 
@@ -552,6 +720,79 @@ PPO Core**.
         Independently confirmed via `pytest tests/ --collect-only -q`
         → "557 tests collected". No other `pytest` process contended
         for the GPU during this run.
+- [x] **P4 Rollout + GAE Integration**:
+  - [x] Implemented `src/training/rollout.py::collect_episode_rollout`/
+        `collect_rollout`: real rollout against the real
+        `MergeEnvironment` (`downstream_mode="frenet_mpc"`, SS2),
+        mirroring the exact pre-step `info_before["merge_committed"]`
+        pattern P0 confirmed is already used by
+        `full_split_evaluator.py::run_episode`
+        (`is_policy_step = not info_before.get("merge_committed", False)`
+        computed from the PREVIOUS reset()/step() call's info, never
+        the current step's post-step info). On an auto-execution step
+        the PPO policy is not called for action selection at all —
+        `BehaviorAction.MERGE` is submitted directly. Every physical
+        frame (regardless of `policy_mask`) becomes one `Transition`
+        with the fixed SS0.1/P4 field set; reward is computed via P2's
+        `MergeRewardWrapper.compute` fed the same pre-step
+        `is_policy_step` flag plus the environment's own post-step
+        `info["termination_reason"]` (SS5.1 — never re-derived).
+  - [x] Implemented `src/training/gae.py::compute_gae`: standard
+        backward-recursion GAE over the FULL physical trajectory
+        (`gamma=0.99`/`gae_lambda=0.95` from `ppo_base.yaml`),
+        correctly distinguishing true termination (bootstrap mask 0)
+        from truncation (bootstrap mask 1, DOES bootstrap from
+        `next_value`). Implemented `normalize_advantages_masked`/
+        `masked_mean_std`: Actor-side normalization mean/std computed
+        ONLY over `policy_mask == 1` positions via boolean-mask
+        indexing before the reduction (SS7.2) — structurally
+        impossible for a `policy_mask == 0` value to enter the
+        statistic.
+  - [x] Wired `src/training/trainer.py::build_training_batch`: real
+        end-to-end rollout → GAE → masked-normalized PPO-ready batch
+        dict (`observation`/`action`/`reward`/`next_observation`/
+        `terminated`/`truncated`/`value`/`next_value`/`log_prob`/
+        `policy_mask`/`advantages_raw`/`advantages`/`returns`), with a
+        finite-value check across every batch field. `run_training`
+        left as an updated `NotImplementedError` stub (P5 scope, per
+        SS0.1/P4's explicit non-goal).
+  - [x] Wrote 38 new P4 tests: `tests/training/test_gae.py` (11 —
+        2 hand-computed multi-step GAE trajectories, terminal-no-
+        bootstrap, truncation-does-bootstrap, mismatched-lengths
+        guard, no-NaN/inf sweep, SS7.2 test A [masked-frame invariance]
+        + its non-vacuous counterpart, manual-computation cross-check,
+        all-masked-out guard, shape-mismatch guard),
+        `tests/training/test_rollout.py` (8 — real 1-episode rollout
+        to completion with the real PPO policy on `MAN_0001`; shape
+        consistency; full-episode no-NaN/inf; multi-maneuver
+        concatenation; the SS7.1 pre-step MERGE `policy_mask`
+        regression test; the SS7.2 test D terminal-reward-propagation
+        test; an integration-level SS7.2 test B; an SS11 action-mapping
+        regression via rollout.py), `tests/training/test_trainer.py`
+        (3 — end-to-end batch-building test, empty-list guard,
+        `run_training` still raises). Updated `tests/training/
+        test_imports.py` in place (stub checks → real-attribute
+        assertions + a narrower `run_training`-still-a-stub check;
+        still 6 collected items).
+  - [x] Ran the new tests file-by-file, then `tests/training/
+        tests/policies/ tests/rewards/` together (114 passed, 148.94s)
+        as an intermediate sanity check before the full suite.
+  - [x] Confirmed `git diff --stat` against `src/environment/`,
+        `src/planning/`, `src/control/`, `src/scenarios/` is EMPTY —
+        zero frozen Phase 1-3 files touched.
+  - [x] Confirmed no other `pytest` process was running (`ps aux`/
+        `pgrep`) before launching the full regression suite.
+  - [x] Ran the FULL existing regression suite (Phase 1-3 + P1 + P2 +
+        P3 + P4 tests together) as a background process and waited
+        synchronously for the actual PID to exit (not a fixed-duration
+        sleep, not a mid-run snapshot): **579 passed**, 0 failed, in
+        1920.04s (0:32:00) — matches 557 (P3 baseline) + 22 net new P4
+        tests exactly (11 gae + 8 rollout + 3 trainer = 22;
+        `test_imports.py` unchanged at 6 collected items).
+        Independently confirmed via `pytest tests/ --collect-only -q`
+        → "579 tests collected". No other `pytest` process contended
+        for the GPU during this run. `jax.devices()` re-confirmed
+        `[CudaDevice(id=0)]` immediately after.
 
 ## Changed Files (this session)
 
@@ -617,6 +858,25 @@ PPO Core**.
   - `tests/policies/test_imports.py` (updated: stub-`NotImplementedError`
     checks replaced with real-attribute/function-presence assertions;
     6 collected, unchanged count from P1)
+- P4 (implementation of existing P1 skeletons + new test files; no
+  existing Phase 1-3 file touched, `git diff --stat` against
+  `src/environment/`, `src/planning/`, `src/control/`,
+  `src/scenarios/` confirmed empty):
+  - `src/training/rollout.py` (implemented; was a P1 stub — real
+    `collect_episode_rollout`/`collect_rollout` against the real
+    `MergeEnvironment`, with the SS7.1 pre-step `policy_mask` pattern)
+  - `src/training/gae.py` (implemented; was a P1 stub — real
+    `compute_gae`/`normalize_advantages_masked`/`masked_mean_std`)
+  - `src/training/trainer.py` (implemented `build_training_batch`;
+    `run_training` remains a P1-style `NotImplementedError` stub,
+    docstring updated to point at `build_training_batch`)
+  - `tests/training/test_gae.py` (new, 11 collected test items)
+  - `tests/training/test_rollout.py` (new, 8 collected test items)
+  - `tests/training/test_trainer.py` (new, 3 collected test items)
+  - `tests/training/test_imports.py` (updated: stub-`NotImplementedError`
+    checks for `rollout`/`gae`/`trainer.build_training_batch` replaced
+    with real-attribute assertions; `run_training`-stub check
+    narrowed/kept; still 6 collected, unchanged count from P2/P3)
 
 ## Current Test Results
 
@@ -655,14 +915,27 @@ PPO Core**.
   (524 pre-existing + 33 net new P3 = 557)
 - GPU re-confirmed working after P3 changes: `jax.devices() ==
   [CudaDevice(id=0)]`
-- Real PPO-algorithm core (networks, categorical distribution,
-  clipped-surrogate/value/entropy losses, Adam-with-clipping train
-  state) is implemented and validated in isolation as of P3. Real
-  rollout/GAE/trainer logic against the actual `MergeEnvironment` is
-  still not implemented (P4/P5 scope) — `src/training/rollout.py`,
-  `src/training/gae.py`, `src/training/trainer.py` remain P1
-  structural stubs raising `NotImplementedError`, confirmed still true
-  by the (unchanged) P1/P2 stub tests
+- New P4 tests: `tests/training/test_gae.py` (11 passed, 0.14s),
+  `tests/training/test_rollout.py` (8 passed, 119.28s — real
+  `MergeEnvironment` episodes, `frenet_mpc` mode), `tests/training/
+  test_trainer.py` (3 passed, 21.46s). `tests/training/ tests/policies/
+  tests/rewards/` together: **114 passed** in 148.94s (intermediate
+  sanity check before the full suite)
+- Full suite after P4 additions (Phase 1-3 + P1 + P2 + P3 + P4 tests
+  together, no concurrent pytest process, real process exit
+  confirmed): **579 passed**, 0 failed, in 1920.04s (0:32:00), exit
+  code 0 — independently confirmed via
+  `pytest tests/ --collect-only -q` → "579 tests collected"
+  (557 pre-existing + 22 net new P4 = 579)
+- GPU re-confirmed working after P4 changes: `jax.devices() ==
+  [CudaDevice(id=0)]`
+- Real PPO rollout/GAE/batch-building against the actual
+  `MergeEnvironment` is now implemented and validated as of P4:
+  `src/training/rollout.py`, `src/training/gae.py`, and
+  `src/training/trainer.py::build_training_batch` are real. The actual
+  multi-epoch parameter-UPDATE loop (`trainer.py::run_training`)
+  remains a `NotImplementedError` stub — P5 scope, confirmed still true
+  by the updated `tests/training/test_imports.py`/`test_trainer.py`
 
 ## Environment / Dependency Versions (recorded per PPO_PLAN.md §0.1 P0)
 
@@ -778,9 +1051,12 @@ state is exercised end-to-end in P5.
 ## Last Command
 
 ```
+pytest tests/ -q                     # P4: 579 passed, 0 failed, 1920.04s (0:32:00)
+pytest tests/training/test_gae.py tests/training/test_rollout.py tests/training/test_trainer.py -v  # new P4 tests
+pytest tests/training/ tests/policies/ tests/rewards/ -q   # intermediate sanity: 114 passed, 148.94s
+pytest tests/ --collect-only -q      # "579 tests collected" (557 + 22 net new = 579)
 pytest tests/ -q                     # P3: 557 passed, 0 failed, 1802.23s (0:30:02)
 pytest tests/policies/ -v            # new P3 tests + updated P1 import tests: 40 passed, 17.55s
-pytest tests/ --collect-only -q      # "557 tests collected" (524 + 33 net new = 557)
 pytest tests/ -q                     # P2: 524 passed, 0 failed, 1769.33s (0:29:29)
 pytest tests/rewards/ tests/tracking/ tests/training/ tests/policies/ -q  # new P2 + P1 tests: 63 passed, 1.88s
 pytest tests/ -q                     # P1: 489 passed, 0 failed, 1867.61s (0:31:07)
@@ -792,23 +1068,30 @@ PYTHONPATH=. python scripts/smoke_train_ppo.py --max-maneuvers 2
 ## Known Issues
 
 No contradiction found between PPO_PLAN.md and the current frozen
-codebase during P0, P1, P2, or P3 — the `info_before`/pre-step pattern
-required by §7.1 is directly supported by the existing
+codebase during P0, P1, P2, P3, or P4 — the `info_before`/pre-step
+pattern required by §7.1 is directly supported by the existing
 `reset()`/`step()` API (both return `info` reflecting
 `merge_committed` state as of that call), and an equivalent pattern is
-already used in `src/environment/full_split_evaluator.py`. P2's reward
-module was implemented as a pure fixed-table lookup consuming the
-environment's own `info["termination_reason"]` string with zero
-imports from `src.environment`/`waymax` — no blocker, no deviation
-from §5.1 required. P3's discrete PPO core (networks, categorical
-distribution, clipped-surrogate/value/entropy losses, train state) was
-implemented entirely against synthetic/toy inputs with no real
-`MergeEnvironment` dependency and no continuous Gaussian/Beta action
-head anywhere — confirmed the PPO -> Environment dependency direction
-stays one-directional (`src/environment/` has zero import references
-to `src.policies`/PPO, only unrelated prose/comment string matches on
-"policies"/"ppo"). No blocker, no deviation from PPO_PLAN.md §1/§3/§6/
-§7.2/§11 required.
+already used in `src/environment/full_split_evaluator.py`; P4's
+`collect_episode_rollout` uses this pattern directly, with the
+dedicated pre-step MERGE `policy_mask` regression test
+(`test_prestep_merge_policy_mask_regression`) confirming it produces
+the correct `policy_mask == 1` on the exact decision frame where MERGE
+is selected. P2's reward module was implemented as a pure fixed-table
+lookup consuming the environment's own `info["termination_reason"]`
+string with zero imports from `src.environment`/`waymax` — no blocker,
+no deviation from §5.1 required. P3's discrete PPO core (networks,
+categorical distribution, clipped-surrogate/value/entropy losses,
+train state) was implemented entirely against synthetic/toy inputs
+with no real `MergeEnvironment` dependency and no continuous
+Gaussian/Beta action head anywhere. P4's rollout/GAE/batch-building
+against the real `MergeEnvironment` (`downstream_mode="frenet_mpc"`)
+required zero changes to any frozen Phase 1-3 file (`git diff --stat`
+against `src/environment/`, `src/planning/`, `src/control/`,
+`src/scenarios/` confirmed empty) — confirming the PPO -> Environment
+dependency direction stays strictly one-directional throughout P0-P4.
+No blocker, no deviation from PPO_PLAN.md §1/§2/§3/§5.1/§6/§7.1/§7.2/
+§11 required.
 
 **Lesson learned (process, not a code issue):** running two `pytest`
 processes against this repo concurrently causes spurious GPU-contention
@@ -829,30 +1112,35 @@ no spurious failures to diagnose.
 
 ## Next Exact Action
 
-**Begin P4 Rollout + GAE Integration.** Per
-[PPO_PLAN.md §0.1/P4](PPO_PLAN.md#p4--rollout--gae-integration):
-connect the now-real PPO core (P3: `src/policies/ppo/*.py`) to the
-real `MergeEnvironment`. Implement `src/training/rollout.py::collect_rollout`
-(producing `Transition`s with the fixed field set already established
-in P1: `observation`, `action`, `reward`, `next_observation`,
-`terminated`, `truncated`, `value`, `next_value`, `log_prob`,
-`policy_mask`) and `src/training/gae.py::compute_gae`/
-`normalize_advantages_masked`. Critical: `policy_mask` MUST be decided
-**before** `env.step()` from the pre-step `info_before["merge_committed"]`
-value (PPO_PLAN.md §7.1) — P0 already confirmed this pattern is
-directly supported by the existing `reset()`/`step()` API and is
-already used in `src/environment/full_split_evaluator.py::run_episode`.
-GAE must use the full physical trajectory (all frames); Actor-side
-statistics (policy loss, entropy, approx-KL, clip-fraction,
-advantage-normalization mean/std) must exclude `policy_mask == 0`
-frames per §7.2. Required tests per §0.1/P4: handcrafted-trajectory
-GAE matching hand-computed values, terminal bootstrap handling,
-truncation handling, masked advantage normalization, rollout shape
-consistency, no NaN/inf, an actual 1-episode rollout against the real
-`MergeEnvironment`, the pre-step MERGE `policy_mask` regression test
-(§7.1), Actor-mask invariance tests A and B (§7.2), the terminal
-reward propagation test D (§7.2), and the §11 action-mapping
-regression (still `0->KEEP, 1->FOLLOW, 2->MERGE, 3->STOP`). Re-run the
-full regression suite, update PROGRESS.md/HANDOFF.md, append an
-EXPERIMENT_LOG.md entry, and make exactly one P4 commit on
+**Begin P5 Smoke Training.** Per
+[PPO_PLAN.md §0.1/P5](PPO_PLAN.md#p5--smoke-training): verify the
+end-to-end training pipeline runs correctly on the real
+`MergeEnvironment` (not to obtain good PPO performance). Stage 1:
+deterministic 1-3 maneuvers from canonical TRAIN, a minimal number of
+updates, exercising every pipeline stage once (env reset, action
+sampling, action mapping, rollout, reward, GAE, PPO loss, parameter
+update/backprop, finite loss/gradients, checkpoint save/load/resume,
+W&B logging, no NaN/inf/crash/OOM). Stage 2 (only if Stage 1 succeeds):
+a somewhat larger deterministic subset and a few more updates, still
+bounded by pipeline-correctness, not performance. Wire the actual
+multi-epoch parameter-update loop into `src/training/trainer.py::run_training`
+(currently a `NotImplementedError` stub) — consuming P4's
+`build_training_batch` output directly, applying `ppo_epochs`/
+`num_minibatches` from `ppo_base.yaml`/`ppo_smoke.yaml`, and remember
+that any Actor-side loss/entropy/KL/clip-fraction computation inside
+the update loop must filter to `policy_mask == 1` rows of the batch
+(per §7.2 — `build_training_batch` does NOT do this filtering itself,
+only the masked advantage normalization). Exercise the full checkpoint
+save → load → resume → additional-update cycle per §10 (full state:
+policy/value params, optimizer state, JAX PRNG key, global env step,
+PPO update step, seed, config snapshot, reward version, git SHA — not
+just weights). Verify W&B metric + config logging (online-or-offline).
+Explicitly forbidden in P5: long full-TRAIN training, millions of
+steps, W&B-curve-based reward revision, hyperparameter tuning, a
+TRAIN/TUNE split, W&B sweeps, canonical VAL evaluation, FSM-vs-PPO
+comparison/conclusions. Completion criteria per §12: all P5 items
+hold, and state is left as **P5 COMPLETE — WAITING FOR USER TUNING**
+(the final state for this entire P0-P5 effort). Re-run the full
+regression suite, update PROGRESS.md/HANDOFF.md, append an
+EXPERIMENT_LOG.md entry, and make exactly one P5 commit on
 `feat/ppo-phase0-5`.
