@@ -62,6 +62,7 @@ import numpy as np
 from src.environment.behavior_action import BehaviorAction
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
 from src.policies.ppo import distribution
+from src.policies.ppo.networks import NUM_ACTIONS
 from src.policies.ppo.policy import PPOPolicy
 from src.rewards.reward_wrapper import MergeRewardWrapper
 from src.training.config import RewardConfig
@@ -84,7 +85,63 @@ REQUIRED_TRANSITION_FIELDS = (
 @dataclasses.dataclass(frozen=True)
 class Transition:
     """One rollout transition. Optional diagnostic fields default to
-    ``None`` so P4 can populate them without breaking this contract."""
+    ``None`` so P4 can populate them without breaking this contract.
+
+    Pre-P6 hardening (Fix 1/Fix 2) additive diagnostic fields, purely
+    for GAE-boundary correctness and the exact-KL diagnostic -- neither
+    changes any existing field's meaning:
+
+    - ``rollout_cutoff``: ``True`` iff this transition is the LAST
+      transition of its episode AND the episode ended because
+      ``collect_episode_rollout``'s ``for step_index in range(max_steps)``
+      loop ran out of steps WITHOUT the environment itself returning
+      ``terminated``/``truncated`` (an artificial trainer-side cutoff,
+      never a reason to synthesize a terminal reward -- SS5.1 stays the
+      sole source of truth). ``False`` for every other transition,
+      including a real environment ``terminated``/``truncated`` step.
+      GAE must treat this exactly like ``truncated`` for bootstrapping
+      (bootstrap from ``next_value``) and exactly like any episode
+      boundary for trace-continuation (never let advantage leak into
+      the next episode).
+    - ``old_logits``: the full 4-logit vector the CURRENT policy
+      assigned at this observation, at rollout-collection time, for
+      ``policy_mask == 1`` decision frames (a sentinel all-zero vector
+      for ``policy_mask == 0`` frames, which the exact-KL diagnostic
+      excludes from its aggregate -- mirroring the existing
+      ``policy_mask == 0`` Actor-side exclusion pattern from P4). Never
+      resampled/re-forward-passed beyond what already computes
+      ``log_prob`` -- same logits, just kept in full rather than
+      reduced to one scalar.
+    - ``info``: the raw POST-step ``info_after`` dict returned by this
+      step's ``env.step()`` call (Fix 6, pre-P6 hardening), carried
+      through verbatim/unmodified so a trainer can read the frozen
+      environment's own downstream-diagnostic fields
+      (``intervention_rate``, ``planner_infeasible_count``,
+      ``collision_blocked_count``, ``controller_failure_count``,
+      ``invalid_reference_count``, ``downstream_status``) for W&B
+      logging WITHOUT this module (or any caller) re-deriving any of
+      those values itself -- purely a pass-through snapshot, never
+      recomputed. ``None`` for any ``Transition`` constructed without
+      it (e.g. an older/synthetic test batch), so downstream-diagnostic
+      aggregation must treat a ``None`` info as "not available" rather
+      than assuming zero.
+
+    Post-Pre-P6 follow-up fix (reward component logging correctness)
+    additive diagnostic fields:
+
+    - ``reward_terminal_component`` / ``reward_decision_cost_component``:
+      the exact terminal-outcome and decision-cost components that
+      ``MergeRewardWrapper.compute`` computed for THIS step (its
+      ``last_terminal_component``/``last_decision_cost_component``
+      immediately after the call that produced this step's ``reward``),
+      propagated verbatim -- never re-derived from ``terminated``/
+      ``truncated`` here or by any caller. ``reward_terminal_component
+      + reward_decision_cost_component == reward`` for every
+      ``Transition`` (mirrors ``MergeRewardWrapper.compute``'s own
+      internal consistency check). Default to ``0.0`` so a
+      ``Transition`` constructed without them (an older/synthetic test
+      batch) degrades to "no component data" rather than crashing.
+    """
 
     observation: Any
     action: Any
@@ -99,6 +156,11 @@ class Transition:
     episode_id: Optional[str] = None
     maneuver_id: Optional[str] = None
     step_index: Optional[int] = None
+    rollout_cutoff: bool = False
+    old_logits: Optional[np.ndarray] = None
+    info: Optional[dict] = None
+    reward_terminal_component: float = 0.0
+    reward_decision_cost_component: float = 0.0
 
 
 def _value_of(value_network, value_params, observation: np.ndarray) -> float:
@@ -153,6 +215,11 @@ def collect_episode_rollout(
             action_index = int(np.asarray(action_index))
             action = distribution.ACTION_INDEX_TO_BEHAVIOR[action_index]
             log_prob = float(np.asarray(log_prob))
+            # Fix 2 (exact categorical KL diagnostic): keep the full
+            # logit vector the CURRENT (behavior) policy assigned here,
+            # not just the sampled action's log_prob -- no extra
+            # forward pass beyond ppo_policy.act's own logits() call.
+            old_logits = np.asarray(ppo_policy.logits(observation), dtype=np.float64)
         else:
             # SS7.1: the environment does not actually consult the
             # policy once committed -- submit MERGE directly, mirroring
@@ -168,6 +235,11 @@ def collect_episode_rollout(
             log_prob = float(
                 np.asarray(distribution.log_prob(logits, action_index))
             )
+            # Fix 2: policy_mask==0 frames get a zero-vector sentinel,
+            # never a real logits vector -- excluded from the exact-KL
+            # aggregate at update time, mirroring the existing
+            # policy_mask==0 Actor-side exclusion pattern.
+            old_logits = np.zeros((NUM_ACTIONS,), dtype=np.float64)
 
         value = _value_of(value_network, value_params, observation)
 
@@ -186,6 +258,36 @@ def collect_episode_rollout(
             is_policy_step=is_policy_step,
             info=info_after,
         )
+        # Reward component logging correctness follow-up fix: read back
+        # THIS call's exact terminal/decision-cost components from the
+        # wrapper (never re-derived from terminated/truncated here) so
+        # they can be propagated onto this step's Transition below.
+        # info_after["termination_reason"] is the environment's own
+        # real per-step value (SS5.1) -- on an artificial rollout-
+        # cutoff step (last max_steps iteration with no real env
+        # terminated/truncated), it is already "none"/non-terminal, so
+        # last_terminal_component is already correctly 0.0 here with no
+        # special-casing needed.
+        reward_terminal_component = reward_wrapper.last_terminal_component
+        reward_decision_cost_component = reward_wrapper.last_decision_cost_component
+
+        # Fix 1 (episode-aware GAE correctness): an ARTIFICIAL rollout
+        # cutoff is when this is the LAST step of the ``max_steps`` loop
+        # (step_index == max_steps - 1) AND the environment itself did
+        # NOT report terminated/truncated for this step -- i.e. the
+        # trainer's own step budget ran out, not the environment's own
+        # termination logic. This must be treated exactly like
+        # ``truncated`` for GAE bootstrapping (bootstrap from
+        # next_value) and as an episode/segment boundary for trace
+        # continuation (never let advantage leak into the next
+        # episode's rewards) -- but it is NEVER a reason to synthesize
+        # a SUCCESS/COLLISION/OFFROAD/TRUNCATION_HORIZON reward; the
+        # reward above was already computed from the environment's own
+        # termination_reason (SS5.1), untouched by this flag.
+        is_last_loop_iteration = step_index == max_steps - 1
+        rollout_cutoff = bool(
+            is_last_loop_iteration and not terminated and not truncated
+        )
 
         transitions.append(
             Transition(
@@ -202,6 +304,11 @@ def collect_episode_rollout(
                 episode_id=episode_id,
                 maneuver_id=maneuver.maneuver_id,
                 step_index=step_index,
+                rollout_cutoff=rollout_cutoff,
+                old_logits=old_logits,
+                info=info_after,
+                reward_terminal_component=reward_terminal_component,
+                reward_decision_cost_component=reward_decision_cost_component,
             )
         )
 

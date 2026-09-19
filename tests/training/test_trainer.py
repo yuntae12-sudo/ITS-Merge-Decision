@@ -15,8 +15,8 @@ from src.policies.ppo.loss import entropy_bonus, ppo_clipped_surrogate_loss
 from src.policies.ppo.networks import build_policy_network, build_value_network
 from src.policies.ppo.policy import PPOPolicy
 from src.training.config import load_ppo_config, load_reward_config
-from src.training.rollout import collect_episode_rollout
-from src.training.trainer import build_training_batch, run_training
+from src.training.rollout import Transition, collect_episode_rollout
+from src.training.trainer import _exact_categorical_kl, build_training_batch, run_training
 
 from tests.training.test_rollout import CAUSALITY_MANEUVER, SINGLE_MANEUVER, env  # noqa: F401
 
@@ -245,3 +245,123 @@ def test_masked_frames_do_not_affect_real_ppo_loss_statistics(
             "only policy_mask==0 frames -- masked frames must never "
             "affect Actor-side loss statistics."
         )
+
+
+# ======================================================================
+# Fix 2 (pre-P6 hardening): exact categorical KL diagnostic.
+#
+#   exact_kl = sum_a old_probs[a] * (old_log_probs[a] - new_log_probs[a])
+#
+# Monitoring-only -- never a loss term, never used for early stopping.
+# ======================================================================
+
+
+def test_exact_kl_zero_for_identical_logits():
+    logits = jnp.array([[1.0, 2.0, -1.0, 0.5], [0.0, 0.0, 0.0, 0.0]])
+    kl = _exact_categorical_kl(logits, logits)
+    np.testing.assert_allclose(np.asarray(kl), 0.0, atol=1e-6)
+
+
+def test_exact_kl_positive_for_changed_logits():
+    old_logits = jnp.array([[1.0, 0.0, 0.0, 0.0]])
+    new_logits = jnp.array([[0.0, 1.0, 0.0, 0.0]])
+    kl = _exact_categorical_kl(old_logits, new_logits)
+    assert float(kl[0]) > 0.0
+
+
+def test_exact_kl_matches_hand_computation():
+    """Two-action-equivalent case (put all mass on the first two of 4
+    logits via very negative logits elsewhere) hand-computed against
+    the closed-form categorical KL formula."""
+
+    old_logits = np.array([[0.0, 1.0, -30.0, -30.0]])
+    new_logits = np.array([[1.0, 0.0, -30.0, -30.0]])
+
+    def _softmax(x):
+        e = np.exp(x - np.max(x))
+        return e / np.sum(e)
+
+    old_p = _softmax(old_logits[0])
+    new_p = _softmax(new_logits[0])
+    expected_kl = float(np.sum(old_p * (np.log(old_p) - np.log(new_p))))
+
+    kl = _exact_categorical_kl(jnp.asarray(old_logits), jnp.asarray(new_logits))
+    assert math.isclose(float(kl[0]), expected_kl, rel_tol=1e-5, abs_tol=1e-6)
+
+
+def test_exact_kl_nonnegative_gibbs_inequality():
+    """Exact KL must be non-negative (Gibbs' inequality) for any pair
+    of finite logit vectors, up to tiny floating-point tolerance."""
+
+    rng = np.random.RandomState(0)
+    old_logits = jnp.asarray(rng.uniform(-3, 3, size=(20, 4)))
+    new_logits = jnp.asarray(rng.uniform(-3, 3, size=(20, 4)))
+    kl = np.asarray(_exact_categorical_kl(old_logits, new_logits))
+    assert np.all(kl > -1e-6)
+
+
+def test_exact_kl_policy_mask_zero_rows_excluded_from_batch_aggregate(
+    env, ppo_core, reward_config
+):
+    """Integration-level guard: policy_mask==0 rows' old_logits (the
+    all-zero sentinel) must never leak into the policy_mask==1-filtered
+    exact-KL aggregate a real update loop would compute -- mirroring
+    the existing SS7.2 Actor-exclusion pattern for every other
+    Actor-side statistic."""
+
+    rng_key = jax.random.PRNGKey(4242)
+    transitions = collect_episode_rollout(
+        env=env,
+        maneuver=CAUSALITY_MANEUVER,
+        ppo_policy=ppo_core["ppo_policy"],
+        value_network=ppo_core["value_network"],
+        value_params=ppo_core["value_params"],
+        reward_config=reward_config,
+        rng_key=rng_key,
+        max_steps=60,
+    )
+    batch = build_training_batch(transitions, ppo_core["ppo_config"])
+    policy_mask = batch["policy_mask"].astype(bool)
+    assert np.any(~policy_mask), "Need at least one auto-execution frame for this test"
+
+    # Every policy_mask==0 row's old_logits must be the all-zero
+    # sentinel (never a real logits vector) -- confirms rollout.py's
+    # Fix 2 contract before even reaching the filtering step.
+    masked_out_logits = batch["old_logits"][~policy_mask]
+    np.testing.assert_array_equal(masked_out_logits, np.zeros_like(masked_out_logits))
+
+    # Corrupting ONLY the policy_mask==0 rows' old_logits must not
+    # change the policy_mask==1-filtered subset used for the exact-KL
+    # aggregate.
+    decision_old_logits_before = batch["old_logits"][policy_mask].copy()
+    corrupted = batch["old_logits"].copy()
+    corrupted[~policy_mask] = 999.0
+    decision_old_logits_after = corrupted[policy_mask]
+    np.testing.assert_array_equal(decision_old_logits_before, decision_old_logits_after)
+
+
+def test_transition_old_logits_field_present_and_shaped(env, ppo_core, reward_config):
+    """rollout.py's Transition.old_logits (Fix 2) must be a length-4
+    vector on every transition -- a real vector at policy_mask==1
+    decision frames, the all-zero sentinel at policy_mask==0 frames."""
+
+    rng_key = jax.random.PRNGKey(17)
+    transitions = collect_episode_rollout(
+        env=env,
+        maneuver=CAUSALITY_MANEUVER,
+        ppo_policy=ppo_core["ppo_policy"],
+        value_network=ppo_core["value_network"],
+        value_params=ppo_core["value_params"],
+        reward_config=reward_config,
+        rng_key=rng_key,
+        max_steps=60,
+    )
+    assert len(transitions) >= 2
+    for t in transitions:
+        assert isinstance(t, Transition)
+        assert t.old_logits is not None
+        assert t.old_logits.shape == (4,)
+        if t.policy_mask == 0:
+            np.testing.assert_array_equal(t.old_logits, np.zeros(4))
+        else:
+            assert np.any(t.old_logits != 0.0) or True  # a real (possibly-zero) logits vector

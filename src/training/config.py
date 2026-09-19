@@ -32,6 +32,29 @@ class NetworkConfig:
 
 @dataclasses.dataclass(frozen=True)
 class PPOHyperparameters:
+    """PPO_PLAN.md SS6 baseline hyperparameters.
+
+    ``value_coef`` (pre-P6 hardening Fix 4, deprecated-for-this-
+    architecture note): the PPO paper's c1/``value_coef`` only affects
+    training dynamics when the policy and value losses are combined
+    into ONE shared gradient (i.e. shared or jointly-optimized
+    parameters). This codebase's policy and value networks are fully
+    INDEPENDENT ``flax.training.train_state.TrainState``s with separate
+    ``apply_gradients`` calls (``src/policies/ppo/state.py``,
+    SS7.2's Actor/Critic separation) -- ``src/training/trainer.py``'s
+    ``run_update`` computes and applies the value loss's gradient on
+    its own, entirely independent of ``value_coef``. The field is kept
+    in this dataclass (not removed) purely for backward compatibility
+    with existing configs/tests/checkpoints that already carry it, and
+    because ``ppo_total_loss`` (``src/policies/ppo/loss.py``) -- a
+    combined-loss helper validated in isolation by P3's own tests,
+    never called by ``run_update`` -- still accepts a ``value_coef``
+    argument for that standalone use. It has NO EFFECT on the actual
+    training loop's dynamics; do not tune it expecting a training-time
+    effect, and do not add it to a hyperparameter sweep's list of
+    active dimensions.
+    """
+
     learning_rate: float
     gamma: float
     gae_lambda: float

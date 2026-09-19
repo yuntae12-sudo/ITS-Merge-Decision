@@ -63,6 +63,22 @@ class CheckpointPayload:
     definition yet (that lands in P3's ``src/policies/ppo/state.py`).
     This dataclass is the stable envelope; P3+ decide what concrete
     pytree structures go inside each field.
+
+    ``numpy_rng_state`` (pre-P6 hardening Fix 5, additive): the tuple
+    returned by ``numpy.random.RandomState.get_state()`` for the
+    ``numpy_rng`` used to shuffle PPO minibatches
+    (``src.training.trainer._minibatch_indices``). P1/P5 already saved
+    the JAX PRNG key (governing rollout action sampling) but never this
+    NumPy RNG's state, so a resumed run's minibatch SHUFFLE ORDER for
+    the very next update would silently diverge from what an
+    uninterrupted run would have produced, even though every other
+    piece of state (params, optimizer, JAX key, step counters) resumed
+    correctly -- this field closes that gap. Defaults to ``None`` so an
+    OLDER checkpoint (saved before this field existed) still loads
+    without error; ``None`` means "the NumPy RNG state was never
+    recorded for this checkpoint" and a caller resuming from one must
+    fall back to re-seeding from ``seed`` for the NumPy stream (a real,
+    if not bit-identical-mid-stream, degradation -- not a crash).
     """
 
     policy_params: Any
@@ -76,6 +92,7 @@ class CheckpointPayload:
     reward_version: str
     git_sha: str
     extra: Optional[dict] = None
+    numpy_rng_state: Optional[tuple] = None
 
 
 def save_checkpoint(payload: CheckpointPayload, path: str) -> None:
@@ -106,4 +123,33 @@ def load_checkpoint(path: str) -> CheckpointPayload:
 
     with open(path, "rb") as f:
         raw = pickle.load(f)
+    raw.setdefault("numpy_rng_state", None)  # Fix 5: older checkpoints
     return CheckpointPayload(**raw)
+
+
+def restore_numpy_rng(numpy_rng_state: Optional[tuple], fallback_seed: int) -> "np.random.RandomState":
+    """Fix 5 (pre-P6 hardening): builds a ``numpy.random.RandomState``
+    from a checkpointed ``numpy_rng_state`` if present, otherwise falls
+    back to re-seeding from ``fallback_seed`` (matching the pre-Fix-5
+    behavior for a checkpoint saved before this field existed).
+
+    Args:
+        numpy_rng_state: ``CheckpointPayload.numpy_rng_state`` -- either
+            a tuple as returned by ``RandomState.get_state()``, or
+            ``None`` (older checkpoint / never captured).
+        fallback_seed: the run's ``seed`` (``CheckpointPayload.seed``),
+            used only if ``numpy_rng_state`` is ``None``.
+
+    Returns:
+        A ``numpy.random.RandomState`` whose internal state exactly
+        matches what the checkpointed run's ``numpy_rng`` held at
+        checkpoint-save time (or, in the fallback case, a fresh stream
+        seeded from ``fallback_seed``).
+    """
+
+    import numpy as np
+
+    rng = np.random.RandomState(fallback_seed)
+    if numpy_rng_state is not None:
+        rng.set_state(numpy_rng_state)
+    return rng

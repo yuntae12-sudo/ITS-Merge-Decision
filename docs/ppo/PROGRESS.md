@@ -8,21 +8,38 @@ Live state, updated at the end of every Phase/Stage. See
 
 ## Current Phase
 
-**P5 COMPLETE — WAITING FOR USER TUNING**
+**PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**
 
-The entire P0–P5 PPO implementation effort is complete. P5 (Smoke
-Training) implemented the real multi-update PPO training loop
-(`src/training/trainer.py::run_training`/`run_update`), verified the
-full save→load→resume→additional-update checkpoint cycle against real
-JAX pytrees, wired both `scripts/train_ppo.py` and
-`scripts/smoke_train_ppo.py` into real, working entry points, and ran
-two real smoke-training stages against the real `MergeEnvironment`.
-Full details in [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md).
-P6+ (reward/hyperparameter tuning, full training, VAL evaluation,
-FSM-vs-PPO comparison) is reserved for the user — see
-[HANDOFF.md](HANDOFF.md)'s NEXT OWNER ACTION.
+The entire P0–P5 PPO implementation effort is complete, and a
+follow-up **Pre-P6 correctness/instrumentation hardening pass** (on
+branch `feat/ppo-pre-p6`, based on `main` at `c00743a`) has also been
+completed on top of it. This pass fixed 7 issues found in the P0-P5
+implementation — episode-aware GAE (a real cross-episode advantage-
+leakage bug), an exact categorical-KL diagnostic (monitoring-only,
+never in any loss), PPO update metric aggregation (was silently
+overwriting with the last minibatch/epoch's value instead of
+aggregating across the full sweep), a `value_coef` documentation/
+consistency resolution (kept, has no effect on this architecture,
+documented consistently everywhere it's referenced), NumPy RNG
+checkpointing (minibatch-shuffle order now survives a resume), full
+W&B diagnostics (success/collision/offroad/timeout rates,
+policy_decision_count/physical_step_count, explained_variance,
+downstream/* rates, env_steps_per_sec, exact_kl_mean/max actually
+computed and logged now), and reward component logging correctness
+(`TRUNCATION_HORIZON` episodes now correctly counted as a
+terminal-component event). **No reward weight, hyperparameter,
+network size, or dataset-split change was made — this was explicitly
+not a tuning pass.** Full details, real re-run smoke-training numbers
+(the original P0-P5 smoke evidence predated these fixes and lacked
+the new diagnostics, so this pass re-ran fresh + resume smoke training
+against the current code), and the full regression result (629
+passed, 0 failed) are in
+[PRE_P6_REPORT.md](PRE_P6_REPORT.md). P6+ (reward/hyperparameter
+tuning, full training, VAL evaluation, FSM-vs-PPO comparison) remains
+reserved for the user — see [HANDOFF.md](HANDOFF.md)'s NEXT OWNER
+ACTION.
 
-### P4 COMPLETE (Rollout + GAE Integration) — prior phase summary below
+### P5 COMPLETE (Smoke Training) — prior phase summary below
 
 ## Current Stage
 
@@ -396,10 +413,21 @@ PPO Core**.
   PPO core (P3)`)
 - P4 completion commit SHA: `fe8edc9` (`feat(ppo): implement rollout
   and GAE integration (P4)`)
-- P5 completion commit SHA: (recorded in `git log` on this branch
-  immediately after this update — the final commit of the entire
-  P0-P5 effort, per the one-commit-per-Phase rule)
-- branch: `feat/ppo-phase0-5`
+- P5 completion commit SHA: `755a498` (`test(ppo): validate smoke
+  training pipeline (P5)`) — the final commit of the entire P0-P5
+  effort, per the one-commit-per-Phase rule
+- branch: `feat/ppo-phase0-5` (P0-P5), merged into `main` at `c00743a`
+  via PR #1
+
+### Pre-P6 hardening pass (follow-up effort, separate branch)
+
+- base SHA: `c00743aaf0e613f70df3b85ebf7e9a4935f40644` (`c00743a`,
+  `main` after the P0-P5 merge)
+- branch: `feat/ppo-pre-p6`
+- Pre-P6 completion commit SHA: see `git log` on this branch — the
+  single commit for this entire phase, per its own one-commit
+  constraint
+- See [PRE_P6_REPORT.md](PRE_P6_REPORT.md) for the full report.
 
 ## Completed Tasks
 
@@ -1152,6 +1180,43 @@ PPO Core**.
   [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for full
   results. **This is the final Phase — the P0-P5 effort is complete.**
 
+### Pre-P6 hardening pass test results
+
+- Targeted run over the 5 changed/new test files
+  (`tests/training/test_gae.py`, `test_checkpoint.py`,
+  `test_run_training.py`, `test_trainer.py`, and the new
+  `test_pre_p6_hardening.py`): **65 passed**, 0 failed, 238 warnings
+  (all pre-existing `optax.global_norm` deprecation warnings), in
+  233.97s. `--collect-only` over the same 5 files independently
+  confirms 65 collected (no silent skips).
+- Full regression suite (solo, no concurrent GPU-contending process,
+  verified by the orchestrating session): **629 passed**, 0 failed,
+  in 2169.30s (0:36:09). `pytest --collect-only -q` over the full
+  tree independently confirms **629 tests collected**, consistent
+  with the reported pass count (baseline going into this branch was
+  587; +42 net new/extended tests across the 7 fixes).
+- Real smoke-training re-run against the current (post-fix) code —
+  the original P0-P5 smoke evidence predated these fixes and lacked
+  the new diagnostics entirely, so this phase re-ran fresh + resume
+  smoke training: both runs exited 0, all metrics finite, the resumed
+  run's `global_env_step`/`ppo_update_step` counters correctly
+  continued (70/2 → 103/3) rather than resetting, and every new W&B
+  diagnostic (`success_rate`, `collision_rate`, `offroad_rate`,
+  `policy_decision_count`, `physical_step_count`, `exact_kl_mean/max`,
+  `explained_variance`, `downstream/*`, `env_steps_per_sec`) appeared
+  in the logged output with real values. Full numbers in
+  [PRE_P6_REPORT.md](PRE_P6_REPORT.md) §5.
+- GPU re-confirmed working after Pre-P6 changes:
+  `jax.devices() == [CudaDevice(id=0)]`.
+- `git diff --stat main -- src/environment/ src/planning/
+  src/control/ src/scenarios/`: confirmed empty. No PPO-FIT/PPO-TUNE
+  split created. Reward V0 values and PPO hyperparameters confirmed
+  byte-identical to `main` (this was a correctness/instrumentation
+  pass, not a tuning pass). See PRE_P6_REPORT.md §7 for the full
+  scope-compliance verification.
+- **This is the final phase of the Pre-P6 hardening effort — state is
+  PRE-P6 HARDENING COMPLETE, WAITING FOR USER TUNING.**
+
 ## Environment / Dependency Versions (recorded per PPO_PLAN.md §0.1 P0)
 
 ```
@@ -1344,15 +1409,39 @@ count. P2's own full-suite run followed this rule from the start (no
 stale process found) and completed clean on the first attempt, with
 no spurious failures to diagnose.
 
+## Small follow-up correction landed after Pre-P6 hardening
+
+A narrow, additive bug fix landed on `feat/ppo-pre-p6` immediately
+after the Pre-P6 hardening pass's own final commit (`d75b593`): Fix
+7's `reward/terminal`/`reward/decision_cost` W&B breakdown was still
+slightly wrong whenever a terminal/truncated outcome landed on a real
+policy-decision step (e.g. SUCCESS `+1.0` combined with a `-0.01`
+decision cost got fully counted as `reward/terminal` instead of split
+`+1.0`/`-0.01`). Fixed by propagating `MergeRewardWrapper`'s own
+already-correct per-step `last_terminal_component`/
+`last_decision_cost_component` onto two new additive `Transition`
+fields (`reward_terminal_component`/`reward_decision_cost_component`)
+and summing those directly in `trainer.py`, instead of guessing from
+`terminated`/`truncated`. Reward V0's values and PPO hyperparameters
+are unchanged; 12 new tests added; full regression 641 passed / 0
+failed (629 baseline + 12 new). See
+[PRE_P6_REPORT.md §10](PRE_P6_REPORT.md#10-follow-up-fix-reward-component-logging-correctness-post-report)
+for the full writeup. This does **not** change the end-state below —
+it is a correction within the same phase.
+
 ## Next Exact Action
 
-**None — the entire P0-P5 effort is COMPLETE.** All items in
-[PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) hold (see
-[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the itemized
-evidence) and the state is **P5 COMPLETE — WAITING FOR USER TUNING**.
-There is no further automated PPO work queued in this effort. P6+
-(reward/hyperparameter tuning, a real TRAIN/TUNE split, longer
-training, canonical VAL evaluation, FSM-vs-PPO comparison) is reserved
-for the user to decide on and run manually after reviewing the P5
-smoke-training W&B results themselves — see
+**None — the entire P0-P5 effort, AND the follow-up Pre-P6
+correctness/instrumentation hardening pass (including the small
+reward-component-logging correction above), are both COMPLETE.** All
+items in [PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) hold
+(see [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the P0-P5
+itemized evidence and [PRE_P6_REPORT.md](PRE_P6_REPORT.md) for the
+Pre-P6 hardening evidence) and the state is **PRE-P6 HARDENING
+COMPLETE — WAITING FOR USER TUNING**. There is no further automated
+PPO work queued in either effort. P6+ (reward/hyperparameter tuning, a
+real TRAIN/TUNE split, longer training, canonical VAL evaluation,
+FSM-vs-PPO comparison) is reserved for the user to decide on and run
+manually after reviewing the real W&B diagnostics (now including the
+Pre-P6 fixes' full diagnostic set) themselves — see
 [HANDOFF.md](HANDOFF.md)'s NEXT OWNER ACTION.

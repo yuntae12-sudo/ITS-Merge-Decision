@@ -952,3 +952,255 @@ Format per entry:
   docs/ppo/SMOKE_TRAINING_REPORT.md for the full report and
   docs/ppo/HANDOFF.md's NEXT OWNER ACTION for what happens next (a
   user decision, not a queued automated action).
+
+## 2026-09-19 — Pre-P6 correctness/instrumentation hardening pass complete
+
+  A follow-up effort on a new branch (`feat/ppo-pre-p6`, based on
+  `main` at `c00743a` after the P0-P5 merge via PR #1) fixed 7
+  correctness/instrumentation issues found in the P0-P5 implementation.
+  Explicitly **not a tuning pass**: no reward weight, hyperparameter,
+  network size, or dataset-split change was made anywhere in this
+  phase — confirmed by `configs/ppo/ppo_smoke.yaml`/`ppo_base.yaml`
+  being byte-identical to `main` and `configs/reward/merge_reward_v0.yaml`
+  unchanged.
+
+  **Fix 1 (episode-aware GAE):** `src/training/gae.py::compute_gae`
+  now assumes ONE contiguous episode segment per call; a new
+  `compute_gae_segmented` groups a flat multi-episode rollout by
+  `episode_id` and calls `compute_gae` independently per segment. This
+  closes a real bug where a later episode's backward-recursion
+  `gae_running` could leak into an earlier truncated/cutoff episode's
+  last steps under the old single-flat-call behavior.
+  `src/training/trainer.py::build_training_batch` confirmed to call
+  `compute_gae_segmented`, never bare `compute_gae`, over rollout
+  output.
+
+  **Fix 2 (exact categorical KL diagnostic):**
+  `src/training/trainer.py::_exact_categorical_kl` computes full
+  categorical KL(old || new) per policy_mask==1 row from a new
+  `Transition.old_logits` field (populated only for policy_mask==1
+  rows, zero-vector sentinel otherwise). Confirmed diagnostic-only by
+  direct inspection of `_policy_loss_fn`: `total = policy_loss -
+  entropy_coef * entropy` never includes exact_kl; it is returned only
+  in the `info` dict for logging.
+
+  **Fix 3 (PPO update metric aggregation):** `run_update` now
+  accumulates every `ppo/*`/grad-norm metric (mean, and for grad-norms
+  also max) across the full `ppo_epochs x num_minibatches` sweep via
+  explicit `_mean`/`_max`-suffixed keys, fixing a bug where the
+  previous version silently kept only the last minibatch/epoch's
+  value.
+
+  **Fix 4 (value_coef resolution):** confirmed `value_coef` is kept
+  (not removed) in `PPOHyperparameters`, documented consistently as
+  having no effect on this architecture's training dynamics (separate
+  Actor/Critic `TrainState`s, never combined into one shared gradient)
+  across `src/training/config.py`, `src/training/trainer.py::run_update`'s
+  docstring, and `src/tracking/wandb_logger.py`'s config-key comment —
+  no contradiction found. `value_coef=0.5` unchanged from P0-P5,
+  matches PPO_PLAN.md §6.
+
+  **Fix 5 (NumPy RNG checkpointing):** `CheckpointPayload.numpy_rng_state`
+  (new, `Optional[tuple]`, defaults to `None` for backward
+  compatibility with older checkpoints) now carries the NumPy
+  `RandomState` governing PPO minibatch shuffling; `restore_numpy_rng`
+  restores it on `--resume`, closing a gap where a resumed run's
+  minibatch order used to silently diverge from an uninterrupted run's
+  (only the JAX PRNG key was previously persisted).
+
+  **Fix 6 (W&B full diagnostics):** `run_training` now actually
+  computes and logs several `MINIMUM_METRICS` fields that were listed
+  in `src/tracking/wandb_logger.py` but never populated:
+  `train/success_rate`/`collision_rate`/`offroad_rate`/`timeout_rate`
+  (from the environment's own `info["termination_reason"]`, never
+  re-derived), `downstream/intervention_rate` and sibling rates (from
+  the environment's own cumulative `intervention_rate`/
+  `planner_infeasible_count`/etc. fields via
+  `_aggregate_downstream_rates`, never re-judged),
+  `ppo/explained_variance` (with a finite-value guard for near-zero
+  variance), `train/policy_decision_count`/`physical_step_count`, and
+  `runtime/env_steps_per_sec`. New metric names added to
+  `MINIMUM_METRICS`: `ppo/exact_kl_mean`, `ppo/exact_kl_max`,
+  `ppo/policy_loss_mean`, `ppo/value_loss_mean`, `ppo/entropy_mean`,
+  `ppo/approx_kl_mean`, `ppo/clip_fraction_mean`,
+  `ppo/policy_grad_norm_mean`, `ppo/policy_grad_norm_max`,
+  `ppo/value_grad_norm_mean`, `ppo/value_grad_norm_max`,
+  `train/policy_decision_count`, `train/physical_step_count`.
+
+  **Fix 7 (reward component logging correctness):** `reward/terminal`
+  in `run_training` now sums every step where `t.terminated OR
+  t.truncated` is True (previously only `t.terminated`), so a
+  TRUNCATION_HORIZON (-0.5) episode-end is correctly counted as a
+  terminal-component event instead of silently leaking into
+  `reward/decision_cost`. An artificial `rollout_cutoff` (Fix 1) is
+  neither `terminated` nor `truncated`, so it is correctly excluded
+  from `reward/terminal` without a special case.
+
+  **Real smoke-training re-run required and performed:** the original
+  P0-P5 smoke-training evidence
+  (`outputs/ppo_checkpoints/smoke_stage1_final.pkl`/
+  `smoke_stage2_final.pkl`,
+  `wandb/offline-run-20260919_024059-dodmdn2z`/`...-bsp9erzm`) was
+  found to predate every fix in this phase (W&B config recorded
+  `git_sha=fe8edc9`, the P4 completion commit) and its logged metrics
+  confirmed this directly -- no `success_rate`/`exact_kl`/
+  `policy_decision_count`/`explained_variance`/etc. fields were
+  present in either run's logged metric dicts, only the pre-existing
+  `train/*`/`reward/*`/`ppo/*` (bare names)/`action/*` set. That
+  evidence was therefore insufficient on its own, so this phase re-ran
+  real fresh + resume smoke training against the current code
+  (`WANDB_MODE=offline`, `--max-maneuvers 2 --max-episode-steps 60`).
+
+  - Fresh run (`--num-updates 2`, `--checkpoint-path
+    outputs/ppo_checkpoints/pre_p6_smoke.pkl`): finished in 61.4s.
+    `global_env_step=70`, `ppo_update_step=2`. Update 0:
+    `episode_return=0.885`, `success_rate=1.0`, `collision_rate=0.0`,
+    `offroad_rate=0.0`, `policy_decision_count=23`,
+    `physical_step_count=35`, `env_steps_per_sec=1.432`,
+    `intervention_rate=0.350`, `policy_loss_mean=-0.0586`,
+    `value_loss_mean=0.4194`, `entropy_mean=1.2427`,
+    `approx_kl_mean=0.0434`, `exact_kl_mean=0.0172`,
+    `exact_kl_max=0.0774`, `explained_variance=-1.746`. Update 1:
+    `episode_return=0.95`, `success_rate=1.0`,
+    `policy_decision_count=10`, `env_steps_per_sec=1.653`,
+    `policy_loss_mean=-0.0396`, `value_loss_mean=0.0257`,
+    `entropy_mean=1.2554`, `approx_kl_mean=0.0320`,
+    `exact_kl_mean=0.0027`, `exact_kl_max=0.0194`,
+    `explained_variance=-1.264`. All values finite. Checkpoint:
+    `outputs/ppo_checkpoints/pre_p6_smoke.pkl` (545,023 bytes).
+  - Resume run (separate process, `--resume
+    outputs/ppo_checkpoints/pre_p6_smoke.pkl`, `--num-updates 1`):
+    printed `Resumed: global_env_step=70, ppo_update_step=2` on load
+    -- exactly matching the fresh run's final state, confirming
+    JAX+NumPy RNG/step-counter resume genuinely continues rather than
+    resets -- then finished in 34.5s with `global_env_step=103,
+    ppo_update_step=3`. Update 0: `episode_return=0.98`,
+    `success_rate=1.0`, `policy_decision_count=4`,
+    `env_steps_per_sec=1.337`, `intervention_rate=0.233`,
+    `collision_blocked_rate=0.233`, `policy_loss_mean=-0.0625`,
+    `value_loss_mean=0.0240`, `entropy_mean=1.1692`,
+    `approx_kl_mean=0.00866`, `exact_kl_mean=0.00623`,
+    `exact_kl_max=0.0358`, `explained_variance=-1.444`. All values
+    finite. Checkpoint: `outputs/ppo_checkpoints/pre_p6_smoke_resumed.pkl`
+    (545,022 bytes). Both runs exited code 0.
+
+  (Housekeeping note: an earlier attempt at this same re-run within
+  this session hit a GPU `FailedPreconditionError: Failed to allocate
+  scratch buffer` from a leftover, still-running process holding
+  ~7.3GB of GPU memory from a prior turn in this same session; that
+  process was identified via `ps`/`nvidia-smi`, killed, and its
+  partial/failed artifacts -- a stray checkpoint path and an empty
+  `wandb/offline-run-...` directory -- removed before the real, clean
+  re-run reported above.)
+
+  Targeted test run over the 5 changed/new test files
+  (`tests/training/test_gae.py`, `test_checkpoint.py`,
+  `test_run_training.py`, `test_trainer.py`, new
+  `test_pre_p6_hardening.py`): **65 passed**, 0 failed, 238 warnings
+  (all pre-existing `optax.global_norm` deprecation warnings), in
+  233.97s; `--collect-only` over the same 5 files independently
+  confirms 65 collected.
+
+  Full regression suite result (verified solo by the orchestrating
+  session, no concurrent GPU-contending process): **629 passed, 0
+  failed, in 2169.30s (0:36:09)**. `pytest --collect-only -q`
+  independently confirms 629 tests collected, consistent with the
+  reported count (baseline going into this branch was 587; +42 net
+  new/extended tests across the 7 fixes).
+
+  `git diff --stat main -- src/environment/ src/planning/
+  src/control/ src/scenarios/` confirmed EMPTY -- zero frozen Phase
+  1-3 files touched. No PPO-FIT/PPO-TUNE dataset split exists
+  anywhere. Reward V0 values unchanged (success=+1.0,
+  failure_collision=-1.0, failure_offroad=-1.0,
+  truncation_horizon=-0.5, none=0.0, decision_cost -0.01/0.0) --
+  only logging/breakdown changed (Fix 7). PPO hyperparameters
+  unchanged (learning_rate=3e-4, gamma=0.99, gae_lambda=0.95,
+  clip_epsilon=0.2, entropy_coef=0.01, value_coef=0.5, network
+  [256, 64, 32] tanh, ppo_epochs=4, num_minibatches=4) -- this was
+  explicitly NOT a tuning pass. `configs/ppo/ppo_tune.yaml` was found
+  on disk as an untracked, code-unreferenced P6-scoped scaffold and
+  deliberately left untracked/uncommitted, out of scope for this
+  phase.
+
+  **This is the final entry for the Pre-P6 hardening pass.** See
+  docs/ppo/PRE_P6_REPORT.md for the full report. State is left as
+  **PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**. See
+  docs/ppo/HANDOFF.md's NEXT OWNER ACTION for what happens next (a
+  user decision, not a queued automated action).
+
+## 2026-09-19 — Reward component logging follow-up fix complete
+
+Landed on `feat/ppo-pre-p6`, one commit immediately after the Pre-P6
+hardening pass's own final commit (`d75b593`). Narrow, additive bug
+fix -- not a reopening of the Pre-P6 hardening pass's completed scope.
+
+**Bug:** Fix 7's `reward/terminal` aggregation
+(`sum(t.reward for t in transitions if t.terminated or t.truncated)`)
+was still wrong whenever a terminal/truncated outcome landed on a real
+policy-decision step: `t.reward` on that row is
+`terminal_component + decision_cost_component` combined, not just the
+terminal part, so e.g. SUCCESS `+1.0` combined with a `-0.01` decision
+cost (`t.reward == +0.99`) got fully attributed to `reward/terminal`
+instead of splitting `+1.0` terminal / `-0.01` decision cost.
+
+**Fix:** `src/rewards/reward_wrapper.py`'s `MergeRewardWrapper` already
+computed the correct per-step `last_terminal_component`/
+`last_decision_cost_component` (unchanged by this fix). Added two
+additive fields to `src/training/rollout.py`'s `Transition`
+(`reward_terminal_component`, `reward_decision_cost_component`,
+both defaulting to `0.0`), populated from the wrapper's own values
+immediately after each `reward_wrapper.compute(...)` call inside
+`collect_episode_rollout`, and changed `src/training/trainer.py`'s
+`run_training` metrics block to sum those fields directly instead of
+guessing from `terminated`/`truncated`. Confirmed (not assumed) that
+an artificial `rollout_cutoff` step already gets
+`reward_terminal_component == 0.0` for free, since
+`reward_wrapper.compute` is called with that step's real (non-terminal)
+`info_after["termination_reason"]` -- verified by a new real-environment
+test, `test_reward_components_zero_terminal_on_artificial_cutoff`.
+
+**Reward V0 values / PPO hyperparameters:** unchanged (verified via
+`git diff --stat -- configs/ src/rewards/` empty, and every new test
+asserting the exact fixed-table values: success=+1.0,
+failure_collision=-1.0, failure_offroad=-1.0, truncation_horizon=-0.5,
+none=0.0, decision_cost -0.01/0.0).
+
+**Tests added (12):** Tests A-H from the fix's task scope
+(SUCCESS+real-decision, FAILURE_COLLISION+real-decision,
+FAILURE_OFFROAD+auto-execution, TRUNCATION_HORIZON+real-decision,
+NONTERMINAL+real-decision, artificial-cutoff, episode-aggregate
+identity, `run_training` W&B-metrics-match-components) across
+`tests/training/test_pre_p6_hardening.py`,
+`tests/training/test_rollout.py` (2 real-environment tests), and
+`tests/training/test_run_training.py` (2 tests, one synthetic-batch,
+one real end-to-end `run_training` call).
+
+Targeted run (`tests/training/test_run_training.py
+tests/training/test_pre_p6_hardening.py tests/rewards/
+tests/training/test_trainer.py tests/training/test_rollout.py -q`):
+**93 passed, 0 failed**.
+
+Smoke run (`PYTHONPATH=. WANDB_MODE=offline python
+scripts/smoke_train_ppo.py --max-maneuvers 2 --num-updates 1
+--max-episode-steps 60`): both maneuvers reached real SUCCESS
+terminal outcomes on real policy-decision steps. Result:
+`train/success_rate=1.0`, `reward/terminal=2.0` (exactly `2 x +1.0`,
+uncontaminated), `reward/decision_cost=-0.23` (`23 x -0.01`, matching
+`train/policy_decision_count=23.0`), `reward/total=1.77`. Under the
+pre-fix code this would have read `reward/terminal=1.98`
+(`2 x 0.99`) instead.
+
+Full regression suite (verified solo, no concurrent `pytest` process):
+**641 passed, 0 failed, in 2072.81s (0:34:32)**. Baseline into this fix
+(from `d75b593`) was 629 passed; 629 + 12 new tests = 641, confirming
+no test was lost or silently skipped.
+
+`git diff --stat -- src/environment/ src/planning/ src/control/
+src/scenarios/` against `main`: confirmed EMPTY. Exactly one new
+commit landed on top of `d75b593`.
+
+State remains **PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**
+-- see docs/ppo/PRE_P6_REPORT.md §10 for the full writeup and
+docs/ppo/HANDOFF.md's NEXT OWNER ACTION for what happens next (still a
+user decision, not a queued automated action).

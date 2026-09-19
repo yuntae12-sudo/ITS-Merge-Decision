@@ -22,6 +22,14 @@ from typing import Any, Dict, Optional
 import wandb
 
 # Minimum per-run config keys (PPO_PLAN.md SS8).
+#
+# Pre-P6 hardening Fix 4 note: "value_coef" is still logged here for
+# provenance/reproducibility (a checkpoint/run's config snapshot should
+# always show exactly what value was on record), but it has NO EFFECT
+# on this repo's actual training dynamics -- see
+# ``src.training.config.PPOHyperparameters.value_coef``'s docstring for
+# why (the policy and value networks are optimized fully independently,
+# never combined into one shared gradient). Not a "tunable" dimension.
 REQUIRED_CONFIG_KEYS = (
     "git_sha",
     "reward_version",
@@ -66,7 +74,25 @@ MINIMUM_METRICS = (
     "downstream/planner_infeasible_rate",
     "downstream/collision_blocked_rate",
     "downstream/controller_failure_rate",
+    "downstream/invalid_reference_rate",
     "runtime/env_steps_per_sec",
+    # Pre-P6 hardening additions (Fix 2/3/6): exact-KL diagnostic,
+    # explicit epoch/minibatch-sweep-aggregated metric names (Fix 3
+    # fixes a last-minibatch-only bug in the previous aggregation), and
+    # the policy-decision/physical-step count diagnostic (Fix 6).
+    "ppo/exact_kl_mean",
+    "ppo/exact_kl_max",
+    "ppo/policy_loss_mean",
+    "ppo/value_loss_mean",
+    "ppo/entropy_mean",
+    "ppo/approx_kl_mean",
+    "ppo/clip_fraction_mean",
+    "ppo/policy_grad_norm_mean",
+    "ppo/policy_grad_norm_max",
+    "ppo/value_grad_norm_mean",
+    "ppo/value_grad_norm_max",
+    "train/policy_decision_count",
+    "train/physical_step_count",
 )
 
 
