@@ -32,6 +32,7 @@ from src.training.checkpoint import (
     CheckpointPayload,
     get_git_sha,
     load_checkpoint,
+    restore_numpy_rng,
     save_checkpoint,
 )
 from src.training.config import load_ppo_config, load_reward_config
@@ -228,6 +229,10 @@ def main() -> None:
         run_key = payload.jax_rng_key
         global_env_step = payload.global_env_step
         ppo_update_step = payload.ppo_update_step
+        # Fix 5: restore the NumPy RNG (minibatch-shuffle) stream too --
+        # not just the JAX key -- so resumed minibatch ordering matches
+        # what an uninterrupted run would have produced.
+        numpy_rng = restore_numpy_rng(payload.numpy_rng_state, fallback_seed=seed)
         print(
             f"Resumed: global_env_step={global_env_step}, "
             f"ppo_update_step={ppo_update_step}"
@@ -241,8 +246,7 @@ def main() -> None:
             policy_hidden_sizes=ppo_config.network.hidden_sizes,
             value_hidden_sizes=ppo_config.network.hidden_sizes,
         )
-
-    numpy_rng = seed_state.numpy_rng
+        numpy_rng = seed_state.numpy_rng
 
     wandb_logger = WandbLogger(
         project=ppo_config.tracking.wandb_project,
@@ -291,6 +295,7 @@ def main() -> None:
             },
             reward_version=reward_config.reward_version,
             git_sha=get_git_sha(),
+            numpy_rng_state=numpy_rng.get_state(),
         )
         save_checkpoint(payload, path)
         print(f"Saved checkpoint to {path}")

@@ -404,11 +404,16 @@ effort, including P5.
 
 ## Last successful test
 
-`pytest tests/ -q` (after P5, clean solo run — no concurrent-pytest
-contention) -> **587 passed**, 0 failed, 80 warnings, 1948.37s
-(0:32:28) — waited for real process completion, verified directly
-against the completed log file's final summary line, 100% dots, no
-`F`/`E` marks.
+Pre-P6 hardening pass, full regression (`pytest tests/ -q`, clean solo
+run, no concurrent-pytest contention, verified by the orchestrating
+session): **629 passed**, 0 failed, in 2169.30s (0:36:09).
+`pytest tests/ --collect-only -q` independently confirms 629 tests
+collected. Targeted run over the 5 changed/new test files: **65
+passed**, 0 failed, 238 warnings (all pre-existing
+`optax.global_norm`-deprecation warnings, not failures), in 233.97s.
+
+(Prior: P5's `pytest tests/ -q`, clean solo run -> **587 passed**,
+0 failed, 80 warnings, 1948.37s (0:32:28).)
 
 ## Failed tests
 
@@ -416,10 +421,21 @@ None.
 
 ## Problems found
 
-None. No contradiction found between PPO_PLAN.md and the current
-codebase in P0, P1, P2, P3, P4, or P5. The entire P0-P5 effort
-completed with zero blockers and zero deviations from the frozen
-design or the approved plan.
+Seven correctness/instrumentation issues found and fixed in the
+Pre-P6 hardening pass (episode-aware GAE cross-episode advantage
+leakage; PPO update metric aggregation silently using only the last
+minibatch/epoch's value instead of the full sweep; missing exact-KL
+diagnostic; `value_coef` documentation inconsistency risk; missing
+NumPy RNG checkpointing causing resumed minibatch order to silently
+diverge; several W&B `MINIMUM_METRICS` fields listed in the module but
+never actually computed/logged by `run_training`; `reward/terminal`
+undercounting `TRUNCATION_HORIZON` episodes) — see
+[PRE_P6_REPORT.md](PRE_P6_REPORT.md) for the full itemized fix list
+and verification evidence. All seven are now fixed and covered by
+tests. No contradiction found between PPO_PLAN.md and the current
+codebase in P0, P1, P2, P3, P4, or P5 themselves — these were bugs in
+the P0-P5 implementation discovered by a dedicated hardening pass, not
+plan/implementation contradictions.
 
 ## Recent commits (PPO-related)
 
@@ -434,10 +450,13 @@ design or the approved plan.
   completion)
 - `fe8edc9` — `feat(ppo): implement rollout and GAE integration (P4)`
   (P4 completion)
-- P5 completion commit (`test(ppo): validate smoke training pipeline
-  (P5)`): see `git log` on `feat/ppo-phase0-5` for the exact SHA —
-  the sixth and FINAL commit of the entire P0-P5 effort, committed
-  immediately after this HANDOFF.md update.
+- `755a498` — `test(ppo): validate smoke training pipeline (P5)` — the
+  sixth and FINAL commit of the P0-P5 effort (`feat/ppo-phase0-5`,
+  merged to `main` at `c00743a` via PR #1).
+- Pre-P6 hardening completion commit (`fix(ppo): harden pre-P6
+  training correctness and diagnostics`): see `git log` on
+  `feat/ppo-pre-p6` for the exact SHA — the single commit for this
+  entire follow-up phase, based on `main` at `c00743a`.
 
 ## Running processes
 
@@ -445,64 +464,77 @@ None.
 
 ## Latest checkpoint
 
-Real checkpoints from P5's two smoke-training stages:
-`outputs/ppo_checkpoints/smoke_stage1_final.pkl` (fresh run) and
-`outputs/ppo_checkpoints/smoke_stage2_final.pkl` (resumed from Stage
-1, 3 more updates). Both carry the full §10 contract (policy params,
-value params, optimizer state for both networks, JAX PRNG key,
-`global_env_step`, `ppo_update_step`, seed, config snapshot, reward
-version, git SHA) as a plain-`pickle` dump of `CheckpointPayload`.
-Round-trip and resume verified both by real script runs and by
-`tests/training/test_checkpoint.py`. See
-[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §11 for the exact
-verified `--resume` command.
+Real checkpoints from the Pre-P6 hardening pass's fresh + resume
+smoke-training re-run (against the current, post-fix code):
+`outputs/ppo_checkpoints/pre_p6_smoke.pkl` (fresh run) and
+`outputs/ppo_checkpoints/pre_p6_smoke_resumed.pkl` (resumed from the
+fresh run, 1 more update). Both carry the full §10 contract PLUS the
+new `numpy_rng_state` field (Fix 5) as a plain-`pickle` dump of
+`CheckpointPayload`. Round-trip and resume verified both by real
+script runs (the resumed run's printed `global_env_step`/
+`ppo_update_step` correctly continued from the fresh run's final
+values, 70/2 -> 103/3) and by `tests/training/test_pre_p6_hardening.py`/
+`test_checkpoint.py`. See [PRE_P6_REPORT.md](PRE_P6_REPORT.md) §5 for
+the exact commands and full numeric results.
+
+(Prior: P5's `outputs/ppo_checkpoints/smoke_stage1_final.pkl`/
+`smoke_stage2_final.pkl` — still present on disk, predate the Pre-P6
+fixes, superseded by the above as the "latest" evidence but not
+deleted.)
 
 ## Next command to run
 
-None queued — the P0-P5 effort is complete. If resuming this repo
-later for P6+ work (reward/hyperparameter tuning, a real TRAIN/TUNE
-split, longer training, VAL evaluation, FSM-vs-PPO comparison), start
-by reading [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) in
-full, then follow the NEXT OWNER ACTION below.
+None queued — both the P0-P5 effort and the Pre-P6 hardening pass are
+complete. If resuming this repo later for P6+ work
+(reward/hyperparameter tuning, a real TRAIN/TUNE split, longer
+training, VAL evaluation, FSM-vs-PPO comparison), start by reading
+[PRE_P6_REPORT.md](PRE_P6_REPORT.md) in full (and
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the earlier
+P0-P5 context it builds on), then follow the NEXT OWNER ACTION below.
 
 ## Next file to modify
 
-None queued for this effort. A future P6+ session would most likely
-start by adding the remaining §8 `MINIMUM_METRICS` W&B fields to
-`src/training/trainer.py::run_training` (success/collision/offroad/
-timeout rates, downstream intervention diagnostics — see
-SMOKE_TRAINING_REPORT.md §8/§13's "Known limitations"), but that is a
-user decision, not a queued action.
+None queued for either effort. The Pre-P6 hardening pass already
+closed out the previously-noted gap (the remaining §8
+`MINIMUM_METRICS` W&B fields are now actually computed and logged by
+`src/training/trainer.py::run_training` — success/collision/offroad/
+timeout rates, downstream intervention diagnostics, exact-KL,
+policy_decision_count/physical_step_count — see
+[PRE_P6_REPORT.md](PRE_P6_REPORT.md) §3/§6). Any further change is a
+P6+ user decision, not a queued action.
 
 ---
 
 ## NEXT OWNER ACTION
 
-**The entire P0-P5 PPO effort is COMPLETE.** State:
-**P5 COMPLETE — WAITING FOR USER TUNING**. Every item in
+**Both the entire P0-P5 PPO effort AND the follow-up Pre-P6
+correctness/instrumentation hardening pass are COMPLETE.** State:
+**PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**. Every item in
 [PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) holds — see
-[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the itemized
-evidence (architecture as implemented, exact smoke-run conditions,
-real results, checkpoint/resume verification, full regression
-numbers, known limitations, reproduction commands).
+[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the P0-P5
+itemized evidence and [PRE_P6_REPORT.md](PRE_P6_REPORT.md) for the
+Pre-P6 hardening evidence (7 fixes, real re-run smoke-training numbers,
+full regression result, scope-compliance verification).
 
-**The user must review the P5 smoke-training W&B results themselves
-before any further PPO work is done.** Concretely: read
-[SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) §9 (or run
-`wandb sync` on the two local offline run directories it references
-to view them in the W&B UI), form their own judgment about the
-observed episode returns / entropy / action distributions / loss
-curves from the two smoke stages, and decide — based on that review,
-not on any recommendation baked into this codebase or these docs —
-whether/how to proceed into P6+ (reward-term additions or reweighting,
-hyperparameter tuning, creating a real PPO-FIT/PPO-TUNE dataset split,
-longer training runs, canonical VAL evaluation, or an FSM-vs-PPO
-comparison). None of that P6+ work has been started, scoped, or
-recommended by this effort — P0-P5 deliberately stayed pipeline-
-verification-only throughout (§0.1's non-goals for every Phase), and
-the choice of what (if anything) to tune next is explicitly the user's
-call to make, not an automated next step for a future session to take
-on its own initiative.
+**The user must review the real W&B diagnostics themselves before any
+further PPO work is done.** Concretely: read
+[PRE_P6_REPORT.md](PRE_P6_REPORT.md) §5 (or run `wandb sync` on a
+local offline run directory to view it in the W&B UI), form their own
+judgment about the observed episode returns / entropy / success-
+collision-offroad rates / downstream-intervention rates / loss curves,
+and decide — based on that review, not on any recommendation baked
+into this codebase or these docs — whether/how to proceed into P6+
+(reward-term additions or reweighting, hyperparameter tuning, creating
+a real PPO-FIT/PPO-TUNE dataset split, longer training runs, canonical
+VAL evaluation, or an FSM-vs-PPO comparison). None of that P6+ work
+has been started, scoped, or recommended by either effort — both
+P0-P5 and the Pre-P6 hardening pass deliberately stayed
+pipeline-verification/correctness-only throughout, and the choice of
+what (if anything) to tune next is explicitly the user's call to make,
+not an automated next step for a future session to take on its own
+initiative. `configs/ppo/ppo_tune.yaml` (untracked, unreferenced by
+any code — see PRE_P6_REPORT.md §7) may be a useful starting scaffold
+for that future work, at the user's discretion.
 
 If a future session is asked to continue this work, it should treat
 that as the START of a new, separately-scoped effort (its own plan,

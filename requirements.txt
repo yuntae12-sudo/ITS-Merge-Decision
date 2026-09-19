@@ -6,3 +6,4 @@ matplotlib
 pillow
 pyyaml
 pytest
+wandb==0.30.0

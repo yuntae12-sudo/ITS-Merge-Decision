@@ -10,6 +10,7 @@ save -> load -> resume -> additional-update cycle SS10 requires.
 """
 
 import dataclasses
+import math
 
 import jax
 import jax.tree_util as jtu
@@ -21,10 +22,12 @@ from src.training.checkpoint import (
     CheckpointPayload,
     get_git_sha,
     load_checkpoint,
+    restore_numpy_rng,
     save_checkpoint,
 )
 from src.training.config import load_ppo_config, load_reward_config
 from src.training.seeding import make_seed_state
+from src.training.trainer import run_update
 
 
 def _leaves(pytree):
@@ -251,3 +254,181 @@ def test_full_save_load_resume_additional_update_cycle(tmp_path, ppo_config, rew
     assert result_2["global_env_step"] > loaded.global_env_step
     assert loaded.ppo_update_step == result_1["ppo_update_step"] == 1
     assert result_2["ppo_update_step"] == 2
+
+
+# ======================================================================
+# Fix 5 (pre-P6 hardening): NumPy RNG checkpoint/resume.
+#
+# CheckpointPayload.numpy_rng_state (the tuple from
+# numpy.random.RandomState.get_state()) must round-trip through
+# save_checkpoint/load_checkpoint, and restoring it must reproduce the
+# EXACT minibatch shuffle order (and therefore identical resulting
+# params) a continuous run would have produced -- not merely restore
+# byte-identical state that happens never to get exercised.
+# ======================================================================
+
+
+def _make_synthetic_batch(n=12, seed=0):
+    """A small synthetic (non-environment) PPO training batch -- fast
+    and fully deterministic, isolating the NumPy-RNG-resume property
+    from any real-environment rollout variance."""
+
+    rng = np.random.RandomState(seed)
+    observation = rng.uniform(-1, 1, size=(n, 14)).astype(np.float32)
+    return {
+        "observation": observation,
+        "action": rng.randint(0, 4, size=(n,)).astype(np.int32),
+        "reward": rng.uniform(-1, 1, size=(n,)).astype(np.float64),
+        "next_observation": observation.copy(),
+        "terminated": np.zeros((n,), dtype=bool),
+        "truncated": np.zeros((n,), dtype=bool),
+        "value": rng.uniform(-1, 1, size=(n,)).astype(np.float64),
+        "next_value": rng.uniform(-1, 1, size=(n,)).astype(np.float64),
+        "log_prob": rng.uniform(-2, 0, size=(n,)).astype(np.float64),
+        "policy_mask": np.ones((n,), dtype=np.int32),
+        "advantages_raw": rng.uniform(-1, 1, size=(n,)).astype(np.float64),
+        "advantages": rng.uniform(-1, 1, size=(n,)).astype(np.float64),
+        "returns": rng.uniform(-1, 1, size=(n,)).astype(np.float64),
+        "old_logits": rng.uniform(-1, 1, size=(n, 4)).astype(np.float64),
+    }
+
+
+def test_numpy_rng_state_roundtrips_through_checkpoint(tmp_path, ppo_config):
+    """CheckpointPayload.numpy_rng_state must save/load byte-identically
+    via save_checkpoint/load_checkpoint, and restore_numpy_rng must
+    reproduce the exact same subsequent random draws as the original
+    RandomState would have produced."""
+
+    original_rng = np.random.RandomState(123)
+    _ = original_rng.permutation(10)  # advance the stream past init
+    saved_state = original_rng.get_state()
+
+    payload = CheckpointPayload(
+        policy_params={},
+        value_params={},
+        optimizer_state={},
+        jax_rng_key=jax.random.PRNGKey(0),
+        global_env_step=0,
+        ppo_update_step=0,
+        seed=123,
+        config_snapshot={},
+        reward_version="v0",
+        git_sha=get_git_sha(),
+        numpy_rng_state=saved_state,
+    )
+    path = tmp_path / "rng_ckpt.pkl"
+    save_checkpoint(payload, str(path))
+    loaded = load_checkpoint(str(path))
+
+    restored_rng = restore_numpy_rng(loaded.numpy_rng_state, fallback_seed=123)
+
+    # Both streams, from this point on, must draw identically.
+    expected_next = original_rng.permutation(10)
+    actual_next = restored_rng.permutation(10)
+    np.testing.assert_array_equal(expected_next, actual_next)
+
+
+def test_restore_numpy_rng_falls_back_to_seed_when_state_missing():
+    """An OLDER checkpoint with numpy_rng_state=None must fall back to
+    re-seeding from the run's seed, not crash."""
+
+    rng = restore_numpy_rng(None, fallback_seed=99)
+    expected = np.random.RandomState(99)
+    np.testing.assert_array_equal(rng.permutation(5), expected.permutation(5))
+
+
+def test_numpy_rng_checkpoint_resume_reproduces_minibatch_order_and_params(
+    tmp_path, ppo_config
+):
+    """The strongest Fix 5 test: Run A (uninterrupted) performs
+    run_update at step N then step N+1 on a deterministic synthetic
+    batch. Run B performs run_update at step N, SAVES the NumPy RNG
+    state via a real checkpoint round-trip, builds a FRESH
+    RandomState, LOADS the checkpoint, and performs step N+1 from the
+    loaded state. With identical initial training state / config /
+    batch, Run A and Run B's step-N+1 minibatch ordering and resulting
+    policy/value parameters must match exactly -- proving the
+    checkpointed NumPy RNG state resumes stochastic training state
+    correctly (not just static params/optimizer state, which the
+    pre-existing test_full_save_load_resume_additional_update_cycle
+    above already covers)."""
+
+    batch = _make_synthetic_batch()
+
+    def _fresh_training_state():
+        return create_train_state(
+            jax.random.PRNGKey(7),
+            learning_rate=ppo_config.hyperparameters.learning_rate,
+            max_grad_norm=ppo_config.hyperparameters.max_grad_norm,
+            policy_hidden_sizes=ppo_config.network.hidden_sizes,
+            value_hidden_sizes=ppo_config.network.hidden_sizes,
+        )
+
+    # --- Run A: one continuous NumPy RandomState across both updates.
+    training_state_a = _fresh_training_state()
+    rng_a = np.random.RandomState(555)
+    result_a1 = run_update(training_state_a, batch, ppo_config, rng_a)
+    result_a2 = run_update(result_a1["training_state"], batch, ppo_config, rng_a)
+
+    # --- Run B: same first update, but RESUME via a real checkpoint
+    # round-trip before the second update (simulating a fresh process).
+    training_state_b = _fresh_training_state()
+    rng_b = np.random.RandomState(555)
+    result_b1 = run_update(training_state_b, batch, ppo_config, rng_b)
+
+    checkpoint_path = tmp_path / "numpy_rng_resume.pkl"
+    payload = CheckpointPayload(
+        policy_params=result_b1["training_state"].policy_state.params,
+        value_params=result_b1["training_state"].value_state.params,
+        optimizer_state={
+            "policy": result_b1["training_state"].policy_state.opt_state,
+            "value": result_b1["training_state"].value_state.opt_state,
+        },
+        jax_rng_key=jax.random.PRNGKey(0),
+        global_env_step=0,
+        ppo_update_step=1,
+        seed=555,
+        config_snapshot={},
+        reward_version="v0",
+        git_sha=get_git_sha(),
+        numpy_rng_state=rng_b.get_state(),
+    )
+    save_checkpoint(payload, str(checkpoint_path))
+
+    # Simulate a brand-new process: fresh RandomState object, loaded
+    # checkpoint, restore the NumPy RNG stream from it.
+    loaded = load_checkpoint(str(checkpoint_path))
+    resumed_training_state_b = dataclasses.replace(
+        _fresh_training_state(),
+        policy_state=_fresh_training_state().policy_state.replace(
+            params=loaded.policy_params, opt_state=loaded.optimizer_state["policy"]
+        ),
+        value_state=_fresh_training_state().value_state.replace(
+            params=loaded.value_params, opt_state=loaded.optimizer_state["value"]
+        ),
+    )
+    resumed_rng_b = restore_numpy_rng(loaded.numpy_rng_state, fallback_seed=555)
+
+    result_b2 = run_update(resumed_training_state_b, batch, ppo_config, resumed_rng_b)
+
+    # Resulting parameters after the SECOND update must match exactly
+    # between the uninterrupted Run A and the checkpoint-resumed Run B
+    # -- proving the minibatch shuffle order (driven by the NumPy RNG)
+    # was reproduced exactly, not just that params/optimizer state
+    # resumed.
+    for a_leaf, b_leaf in zip(
+        _leaves(result_a2["training_state"].policy_state.params),
+        _leaves(result_b2["training_state"].policy_state.params),
+    ):
+        np.testing.assert_array_equal(a_leaf, b_leaf)
+    for a_leaf, b_leaf in zip(
+        _leaves(result_a2["training_state"].value_state.params),
+        _leaves(result_b2["training_state"].value_state.params),
+    ):
+        np.testing.assert_array_equal(a_leaf, b_leaf)
+
+    # Metrics (which depend on minibatch composition) must also match.
+    for key in result_a2["metrics"]:
+        assert math.isclose(
+            result_a2["metrics"][key], result_b2["metrics"][key], rel_tol=1e-9, abs_tol=1e-9
+        ), f"metric {key!r} diverged between Run A and resumed Run B"

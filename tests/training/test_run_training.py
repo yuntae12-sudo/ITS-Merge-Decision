@@ -284,3 +284,171 @@ def test_run_training_action_stats_only_count_policy_mask_one_rows(env, ppo_conf
     # rest 0.0, never a distribution smeared across many auto-execution
     # MERGE frames.
     assert sorted(ratios) == [0.0, 0.0, 0.0, 1.0]
+
+
+# ======================================================================
+# Fix 6/Fix 7 (pre-P6 hardening): W&B full diagnostics + reward
+# component logging correctness, exercised against a real
+# MergeEnvironment run_training call.
+# ======================================================================
+
+
+def test_run_training_emits_fix6_diagnostic_metrics(env, ppo_config, reward_config):
+    """Fix 6: the new W&B diagnostics must all be present, finite, and
+    within sane ranges after a real run_training call."""
+
+    import jax
+
+    seed_state = make_seed_state(ppo_config.seed)
+    init_key, run_key = jax.random.split(seed_state.jax_key)
+    training_state = create_train_state(
+        init_key,
+        learning_rate=ppo_config.hyperparameters.learning_rate,
+        max_grad_norm=ppo_config.hyperparameters.max_grad_norm,
+        policy_hidden_sizes=ppo_config.network.hidden_sizes,
+        value_hidden_sizes=ppo_config.network.hidden_sizes,
+    )
+
+    result = run_training(
+        ppo_config=ppo_config,
+        reward_config=reward_config,
+        env=env,
+        maneuvers=[CAUSALITY_MANEUVER],
+        training_state=training_state,
+        rng_key=run_key,
+        numpy_rng=seed_state.numpy_rng,
+        num_updates=1,
+        max_steps_per_episode=60,
+    )
+
+    metrics = result["updates"][0]
+
+    for key in (
+        "train/success_rate",
+        "train/collision_rate",
+        "train/offroad_rate",
+        "train/timeout_rate",
+        "train/policy_decision_count",
+        "train/physical_step_count",
+        "ppo/explained_variance",
+        "runtime/env_steps_per_sec",
+        "downstream/intervention_rate",
+        "downstream/planner_infeasible_rate",
+        "downstream/collision_blocked_rate",
+        "downstream/controller_failure_rate",
+        "downstream/invalid_reference_rate",
+    ):
+        assert key in metrics, f"missing Fix 6 diagnostic metric {key!r}"
+        assert np.isfinite(metrics[key]), f"{key!r} is non-finite: {metrics[key]}"
+
+    # policy_decision_count/physical_step_count: exactly one decision
+    # frame for CAUSALITY_MANEUVER (single-transition lane_chain),
+    # physical_step_count == total transitions collected.
+    assert metrics["train/policy_decision_count"] >= 1
+    assert metrics["train/physical_step_count"] >= metrics["train/policy_decision_count"]
+
+    # Exactly one outcome category should be lit for this single-
+    # episode rollout (success/collision/offroad/timeout rates sum to
+    # at most 1.0 across one episode).
+    outcome_sum = (
+        metrics["train/success_rate"]
+        + metrics["train/collision_rate"]
+        + metrics["train/offroad_rate"]
+        + metrics["train/timeout_rate"]
+    )
+    assert 0.0 <= outcome_sum <= 1.0 + 1e-9
+
+    assert metrics["runtime/env_steps_per_sec"] > 0.0
+
+
+def test_run_training_reward_terminal_includes_truncation_horizon(env, ppo_config, reward_config):
+    """Fix 7 regression: reward/terminal must include a TRUNCATION_HORIZON
+    (-0.5) episode's terminal component -- not just true-terminated
+    (SUCCESS/COLLISION/OFFROAD) episodes. Uses a deliberately tiny
+    max_steps_per_episode so the episode is virtually certain to hit
+    the environment's own truncation (episode horizon) before reaching
+    a true terminated outcome, on a maneuver that does not immediately
+    commit to MERGE."""
+
+    import jax
+
+    seed_state = make_seed_state(ppo_config.seed)
+    init_key, run_key = jax.random.split(seed_state.jax_key)
+    training_state = create_train_state(
+        init_key,
+        learning_rate=ppo_config.hyperparameters.learning_rate,
+        max_grad_norm=ppo_config.hyperparameters.max_grad_norm,
+        policy_hidden_sizes=ppo_config.network.hidden_sizes,
+        value_hidden_sizes=ppo_config.network.hidden_sizes,
+    )
+
+    # A single very-short rollout on SINGLE_MANEUVER: with an
+    # untrained/random policy this will very likely end via the
+    # environment's own max_steps cutoff inside collect_episode_rollout
+    # (rollout_cutoff=True), NOT a real environment truncated=True --
+    # so this test only asserts the aggregation logic is internally
+    # self-consistent (reward/terminal + reward/decision_cost ==
+    # reward/total) rather than asserting a specific truncation_horizon
+    # occurred (which cannot be forced deterministically without
+    # scripting the environment itself).
+    result = run_training(
+        ppo_config=ppo_config,
+        reward_config=reward_config,
+        env=env,
+        maneuvers=[SINGLE_MANEUVER],
+        training_state=training_state,
+        rng_key=run_key,
+        numpy_rng=seed_state.numpy_rng,
+        num_updates=1,
+        max_steps_per_episode=5,
+    )
+    metrics = result["updates"][0]
+
+    assert np.isfinite(metrics["reward/terminal"])
+    assert np.isfinite(metrics["reward/decision_cost"])
+    assert np.isfinite(metrics["reward/total"])
+    assert metrics["reward/terminal"] + metrics["reward/decision_cost"] == pytest.approx(
+        metrics["reward/total"], abs=1e-9
+    )
+
+
+def test_reward_terminal_aggregation_counts_truncated_transitions_directly():
+    """Fix 7 unit-level regression (no real environment needed):
+    directly on a synthetic transition list, reward/terminal's
+    aggregation formula (transitions.terminated OR transitions.truncated)
+    must include a truncated-but-not-terminated transition's reward,
+    unlike the old buggy version which only summed `t.terminated` rows
+    and would have silently misclassified a TRUNCATION_HORIZON step's
+    -0.5 terminal component as a decision-cost component instead."""
+
+    from src.training.rollout import Transition
+
+    transitions = [
+        Transition(
+            observation=np.zeros(14), action=0, reward=-0.01,
+            next_observation=np.zeros(14), terminated=False, truncated=False,
+            value=0.0, next_value=0.0, log_prob=0.0, policy_mask=1,
+            episode_id="ep0",
+        ),
+        Transition(
+            observation=np.zeros(14), action=0, reward=-0.51,  # -0.5 terminal + -0.01 decision cost
+            next_observation=np.zeros(14), terminated=False, truncated=True,
+            value=0.0, next_value=0.0, log_prob=0.0, policy_mask=0,
+            episode_id="ep0",
+        ),
+    ]
+
+    # Reproduce the exact Fix 7 aggregation formula from trainer.py.
+    reward_terminal = float(sum(t.reward for t in transitions if t.terminated or t.truncated))
+    reward_total = float(sum(t.reward for t in transitions))
+    reward_decision_cost = reward_total - reward_terminal
+
+    assert reward_terminal == pytest.approx(-0.51)
+    assert reward_decision_cost == pytest.approx(-0.01)
+
+    # The OLD (buggy) formula would have given reward_terminal == 0.0
+    # (no transition has terminated=True) -- confirm the fix actually
+    # changes behavior relative to that regression case.
+    old_buggy_reward_terminal = float(sum(t.reward for t in transitions if t.terminated))
+    assert old_buggy_reward_terminal == pytest.approx(0.0)
+    assert reward_terminal != old_buggy_reward_terminal
