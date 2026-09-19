@@ -505,10 +505,25 @@ P6+ user decision, not a queued action.
 
 ---
 
+## Small follow-up correction (post Pre-P6 hardening)
+
+A narrow, additive bug fix landed on this branch immediately after the
+Pre-P6 hardening pass's final commit: the `reward/terminal`/
+`reward/decision_cost` W&B breakdown (Fix 7) still mis-split a
+terminal/truncated outcome that landed on a real policy-decision step
+(e.g. SUCCESS `+1.0` plus `-0.01` decision cost was fully counted as
+`reward/terminal`). Fixed via Transition-level propagation of
+`MergeRewardWrapper`'s own already-correct per-step components — no
+change to Reward V0's values, PPO hyperparameters, or the end-state
+below. See [PRE_P6_REPORT.md §10](PRE_P6_REPORT.md#10-follow-up-fix-reward-component-logging-correctness-post-report)
+for the full writeup (12 new tests, full regression 641 passed/0
+failed).
+
 ## NEXT OWNER ACTION
 
 **Both the entire P0-P5 PPO effort AND the follow-up Pre-P6
-correctness/instrumentation hardening pass are COMPLETE.** State:
+correctness/instrumentation hardening pass (including the small
+reward-component-logging correction above) are COMPLETE.** State:
 **PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**. Every item in
 [PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) holds — see
 [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the P0-P5

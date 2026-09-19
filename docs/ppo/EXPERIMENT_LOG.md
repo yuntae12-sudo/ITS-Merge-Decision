@@ -1128,3 +1128,79 @@ Format per entry:
   **PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**. See
   docs/ppo/HANDOFF.md's NEXT OWNER ACTION for what happens next (a
   user decision, not a queued automated action).
+
+## 2026-09-19 — Reward component logging follow-up fix complete
+
+Landed on `feat/ppo-pre-p6`, one commit immediately after the Pre-P6
+hardening pass's own final commit (`d75b593`). Narrow, additive bug
+fix -- not a reopening of the Pre-P6 hardening pass's completed scope.
+
+**Bug:** Fix 7's `reward/terminal` aggregation
+(`sum(t.reward for t in transitions if t.terminated or t.truncated)`)
+was still wrong whenever a terminal/truncated outcome landed on a real
+policy-decision step: `t.reward` on that row is
+`terminal_component + decision_cost_component` combined, not just the
+terminal part, so e.g. SUCCESS `+1.0` combined with a `-0.01` decision
+cost (`t.reward == +0.99`) got fully attributed to `reward/terminal`
+instead of splitting `+1.0` terminal / `-0.01` decision cost.
+
+**Fix:** `src/rewards/reward_wrapper.py`'s `MergeRewardWrapper` already
+computed the correct per-step `last_terminal_component`/
+`last_decision_cost_component` (unchanged by this fix). Added two
+additive fields to `src/training/rollout.py`'s `Transition`
+(`reward_terminal_component`, `reward_decision_cost_component`,
+both defaulting to `0.0`), populated from the wrapper's own values
+immediately after each `reward_wrapper.compute(...)` call inside
+`collect_episode_rollout`, and changed `src/training/trainer.py`'s
+`run_training` metrics block to sum those fields directly instead of
+guessing from `terminated`/`truncated`. Confirmed (not assumed) that
+an artificial `rollout_cutoff` step already gets
+`reward_terminal_component == 0.0` for free, since
+`reward_wrapper.compute` is called with that step's real (non-terminal)
+`info_after["termination_reason"]` -- verified by a new real-environment
+test, `test_reward_components_zero_terminal_on_artificial_cutoff`.
+
+**Reward V0 values / PPO hyperparameters:** unchanged (verified via
+`git diff --stat -- configs/ src/rewards/` empty, and every new test
+asserting the exact fixed-table values: success=+1.0,
+failure_collision=-1.0, failure_offroad=-1.0, truncation_horizon=-0.5,
+none=0.0, decision_cost -0.01/0.0).
+
+**Tests added (12):** Tests A-H from the fix's task scope
+(SUCCESS+real-decision, FAILURE_COLLISION+real-decision,
+FAILURE_OFFROAD+auto-execution, TRUNCATION_HORIZON+real-decision,
+NONTERMINAL+real-decision, artificial-cutoff, episode-aggregate
+identity, `run_training` W&B-metrics-match-components) across
+`tests/training/test_pre_p6_hardening.py`,
+`tests/training/test_rollout.py` (2 real-environment tests), and
+`tests/training/test_run_training.py` (2 tests, one synthetic-batch,
+one real end-to-end `run_training` call).
+
+Targeted run (`tests/training/test_run_training.py
+tests/training/test_pre_p6_hardening.py tests/rewards/
+tests/training/test_trainer.py tests/training/test_rollout.py -q`):
+**93 passed, 0 failed**.
+
+Smoke run (`PYTHONPATH=. WANDB_MODE=offline python
+scripts/smoke_train_ppo.py --max-maneuvers 2 --num-updates 1
+--max-episode-steps 60`): both maneuvers reached real SUCCESS
+terminal outcomes on real policy-decision steps. Result:
+`train/success_rate=1.0`, `reward/terminal=2.0` (exactly `2 x +1.0`,
+uncontaminated), `reward/decision_cost=-0.23` (`23 x -0.01`, matching
+`train/policy_decision_count=23.0`), `reward/total=1.77`. Under the
+pre-fix code this would have read `reward/terminal=1.98`
+(`2 x 0.99`) instead.
+
+Full regression suite (verified solo, no concurrent `pytest` process):
+**641 passed, 0 failed, in 2072.81s (0:34:32)**. Baseline into this fix
+(from `d75b593`) was 629 passed; 629 + 12 new tests = 641, confirming
+no test was lost or silently skipped.
+
+`git diff --stat -- src/environment/ src/planning/ src/control/
+src/scenarios/` against `main`: confirmed EMPTY. Exactly one new
+commit landed on top of `d75b593`.
+
+State remains **PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**
+-- see docs/ppo/PRE_P6_REPORT.md §10 for the full writeup and
+docs/ppo/HANDOFF.md's NEXT OWNER ACTION for what happens next (still a
+user decision, not a queued automated action).

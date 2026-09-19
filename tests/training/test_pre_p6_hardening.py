@@ -697,3 +697,319 @@ def test_reward_nonterminal_decision_cost_only_case():
     assert math.isclose(reward_terminal, 0.0, abs_tol=1e-9)
     assert math.isclose(reward_decision_cost, nonterminal_reward, abs_tol=1e-9)
     assert math.isclose(nonterminal_reward, -0.01, abs_tol=1e-9)
+
+
+# ======================================================================
+# Fix 7 follow-up: Transition-level reward component propagation
+#
+# The Fix 7 aggregation above (``sum(t.reward for t in transitions if
+# t.terminated or t.truncated)``) is itself still wrong whenever a
+# terminal/truncated step is ALSO a real policy-decision step: `t.reward`
+# on that row is terminal_component + decision_cost_component combined
+# (e.g. SUCCESS +1.0 on a real decision step, decision cost -0.01, so
+# t.reward == +0.99), so the old formula dumps the WHOLE +0.99 into
+# reward/terminal instead of splitting +1.0 terminal / -0.01 decision
+# cost. ``Transition.reward_terminal_component`` /
+# ``reward_decision_cost_component`` (propagated verbatim from
+# ``MergeRewardWrapper.compute``'s own per-step components -- never
+# re-derived from terminated/truncated) fix this: summing THOSE fields
+# directly is exact in every case, including this one.
+# ======================================================================
+
+
+def _reward_terminal_decision_cost_total(transitions):
+    """The CORRECTED trainer.py aggregation formula (post-Fix-7-followup):
+    sum each Transition's own propagated components directly, never
+    re-deriving them from terminated/truncated."""
+
+    reward_terminal = float(sum(t.reward_terminal_component for t in transitions))
+    reward_decision_cost = float(sum(t.reward_decision_cost_component for t in transitions))
+    reward_total = float(sum(t.reward for t in transitions))
+    return reward_terminal, reward_decision_cost, reward_total
+
+
+def test_component_split_success_plus_real_decision_step():
+    """Test A: SUCCESS landing on a real policy-decision step. The old
+    buggy formula would give reward/terminal == +0.99 (contaminated by
+    the decision cost); the fix must give exactly +1.0 terminal / -0.01
+    decision cost / +0.99 total."""
+
+    from src.rewards.merge_reward import compute_reward
+    from src.training.config import load_reward_config
+
+    reward_config = load_reward_config()
+    success_reward = compute_reward(reward_config, "success", is_policy_step=True)
+    assert math.isclose(success_reward, 0.99, abs_tol=1e-9)
+
+    transitions = [
+        _make_transition(
+            episode_id="ep0",
+            terminated=True,
+            truncated=False,
+            policy_mask=1,
+            reward=success_reward,
+            reward_terminal_component=1.0,
+            reward_decision_cost_component=-0.01,
+        )
+    ]
+
+    reward_terminal, reward_decision_cost, reward_total = _reward_terminal_decision_cost_total(
+        transitions
+    )
+    assert math.isclose(reward_terminal, 1.0, abs_tol=1e-9)
+    assert math.isclose(reward_decision_cost, -0.01, abs_tol=1e-9)
+    assert math.isclose(reward_total, 0.99, abs_tol=1e-9)
+
+    # The OLD buggy formula (whole-reward-as-terminal) would have
+    # incorrectly attributed the full +0.99 to reward/terminal.
+    old_buggy_reward_terminal = float(
+        sum(t.reward for t in transitions if t.terminated or t.truncated)
+    )
+    assert old_buggy_reward_terminal == pytest.approx(0.99)
+    assert reward_terminal != old_buggy_reward_terminal
+
+
+def test_component_split_failure_collision_plus_real_decision_step():
+    """Test B: FAILURE_COLLISION on a real policy-decision step:
+    terminal=-1.0, decision=-0.01, total=-1.01."""
+
+    from src.rewards.merge_reward import compute_reward
+    from src.training.config import load_reward_config
+
+    reward_config = load_reward_config()
+    collision_reward = compute_reward(
+        reward_config, "failure_collision", is_policy_step=True
+    )
+    assert math.isclose(collision_reward, -1.01, abs_tol=1e-9)
+
+    transitions = [
+        _make_transition(
+            episode_id="ep0",
+            terminated=True,
+            truncated=False,
+            policy_mask=1,
+            reward=collision_reward,
+            reward_terminal_component=-1.0,
+            reward_decision_cost_component=-0.01,
+        )
+    ]
+
+    reward_terminal, reward_decision_cost, reward_total = _reward_terminal_decision_cost_total(
+        transitions
+    )
+    assert math.isclose(reward_terminal, -1.0, abs_tol=1e-9)
+    assert math.isclose(reward_decision_cost, -0.01, abs_tol=1e-9)
+    assert math.isclose(reward_total, -1.01, abs_tol=1e-9)
+
+
+def test_component_split_failure_offroad_plus_auto_execution_step():
+    """Test C: FAILURE_OFFROAD on an auto-execution (policy_mask=0)
+    step: terminal=-1.0, decision=0.0, total=-1.0."""
+
+    from src.rewards.merge_reward import compute_reward
+    from src.training.config import load_reward_config
+
+    reward_config = load_reward_config()
+    offroad_reward = compute_reward(
+        reward_config, "failure_offroad", is_policy_step=False
+    )
+    assert math.isclose(offroad_reward, -1.0, abs_tol=1e-9)
+
+    transitions = [
+        _make_transition(
+            episode_id="ep0",
+            terminated=True,
+            truncated=False,
+            policy_mask=0,
+            reward=offroad_reward,
+            reward_terminal_component=-1.0,
+            reward_decision_cost_component=0.0,
+        )
+    ]
+
+    reward_terminal, reward_decision_cost, reward_total = _reward_terminal_decision_cost_total(
+        transitions
+    )
+    assert math.isclose(reward_terminal, -1.0, abs_tol=1e-9)
+    assert math.isclose(reward_decision_cost, 0.0, abs_tol=1e-9)
+    assert math.isclose(reward_total, -1.0, abs_tol=1e-9)
+
+
+def test_component_split_truncation_horizon_plus_real_decision_step():
+    """Test D: TRUNCATION_HORIZON on a real policy-decision step:
+    terminal=-0.5, decision=-0.01, total=-0.51."""
+
+    from src.rewards.merge_reward import compute_reward
+    from src.training.config import load_reward_config
+
+    reward_config = load_reward_config()
+    truncation_reward = compute_reward(
+        reward_config, "truncation_horizon", is_policy_step=True
+    )
+    assert math.isclose(truncation_reward, -0.51, abs_tol=1e-9)
+
+    transitions = [
+        _make_transition(
+            episode_id="ep0",
+            terminated=False,
+            truncated=True,
+            policy_mask=1,
+            reward=truncation_reward,
+            reward_terminal_component=-0.5,
+            reward_decision_cost_component=-0.01,
+        )
+    ]
+
+    reward_terminal, reward_decision_cost, reward_total = _reward_terminal_decision_cost_total(
+        transitions
+    )
+    assert math.isclose(reward_terminal, -0.5, abs_tol=1e-9)
+    assert math.isclose(reward_decision_cost, -0.01, abs_tol=1e-9)
+    assert math.isclose(reward_total, -0.51, abs_tol=1e-9)
+
+
+def test_component_split_nonterminal_plus_real_decision_step():
+    """Test E: NONTERMINAL (termination_reason == none) on a real
+    policy-decision step: terminal=0.0, decision=-0.01, total=-0.01."""
+
+    from src.rewards.merge_reward import compute_reward
+    from src.training.config import load_reward_config
+
+    reward_config = load_reward_config()
+    nonterminal_reward = compute_reward(reward_config, "none", is_policy_step=True)
+    assert math.isclose(nonterminal_reward, -0.01, abs_tol=1e-9)
+
+    transitions = [
+        _make_transition(
+            episode_id="ep0",
+            terminated=False,
+            truncated=False,
+            policy_mask=1,
+            reward=nonterminal_reward,
+            reward_terminal_component=0.0,
+            reward_decision_cost_component=-0.01,
+        )
+    ]
+
+    reward_terminal, reward_decision_cost, reward_total = _reward_terminal_decision_cost_total(
+        transitions
+    )
+    assert math.isclose(reward_terminal, 0.0, abs_tol=1e-9)
+    assert math.isclose(reward_decision_cost, -0.01, abs_tol=1e-9)
+    assert math.isclose(reward_total, -0.01, abs_tol=1e-9)
+
+
+def test_component_split_artificial_rollout_cutoff_excludes_terminal():
+    """Test F: an artificial rollout_cutoff step (max_steps ran out
+    WITHOUT the environment itself reporting terminated/truncated) must
+    get reward_terminal_component == 0.0 -- never a synthesized terminal
+    outcome -- with only its own is_policy_step/policy_mask value
+    driving the decision-cost component.
+
+    Covers both a real-decision-step cutoff (decision cost -0.01) and
+    an auto-execution-step cutoff (decision cost 0.0)."""
+
+    from src.rewards.merge_reward import compute_reward
+    from src.training.config import load_reward_config
+
+    reward_config = load_reward_config()
+
+    # Cutoff on what would have been a real policy-decision step.
+    nonterminal_decision_reward = compute_reward(
+        reward_config, "none", is_policy_step=True
+    )
+    cutoff_decision_transition = _make_transition(
+        episode_id="ep0",
+        terminated=False,
+        truncated=False,
+        policy_mask=1,
+        rollout_cutoff=True,
+        reward=nonterminal_decision_reward,
+        reward_terminal_component=0.0,
+        reward_decision_cost_component=-0.01,
+    )
+    assert cutoff_decision_transition.reward_terminal_component == pytest.approx(0.0)
+    assert cutoff_decision_transition.reward_decision_cost_component == pytest.approx(-0.01)
+
+    # Cutoff on what would have been an auto-execution step.
+    nonterminal_auto_reward = compute_reward(
+        reward_config, "none", is_policy_step=False
+    )
+    cutoff_auto_transition = _make_transition(
+        episode_id="ep1",
+        terminated=False,
+        truncated=False,
+        policy_mask=0,
+        rollout_cutoff=True,
+        reward=nonterminal_auto_reward,
+        reward_terminal_component=0.0,
+        reward_decision_cost_component=0.0,
+    )
+    assert cutoff_auto_transition.reward_terminal_component == pytest.approx(0.0)
+    assert cutoff_auto_transition.reward_decision_cost_component == pytest.approx(0.0)
+
+    reward_terminal, reward_decision_cost, reward_total = _reward_terminal_decision_cost_total(
+        [cutoff_decision_transition, cutoff_auto_transition]
+    )
+    assert math.isclose(reward_terminal, 0.0, abs_tol=1e-9)
+    assert math.isclose(reward_decision_cost, -0.01, abs_tol=1e-9)
+    assert math.isclose(reward_total, -0.01, abs_tol=1e-9)
+
+
+def test_component_split_episode_aggregate_identity():
+    """Test G: over a realistic multi-step episode (two nonterminal
+    real-decision steps, one auto-execution step, then a SUCCESS on a
+    real decision step), sum(terminal components) + sum(decision-cost
+    components) == sum(rewards), within 1e-6 tolerance."""
+
+    from src.rewards.merge_reward import compute_reward
+    from src.training.config import load_reward_config
+
+    reward_config = load_reward_config()
+    nonterminal_decision = compute_reward(reward_config, "none", is_policy_step=True)
+    nonterminal_auto = compute_reward(reward_config, "none", is_policy_step=False)
+    success_reward = compute_reward(reward_config, "success", is_policy_step=True)
+
+    transitions = [
+        _make_transition(
+            episode_id="ep0", terminated=False, truncated=False, policy_mask=1,
+            reward=nonterminal_decision,
+            reward_terminal_component=0.0, reward_decision_cost_component=-0.01,
+        ),
+        _make_transition(
+            episode_id="ep0", terminated=False, truncated=False, policy_mask=0,
+            reward=nonterminal_auto,
+            reward_terminal_component=0.0, reward_decision_cost_component=0.0,
+        ),
+        _make_transition(
+            episode_id="ep0", terminated=False, truncated=False, policy_mask=1,
+            reward=nonterminal_decision,
+            reward_terminal_component=0.0, reward_decision_cost_component=-0.01,
+        ),
+        _make_transition(
+            episode_id="ep0", terminated=True, truncated=False, policy_mask=1,
+            reward=success_reward,
+            reward_terminal_component=1.0, reward_decision_cost_component=-0.01,
+        ),
+    ]
+
+    reward_terminal, reward_decision_cost, reward_total = _reward_terminal_decision_cost_total(
+        transitions
+    )
+    assert math.isclose(reward_terminal + reward_decision_cost, reward_total, abs_tol=1e-6)
+    assert math.isclose(reward_terminal, 1.0, abs_tol=1e-9)
+    # Three real-decision steps (-0.01 each) + one auto-execution step
+    # (0.0) contribute to reward/decision_cost.
+    assert math.isclose(reward_decision_cost, -0.03, abs_tol=1e-9)
+    assert math.isclose(reward_total, 0.97, abs_tol=1e-9)
+
+
+def test_transition_reward_component_fields_default_to_zero():
+    """A Transition constructed without the new component fields (an
+    older/synthetic transition list predating this fix) degrades to
+    0.0/0.0 rather than crashing -- confirms the fields are purely
+    additive."""
+
+    t = _make_transition(episode_id="ep0", reward=-0.01)
+    assert t.reward_terminal_component == 0.0
+    assert t.reward_decision_cost_component == 0.0

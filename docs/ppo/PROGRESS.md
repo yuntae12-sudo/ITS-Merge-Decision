@@ -1409,10 +1409,31 @@ count. P2's own full-suite run followed this rule from the start (no
 stale process found) and completed clean on the first attempt, with
 no spurious failures to diagnose.
 
+## Small follow-up correction landed after Pre-P6 hardening
+
+A narrow, additive bug fix landed on `feat/ppo-pre-p6` immediately
+after the Pre-P6 hardening pass's own final commit (`d75b593`): Fix
+7's `reward/terminal`/`reward/decision_cost` W&B breakdown was still
+slightly wrong whenever a terminal/truncated outcome landed on a real
+policy-decision step (e.g. SUCCESS `+1.0` combined with a `-0.01`
+decision cost got fully counted as `reward/terminal` instead of split
+`+1.0`/`-0.01`). Fixed by propagating `MergeRewardWrapper`'s own
+already-correct per-step `last_terminal_component`/
+`last_decision_cost_component` onto two new additive `Transition`
+fields (`reward_terminal_component`/`reward_decision_cost_component`)
+and summing those directly in `trainer.py`, instead of guessing from
+`terminated`/`truncated`. Reward V0's values and PPO hyperparameters
+are unchanged; 12 new tests added; full regression 641 passed / 0
+failed (629 baseline + 12 new). See
+[PRE_P6_REPORT.md §10](PRE_P6_REPORT.md#10-follow-up-fix-reward-component-logging-correctness-post-report)
+for the full writeup. This does **not** change the end-state below —
+it is a correction within the same phase.
+
 ## Next Exact Action
 
 **None — the entire P0-P5 effort, AND the follow-up Pre-P6
-correctness/instrumentation hardening pass, are both COMPLETE.** All
+correctness/instrumentation hardening pass (including the small
+reward-component-logging correction above), are both COMPLETE.** All
 items in [PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) hold
 (see [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the P0-P5
 itemized evidence and [PRE_P6_REPORT.md](PRE_P6_REPORT.md) for the

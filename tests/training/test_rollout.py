@@ -364,6 +364,94 @@ def test_terminal_reward_propagates_to_merge_decision_frame(env, ppo_core, rewar
         assert decision_frame_return < decision_frame_immediate_reward
 
 
+def test_reward_components_propagate_from_wrapper_to_transitions(env, ppo_core, reward_config):
+    """Reward component logging correctness follow-up fix: each real
+    rollout Transition's reward_terminal_component /
+    reward_decision_cost_component must match what MergeRewardWrapper
+    actually computed for that step (never a synthesized/re-derived
+    value), and every transition's two components must sum to exactly
+    its own `reward` -- including the final terminal transition, where
+    the OLD trainer.py bug would have conflated the two."""
+
+    scripted_policy = _ScriptedMergePolicy(
+        ppo_core["ppo_policy"]._policy_network, ppo_core["ppo_policy"]._policy_params
+    )
+
+    rng_key = jax.random.PRNGKey(2024)
+    transitions = collect_episode_rollout(
+        env=env,
+        maneuver=CAUSALITY_MANEUVER,
+        ppo_policy=scripted_policy,
+        value_network=ppo_core["value_network"],
+        value_params=ppo_core["value_params"],
+        reward_config=reward_config,
+        rng_key=rng_key,
+        max_steps=60,
+    )
+
+    assert transitions[-1].terminated, "Expected a true terminal outcome (success/collision/offroad)"
+
+    for t in transitions:
+        assert t.reward_terminal_component + t.reward_decision_cost_component == pytest.approx(
+            t.reward, abs=1e-9
+        )
+
+    # The final (terminal) transition's terminal component must be one
+    # of Reward V0's fixed terminal-outcome values, not contaminated by
+    # any decision-cost component -- the exact bug this fix guards
+    # against (the old code would have folded the ENTIRE t.reward,
+    # decision cost included, into what it called "terminal").
+    final = transitions[-1]
+    assert final.reward_terminal_component in (1.0, -1.0)
+    assert final.reward_decision_cost_component in (-0.01, 0.0)
+
+    # Episode-aggregate identity (Test G, real-environment version):
+    # sum of components must equal sum of rewards within tolerance.
+    total_terminal = sum(t.reward_terminal_component for t in transitions)
+    total_decision_cost = sum(t.reward_decision_cost_component for t in transitions)
+    total_reward = sum(t.reward for t in transitions)
+    assert total_terminal + total_decision_cost == pytest.approx(total_reward, abs=1e-6)
+
+
+def test_reward_components_zero_terminal_on_artificial_cutoff(env, ppo_core, reward_config):
+    """An artificial rollout_cutoff transition (max_steps exhausted
+    without the environment itself reporting terminated/truncated) must
+    have reward_terminal_component == 0.0 -- confirms
+    MergeRewardWrapper.compute is actually invoked with the
+    environment's real (non-terminal) termination_reason for such a
+    step, not a synthesized terminal status."""
+
+    scripted_policy = _ScriptedMergePolicy(
+        ppo_core["ppo_policy"]._policy_network, ppo_core["ppo_policy"]._policy_params
+    )
+
+    rng_key = jax.random.PRNGKey(7)
+    # SINGLE_MANEUVER + a tiny max_steps: very likely to hit the
+    # artificial trainer-side cutoff before any real environment
+    # terminated/truncated outcome.
+    transitions = collect_episode_rollout(
+        env=env,
+        maneuver=SINGLE_MANEUVER,
+        ppo_policy=scripted_policy,
+        value_network=ppo_core["value_network"],
+        value_params=ppo_core["value_params"],
+        reward_config=reward_config,
+        rng_key=rng_key,
+        max_steps=3,
+    )
+
+    last = transitions[-1]
+    if last.rollout_cutoff:
+        assert not last.terminated
+        assert not last.truncated
+        assert last.reward_terminal_component == pytest.approx(0.0)
+        # Only the decision-cost component (driven by that step's own
+        # policy_mask), never a synthesized terminal outcome.
+        expected_decision_cost = -0.01 if last.policy_mask == 1 else 0.0
+        assert last.reward_decision_cost_component == pytest.approx(expected_decision_cost)
+        assert last.reward == pytest.approx(expected_decision_cost)
+
+
 # ======================================================================
 # SS7.2 test B: Actor-loss invariance to masked frames (integration
 # level, using a real scripted rollout's policy_mask==0 frames)

@@ -337,3 +337,106 @@ training, canonical VAL evaluation, or an FSM-vs-PPO comparison. None
 of that has been started, scoped, or recommended by this phase.
 `configs/ppo/ppo_tune.yaml` (untracked, see §7) may be a useful
 starting scaffold for that future work, at the user's discretion.
+
+---
+
+## 10. Follow-up fix: reward component logging correctness (post-report)
+
+Landed in the commit immediately following `d75b593` on this branch
+(this report's own commit). Scope: a narrow, additive bug fix to Fix
+7's `reward/terminal`/`reward/decision_cost` W&B breakdown — **not** a
+reopening of §9's "no P6 action recommended" stance.
+
+**What was wrong:** Fix 7 (§1/§6 above) corrected `reward/terminal` to
+include TRUNCATION_HORIZON's `-0.5` component (previously only rows
+with `terminated == True` were counted), but its aggregation formula
+was still `sum(t.reward for t in transitions if t.terminated or
+t.truncated)`. `t.reward` on a terminal/truncated row is
+`terminal_component + decision_cost_component` combined (see
+`src/rewards/merge_reward.py`), not just the terminal part. So whenever
+a terminal/truncated outcome landed on a *real policy-decision* step
+(e.g. SUCCESS `+1.0` with decision cost `-0.01`, `t.reward == +0.99`),
+the old formula dumped the **whole** `+0.99` into `reward/terminal`
+instead of splitting it into `+1.0` terminal / `-0.01` decision cost —
+skewing both metrics whenever that combination occurred.
+
+**The fix — Transition-level component propagation:**
+`src/rewards/reward_wrapper.py`'s `MergeRewardWrapper.compute` already
+computed and exposed the exact terminal/decision-cost components for
+the step it just processed, via `last_terminal_component`/
+`last_decision_cost_component` (unchanged by this fix — it is the
+frozen source of truth). The bug was that neither component was ever
+propagated onto the `Transition` the rollout loop builds for that
+step, leaving `trainer.py` to guess from `terminated`/`truncated`
+alone. Fixed by:
+
+1. `src/training/rollout.py`: `Transition` gains two additive fields,
+   `reward_terminal_component: float = 0.0` and
+   `reward_decision_cost_component: float = 0.0` (defaulting to 0.0 so
+   any older/synthetic `Transition` construction still works).
+2. `collect_episode_rollout` reads `reward_wrapper.
+   last_terminal_component`/`last_decision_cost_component` immediately
+   after the existing `reward_wrapper.compute(...)` call for that step
+   and stores them on the `Transition` it constructs — a pure
+   pass-through, never re-derived from `terminated`/`truncated`.
+3. `src/training/trainer.py`'s `run_training` per-update metrics block
+   now computes `reward_terminal = sum(t.reward_terminal_component ...)`
+   and `reward_decision_cost = sum(t.reward_decision_cost_component
+   ...)` directly, replacing the old `terminated`/`truncated`-based
+   guess. `reward_total` is still `np.sum(batch["reward"])`.
+
+**Artificial rollout-cutoff edge case, verified not assumed:** when
+`collect_episode_rollout`'s `max_steps` loop exhausts without the
+environment itself reporting `terminated`/`truncated`
+(`rollout_cutoff=True`), `reward_wrapper.compute` is called with that
+step's real `info_after["termination_reason"]` — which the
+environment itself set to `"none"` (non-terminal), since it did not
+terminate — so `last_terminal_component` is already `0.0` for that
+call with no special-casing needed. This was confirmed empirically
+(not assumed) by
+`tests/training/test_rollout.py::test_reward_components_zero_terminal_on_artificial_cutoff`
+against the real environment.
+
+**Reward V0 values confirmed unchanged:** `success=+1.0`,
+`failure_collision=-1.0`, `failure_offroad=-1.0`,
+`truncation_horizon=-0.5`, `none=0.0`, `decision_cost` `-0.01`
+(real policy-decision step) / `0.0` (auto-execution step) — verified
+via `git diff --stat -- configs/ src/rewards/` (empty) and by every
+new test asserting these exact fixed-table values.
+`src/rewards/reward_wrapper.py`'s `MergeRewardWrapper` itself was not
+modified — only read.
+
+**Targeted test results:** added 12 new tests (Tests A-H from this
+fix's task scope, plus two supporting real-environment/edge-case
+tests) across `tests/training/test_pre_p6_hardening.py`,
+`tests/training/test_rollout.py`, and `tests/training/
+test_run_training.py`. Full targeted run —
+`pytest tests/training/test_run_training.py
+tests/training/test_pre_p6_hardening.py tests/rewards/
+tests/training/test_trainer.py tests/training/test_rollout.py -q` —
+**93 passed, 0 failed**.
+
+**Smoke-training confirmation:** `PYTHONPATH=. WANDB_MODE=offline
+python scripts/smoke_train_ppo.py --max-maneuvers 2 --num-updates 1
+--max-episode-steps 60` on 2 real canonical-TRAIN maneuvers, both
+reaching real SUCCESS terminal outcomes on real policy-decision steps
+— exactly the case the bug mishandled. Result:
+`train/success_rate=1.0`, `reward/terminal=2.0` (exactly `2 × +1.0`,
+the fixed SUCCESS table value — no decision-cost contamination),
+`reward/decision_cost=-0.23` (`23 × -0.01`, matching
+`train/policy_decision_count=23.0` exactly), `reward/total=1.77`
+(`2.0 + -0.23`). This is the genuine component split the fix is meant
+to produce; under the pre-fix code, `reward/terminal` here would have
+been inflated to `1.98` (`2 × 0.99`) and `reward/decision_cost`
+correspondingly deflated.
+
+**Full regression suite result:** `pytest tests/ -q` in the
+`its-merge` conda environment (confirmed no concurrent `pytest`
+process first, per §"Lesson learned" in HANDOFF.md/EXPERIMENT_LOG.md)
+— **641 passed, 0 failed, in 2072.81s (0:34:32)**. Baseline going into
+this fix (from `d75b593`) was 629 passed; 629 + 12 new tests = 641,
+confirming no test was lost or silently skipped.
+
+State remains **PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**
+(§9 above still applies unchanged) — this was a correction within the
+same phase, not new P6-scoped work.

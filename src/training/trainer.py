@@ -599,29 +599,31 @@ def run_training(
             episode_returns[t.episode_id] += t.reward
         mean_episode_return = float(np.mean(list(episode_returns.values()))) if episode_returns else 0.0
 
-        # Fix 7 (reward component logging correctness): reward/terminal
-        # is the terminal-outcome component of EVERY step that carries
-        # one -- that is every step where the environment reported
-        # EITHER terminated=True (SUCCESS/COLLISION/OFFROAD) OR
-        # truncated=True (TRUNCATION_HORIZON, -0.5). The previous
-        # version of this aggregation only summed `t.terminated` rows,
-        # silently dropping TRUNCATION_HORIZON's -0.5 terminal
-        # component into reward/decision_cost instead (a truncated
-        # step's reward is terminal_outcome(-0.5) + decision_cost, same
-        # as any other step -- see src/rewards/merge_reward.py) --
-        # undercounting reward/terminal and overcounting
-        # reward/decision_cost whenever an episode ends via timeout
-        # rather than a true terminated outcome. An artificial
-        # collection-only rollout_cutoff (Fix 1) is NEITHER terminated
-        # nor truncated -- by construction it carries only a
-        # decision-cost component (SS5.1: never synthesize a terminal
-        # reward for a trainer-side cutoff), so it is correctly
-        # excluded from reward/terminal here without any special case.
+        # Fix 7 follow-up (reward component logging correctness): the
+        # PRIOR version of this aggregation approximated reward/terminal
+        # by summing the FULL `t.reward` of every terminated/truncated
+        # row -- but `t.reward` on such a row is terminal_component +
+        # decision_cost_component combined (see
+        # src/rewards/merge_reward.py), so e.g. a SUCCESS (+1.0) landing
+        # on a real policy-decision step (-0.01 decision cost) dumped
+        # the whole +0.99 into reward/terminal instead of splitting it
+        # into +1.0 terminal / -0.01 decision cost. Each `Transition`
+        # now carries its own exact `reward_terminal_component`/
+        # `reward_decision_cost_component`, propagated verbatim from
+        # `MergeRewardWrapper.compute`'s per-step
+        # `last_terminal_component`/`last_decision_cost_component`
+        # (never re-derived from `terminated`/`truncated` here) --
+        # summing those directly is now exact, including on an
+        # artificial rollout_cutoff row (which the wrapper already
+        # correctly gave a 0.0 terminal component, since the
+        # environment's own termination_reason was non-terminal there).
         reward_terminal = float(
-            sum(t.reward for t in transitions if t.terminated or t.truncated)
+            sum(t.reward_terminal_component for t in transitions)
+        )
+        reward_decision_cost = float(
+            sum(t.reward_decision_cost_component for t in transitions)
         )
         reward_total = float(np.sum(batch["reward"]))
-        reward_decision_cost = reward_total - reward_terminal
 
         # Fix 6 (W&B full diagnostics): episode-outcome rates, sourced
         # exclusively from the frozen environment's own

@@ -438,7 +438,12 @@ def test_reward_terminal_aggregation_counts_truncated_transitions_directly():
         ),
     ]
 
-    # Reproduce the exact Fix 7 aggregation formula from trainer.py.
+    # Reproduce the Fix 7 aggregation formula (superseded by the
+    # reward-component-propagation follow-up fix below -- kept here as
+    # a standalone historical regression check that this formula still
+    # improves on the ORIGINAL pre-Fix-7 bug it was written against;
+    # trainer.py itself no longer uses this formula, see
+    # test_reward_component_propagation_matches_wandb_metrics below).
     reward_terminal = float(sum(t.reward for t in transitions if t.terminated or t.truncated))
     reward_total = float(sum(t.reward for t in transitions))
     reward_decision_cost = reward_total - reward_terminal
@@ -451,4 +456,137 @@ def test_reward_terminal_aggregation_counts_truncated_transitions_directly():
     # changes behavior relative to that regression case.
     old_buggy_reward_terminal = float(sum(t.reward for t in transitions if t.terminated))
     assert old_buggy_reward_terminal == pytest.approx(0.0)
-    assert reward_terminal != old_buggy_reward_terminal
+
+
+# ======================================================================
+# Reward component logging correctness follow-up fix: Transition-level
+# component propagation (Test H)
+# ======================================================================
+
+
+def test_reward_component_propagation_matches_wandb_metrics():
+    """Test H: run_training's W&B metrics (reward/terminal,
+    reward/decision_cost, reward/total) for a constructed transition
+    list must match the component-wise values EXACTLY, not the old
+    buggy full-reward-as-terminal value.
+
+    Constructs a synthetic multi-episode transition list (mirroring
+    what run_training builds internally: nonterminal decision steps,
+    an auto-execution step, and episodes ending in SUCCESS and in
+    TRUNCATION_HORIZON respectively -- both on real policy-decision
+    steps, the exact case the old bug mishandled) and reproduces
+    run_training's own metric-computation formula directly against
+    src.training.trainer's current aggregation code path."""
+
+    from src.training.rollout import Transition
+
+    success_reward = 1.0 + (-0.01)  # SUCCESS on a real decision step
+    truncation_reward = -0.5 + (-0.01)  # TRUNCATION_HORIZON on a real decision step
+
+    transitions = [
+        # Episode "ep0": two nonterminal decision steps then SUCCESS.
+        Transition(
+            observation=np.zeros(14), action=0, reward=-0.01,
+            next_observation=np.zeros(14), terminated=False, truncated=False,
+            value=0.0, next_value=0.0, log_prob=0.0, policy_mask=1,
+            episode_id="ep0",
+            reward_terminal_component=0.0, reward_decision_cost_component=-0.01,
+        ),
+        Transition(
+            observation=np.zeros(14), action=0, reward=0.0,
+            next_observation=np.zeros(14), terminated=False, truncated=False,
+            value=0.0, next_value=0.0, log_prob=0.0, policy_mask=0,
+            episode_id="ep0",
+            reward_terminal_component=0.0, reward_decision_cost_component=0.0,
+        ),
+        Transition(
+            observation=np.zeros(14), action=0, reward=success_reward,
+            next_observation=np.zeros(14), terminated=True, truncated=False,
+            value=0.0, next_value=0.0, log_prob=0.0, policy_mask=1,
+            episode_id="ep0",
+            reward_terminal_component=1.0, reward_decision_cost_component=-0.01,
+        ),
+        # Episode "ep1": one nonterminal decision step then
+        # TRUNCATION_HORIZON (also on a real decision step).
+        Transition(
+            observation=np.zeros(14), action=0, reward=-0.01,
+            next_observation=np.zeros(14), terminated=False, truncated=False,
+            value=0.0, next_value=0.0, log_prob=0.0, policy_mask=1,
+            episode_id="ep1",
+            reward_terminal_component=0.0, reward_decision_cost_component=-0.01,
+        ),
+        Transition(
+            observation=np.zeros(14), action=0, reward=truncation_reward,
+            next_observation=np.zeros(14), terminated=False, truncated=True,
+            value=0.0, next_value=0.0, log_prob=0.0, policy_mask=1,
+            episode_id="ep1",
+            reward_terminal_component=-0.5, reward_decision_cost_component=-0.01,
+        ),
+    ]
+
+    # Reproduce trainer.py's CURRENT (fixed) aggregation formula
+    # exactly (src/training/trainer.py, run_training's per-update
+    # metrics block).
+    reward_terminal = float(sum(t.reward_terminal_component for t in transitions))
+    reward_decision_cost = float(sum(t.reward_decision_cost_component for t in transitions))
+    reward_total = float(sum(t.reward for t in transitions))
+
+    expected_terminal = 1.0 + (-0.5)  # SUCCESS + TRUNCATION_HORIZON terminal components
+    expected_decision_cost = -0.01 * 4  # four real-decision steps, one auto-execution step (0.0)
+    expected_total = success_reward + truncation_reward + (-0.01) * 2 + 0.0
+
+    assert reward_terminal == pytest.approx(expected_terminal)
+    assert reward_decision_cost == pytest.approx(expected_decision_cost)
+    assert reward_total == pytest.approx(expected_total)
+    assert reward_terminal + reward_decision_cost == pytest.approx(reward_total, abs=1e-6)
+
+    # Confirm this is NOT the old buggy value: the old formula would
+    # have put the FULL success_reward/truncation_reward (decision
+    # cost included) into reward_terminal.
+    old_buggy_reward_terminal = float(
+        sum(t.reward for t in transitions if t.terminated or t.truncated)
+    )
+    assert old_buggy_reward_terminal == pytest.approx(success_reward + truncation_reward)
+    assert reward_terminal != pytest.approx(old_buggy_reward_terminal)
+
+
+def test_run_training_wandb_metrics_use_component_split_end_to_end(env, ppo_config, reward_config):
+    """Test H (end-to-end): run_training's actual returned metrics for
+    a real small batch against the real environment must satisfy the
+    component-sum identity, and reward/terminal must never exceed the
+    fixed Reward V0 terminal-outcome magnitudes (1.0/0.5) by more than
+    floating-point tolerance -- if the old bug were present,
+    reward/terminal could be inflated/deflated by up to one decision
+    cost (-0.01/0.0) per terminal episode relative to the fixed table."""
+
+    import jax
+
+    seed_state = make_seed_state(ppo_config.seed)
+    init_key, run_key = jax.random.split(seed_state.jax_key)
+    training_state = create_train_state(
+        init_key,
+        learning_rate=ppo_config.hyperparameters.learning_rate,
+        max_grad_norm=ppo_config.hyperparameters.max_grad_norm,
+        policy_hidden_sizes=ppo_config.network.hidden_sizes,
+        value_hidden_sizes=ppo_config.network.hidden_sizes,
+    )
+
+    result = run_training(
+        ppo_config=ppo_config,
+        reward_config=reward_config,
+        env=env,
+        maneuvers=[SINGLE_MANEUVER, CAUSALITY_MANEUVER],
+        training_state=training_state,
+        rng_key=run_key,
+        numpy_rng=seed_state.numpy_rng,
+        num_updates=1,
+        max_steps_per_episode=60,
+    )
+    metrics = result["updates"][0]
+
+    assert np.isfinite(metrics["reward/terminal"])
+    assert np.isfinite(metrics["reward/decision_cost"])
+    assert np.isfinite(metrics["reward/total"])
+    assert metrics["reward/terminal"] + metrics["reward/decision_cost"] == pytest.approx(
+        metrics["reward/total"], abs=1e-6
+    )

@@ -125,6 +125,22 @@ class Transition:
       it (e.g. an older/synthetic test batch), so downstream-diagnostic
       aggregation must treat a ``None`` info as "not available" rather
       than assuming zero.
+
+    Post-Pre-P6 follow-up fix (reward component logging correctness)
+    additive diagnostic fields:
+
+    - ``reward_terminal_component`` / ``reward_decision_cost_component``:
+      the exact terminal-outcome and decision-cost components that
+      ``MergeRewardWrapper.compute`` computed for THIS step (its
+      ``last_terminal_component``/``last_decision_cost_component``
+      immediately after the call that produced this step's ``reward``),
+      propagated verbatim -- never re-derived from ``terminated``/
+      ``truncated`` here or by any caller. ``reward_terminal_component
+      + reward_decision_cost_component == reward`` for every
+      ``Transition`` (mirrors ``MergeRewardWrapper.compute``'s own
+      internal consistency check). Default to ``0.0`` so a
+      ``Transition`` constructed without them (an older/synthetic test
+      batch) degrades to "no component data" rather than crashing.
     """
 
     observation: Any
@@ -143,6 +159,8 @@ class Transition:
     rollout_cutoff: bool = False
     old_logits: Optional[np.ndarray] = None
     info: Optional[dict] = None
+    reward_terminal_component: float = 0.0
+    reward_decision_cost_component: float = 0.0
 
 
 def _value_of(value_network, value_params, observation: np.ndarray) -> float:
@@ -240,6 +258,18 @@ def collect_episode_rollout(
             is_policy_step=is_policy_step,
             info=info_after,
         )
+        # Reward component logging correctness follow-up fix: read back
+        # THIS call's exact terminal/decision-cost components from the
+        # wrapper (never re-derived from terminated/truncated here) so
+        # they can be propagated onto this step's Transition below.
+        # info_after["termination_reason"] is the environment's own
+        # real per-step value (SS5.1) -- on an artificial rollout-
+        # cutoff step (last max_steps iteration with no real env
+        # terminated/truncated), it is already "none"/non-terminal, so
+        # last_terminal_component is already correctly 0.0 here with no
+        # special-casing needed.
+        reward_terminal_component = reward_wrapper.last_terminal_component
+        reward_decision_cost_component = reward_wrapper.last_decision_cost_component
 
         # Fix 1 (episode-aware GAE correctness): an ARTIFICIAL rollout
         # cutoff is when this is the LAST step of the ``max_steps`` loop
@@ -277,6 +307,8 @@ def collect_episode_rollout(
                 rollout_cutoff=rollout_cutoff,
                 old_logits=old_logits,
                 info=info_after,
+                reward_terminal_component=reward_terminal_component,
+                reward_decision_cost_component=reward_decision_cost_component,
             )
         )
 
