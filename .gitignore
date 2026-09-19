@@ -52,3 +52,8 @@ venv/
 
 # Logs
 *.log
+
+# W&B local run artifacts (docs/ppo/PPO_PLAN.md SS8) -- offline-run
+# directories are local run logs/binaries, not source; see
+# docs/ppo/SMOKE_TRAINING_REPORT.md SS12 for the referenced run paths.
+wandb/

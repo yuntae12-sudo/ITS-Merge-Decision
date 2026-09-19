@@ -1,0 +1,41 @@
+# PPO baseline architecture + hyperparameters (docs/ppo/PPO_PLAN.md
+# SS6). V-Max-derived, NOT tuned in P0-P5 -- see PPO_PLAN.md's explicit
+# non-goals. Any hyperparameter change is a P6+ (user-only) decision.
+
+seed: 0
+
+network:
+  observation_dim: 14
+  num_actions: 4
+  # 14 -> 256 -> 64 -> 32 -> {4 logits | 1 value}, tanh activations,
+  # shared hidden sizes for both policy and value networks (PPO_PLAN.md
+  # SS6). Policy and value networks do NOT share parameters -- each
+  # gets its own full stack of these hidden sizes (separate Actor and
+  # Critic, per SS7.2's Actor-vs-Critic separation of concerns).
+  hidden_sizes: [256, 64, 32]
+  activation: "tanh"
+
+hyperparameters:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  # Not in PPO_PLAN.md SS6's fixed list, but required for a working
+  # optimizer/update step; standard, conservative, non-tuned defaults.
+  max_grad_norm: 0.5
+  ppo_epochs: 4
+  num_minibatches: 4
+
+rollout:
+  # Downstream execution mode PPO always uses (PPO_PLAN.md SS1): PPO
+  # never outputs acceleration/steering directly, only the 4-way
+  # BehaviorAction, executed through the common Frenet MPC downstream.
+  downstream_mode: "frenet_mpc"
+
+reward_config_path: "configs/reward/merge_reward_v0.yaml"
+
+tracking:
+  wandb_project: "its-merge-ppo"
+  wandb_mode: "offline"  # override with WANDB_MODE env var for online runs
