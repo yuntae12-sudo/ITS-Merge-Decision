@@ -8,7 +8,22 @@ Live state, updated at the end of every Phase/Stage. See
 
 ## Current Phase
 
-**PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**
+**P6 WORKSPACE READY — WAITING FOR USER BASELINE RUN**
+
+`feat/ppo-pre-p6` (commits `d75b593`, `f947b26`) merged into `main` via
+PR #2 (merge SHA `066b123`). A new experiment branch,
+`exp/ppo-p6-tuning`, was created from that `main` and now carries an
+immutable baseline config
+([`configs/ppo/ppo_p6_baseline.yaml`](../../configs/ppo/ppo_p6_baseline.yaml),
+byte-identical to `ppo_base.yaml` — no tuning applied) plus
+[`docs/ppo/P6_EXPERIMENT_GUIDE.md`](P6_EXPERIMENT_GUIDE.md) describing
+the one-axis-per-experiment policy. No training, tuning, sweep, or
+TRAIN/TUNE split has been executed. The user runs the first P6 W&B
+baseline experiment themselves from here.
+
+---
+
+**PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING** (prior phase, superseded by the above)
 
 The entire P0–P5 PPO implementation effort is complete, and a
 follow-up **Pre-P6 correctness/instrumentation hardening pass** (on

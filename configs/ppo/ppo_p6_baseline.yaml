@@ -1,0 +1,56 @@
+# P6 baseline reference config.
+#
+# Copied from the validated Pre-P6 PPO baseline (configs/ppo/ppo_base.yaml,
+# as of main commit 066b123 -- the Pre-P6 correctness/instrumentation
+# hardening pass, PR #2). NO tuning has been applied: every network,
+# hyperparameter, rollout, and reward value below is byte-identical to
+# ppo_base.yaml.
+#
+# Any experiment that changes one or more parameters must use a separate
+# experiment config (e.g. under configs/ppo/experiments/) and must NOT
+# modify this baseline file. This file exists so the first P6 W&B
+# baseline run always has an immutable, known-good reference to compare
+# every subsequent experiment against.
+#
+# See docs/ppo/P6_EXPERIMENT_GUIDE.md for the experiment policy.
+
+seed: 0
+
+network:
+  observation_dim: 14
+  num_actions: 4
+  # 14 -> 256 -> 64 -> 32 -> {4 logits | 1 value}, tanh activations,
+  # shared hidden sizes for both policy and value networks (PPO_PLAN.md
+  # SS6). Policy and value networks do NOT share parameters -- each
+  # gets its own full stack of these hidden sizes (separate Actor and
+  # Critic, per SS7.2's Actor-vs-Critic separation of concerns).
+  hidden_sizes: [256, 64, 32]
+  activation: "tanh"
+
+hyperparameters:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  # Not in PPO_PLAN.md SS6's fixed list, but required for a working
+  # optimizer/update step; standard, conservative, non-tuned defaults.
+  max_grad_norm: 0.5
+  ppo_epochs: 4
+  num_minibatches: 4
+
+rollout:
+  # Downstream execution mode PPO always uses (PPO_PLAN.md SS1): PPO
+  # never outputs acceleration/steering directly, only the 4-way
+  # BehaviorAction, executed through the common Frenet MPC downstream.
+  downstream_mode: "frenet_mpc"
+
+reward_config_path: "configs/reward/merge_reward_v0.yaml"
+
+tracking:
+  # Separate W&B project from the Pre-P6 pipeline-verification runs, so
+  # P6 baseline/experiment runs are tracked distinctly from P0-P5 smoke
+  # runs.
+  wandb_project: "its-merge-ppo-p6"
+  wandb_mode: "online"  # override with WANDB_MODE env var (e.g. WANDB_MODE=offline)

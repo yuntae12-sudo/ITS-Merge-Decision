@@ -521,38 +521,60 @@ failed).
 
 ## NEXT OWNER ACTION
 
-**Both the entire P0-P5 PPO effort AND the follow-up Pre-P6
-correctness/instrumentation hardening pass (including the small
-reward-component-logging correction above) are COMPLETE.** State:
-**PRE-P6 HARDENING COMPLETE — WAITING FOR USER TUNING**. Every item in
+**State: P6 WORKSPACE READY — WAITING FOR USER BASELINE RUN.**
+
+The entire P0-P5 PPO effort, the follow-up Pre-P6
+correctness/instrumentation hardening pass, and the P6 workspace setup
+described below are all COMPLETE. Every item in
 [PPO_PLAN.md §12](PPO_PLAN.md#12-completion-checklist) holds — see
 [SMOKE_TRAINING_REPORT.md](SMOKE_TRAINING_REPORT.md) for the P0-P5
 itemized evidence and [PRE_P6_REPORT.md](PRE_P6_REPORT.md) for the
 Pre-P6 hardening evidence (7 fixes, real re-run smoke-training numbers,
 full regression result, scope-compliance verification).
 
+**Git state:** `feat/ppo-pre-p6` (commits `d75b593`, `f947b26`) merged
+into `main` via PR #2, merge SHA `066b123`. A new branch,
+`exp/ppo-p6-tuning`, was created from that `main` and carries exactly
+one setup commit adding `configs/ppo/ppo_p6_baseline.yaml` (byte-
+identical to `ppo_base.yaml` — no tuning applied) and
+[`docs/ppo/P6_EXPERIMENT_GUIDE.md`](P6_EXPERIMENT_GUIDE.md) (the
+one-axis-per-experiment policy and W&B checklist). No PPO source code
+was touched in that setup commit.
+
+**No training was executed as part of this setup.** No tuning, no
+W&B sweep, no TRAIN/TUNE dataset split, no canonical VAL evaluation.
+`exp/ppo-p6-tuning` is ready for the user to run the first real P6
+baseline experiment themselves:
+
+```
+PYTHONPATH=. python scripts/train_ppo.py \
+  --ppo-config configs/ppo/ppo_p6_baseline.yaml \
+  --max-maneuvers <YOUR_CHOSEN_COUNT> \
+  --num-updates <YOUR_CHOSEN_COUNT> \
+  --max-episode-steps <YOUR_CHOSEN_COUNT> \
+  --checkpoint-path outputs/ppo_checkpoints/p6_baseline_seed0.pkl
+```
+
 **The user must review the real W&B diagnostics themselves before any
-further PPO work is done.** Concretely: read
-[PRE_P6_REPORT.md](PRE_P6_REPORT.md) §5 (or run `wandb sync` on a
-local offline run directory to view it in the W&B UI), form their own
-judgment about the observed episode returns / entropy / success-
-collision-offroad rates / downstream-intervention rates / loss curves,
-and decide — based on that review, not on any recommendation baked
-into this codebase or these docs — whether/how to proceed into P6+
-(reward-term additions or reweighting, hyperparameter tuning, creating
-a real PPO-FIT/PPO-TUNE dataset split, longer training runs, canonical
-VAL evaluation, or an FSM-vs-PPO comparison). None of that P6+ work
-has been started, scoped, or recommended by either effort — both
-P0-P5 and the Pre-P6 hardening pass deliberately stayed
-pipeline-verification/correctness-only throughout, and the choice of
-what (if anything) to tune next is explicitly the user's call to make,
-not an automated next step for a future session to take on its own
-initiative. `configs/ppo/ppo_tune.yaml` (untracked, unreferenced by
-any code — see PRE_P6_REPORT.md §7) may be a useful starting scaffold
-for that future work, at the user's discretion.
+further PPO work is done.** Form your own judgment about the observed
+episode returns / entropy / success-collision-offroad rates /
+downstream-intervention rates / loss curves (see
+[P6_EXPERIMENT_GUIDE.md](P6_EXPERIMENT_GUIDE.md) Rule 4 for the
+metric checklist), and decide — based on that review, not on any
+recommendation baked into this codebase or these docs — whether/how to
+proceed (reward-term additions or reweighting, hyperparameter tuning,
+creating a real PPO-FIT/PPO-TUNE dataset split, longer training runs,
+canonical VAL evaluation, or an FSM-vs-PPO comparison). None of that
+work has been started, scoped, or recommended here — the choice of
+what (if anything) to tune next, and the training budget
+(maneuvers/updates/episode-step-cap) to use, is explicitly the user's
+call, not an automated next step for a future session to take on its
+own initiative. Per Rule 2 in the experiment guide, create a new
+experiment config under `configs/ppo/experiments/` for each change
+rather than editing `ppo_p6_baseline.yaml` itself.
 
 If a future session is asked to continue this work, it should treat
-that as the START of a new, separately-scoped effort (its own plan,
-its own branch decision, its own commit cadence) built on top of this
-frozen P0-P5 foundation — not as "P6" of this same effort, since no P6
-scope was ever defined or approved.
+any further code/algorithm change as the START of a new,
+separately-scoped effort (its own plan, its own branch decision, its
+own commit cadence) built on top of this frozen P0-P5 + Pre-P6
+foundation.
