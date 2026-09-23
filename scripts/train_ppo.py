@@ -24,12 +24,14 @@ there -- not a restart from zero.
 import argparse
 import dataclasses
 import time
+from pathlib import Path
 
 import jax
 
 from src.environment.dataset_split import load_split_manifest
 from src.environment.full_split_evaluator import load_maneuver_specs
 from src.environment.merge_environment import MergeEnvironment
+from src.scenarios.merge_v2 import DATASET_SCHEMA_V2, LEGACY_DATASET_SCHEMA
 from src.policies.ppo.state import create_train_state
 from src.training.checkpoint import (
     CheckpointPayload,
@@ -39,11 +41,13 @@ from src.training.checkpoint import (
     save_checkpoint,
 )
 from src.training.config import load_ppo_config, load_reward_config
+from src.training.run_manifest import write_run_manifest
 from src.training.seeding import make_seed_state
 from src.training.trainer import run_training
 from src.tracking.wandb_logger import WandbLogger
 
 DEFAULT_DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DEFAULT_V2_ROOT = "data/manifests/v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +56,13 @@ def parse_args() -> argparse.Namespace:
         "--ppo-config",
         default="configs/ppo/ppo_base.yaml",
         help="Path to a PPO run config YAML (see configs/ppo/).",
+    )
+    parser.add_argument("--maneuver-table", default=f"{DEFAULT_V2_ROOT}/merge_maneuvers_v2.csv")
+    parser.add_argument("--candidate-manifest", default=f"{DEFAULT_V2_ROOT}/merge_manifest_v2.csv")
+    parser.add_argument("--split-manifest", default=f"{DEFAULT_V2_ROOT}/dataset_split_v2.csv")
+    parser.add_argument(
+        "--allow-legacy-dataset", action="store_true",
+        help="Historical debugging only. Paper/P6 training must use merge_interaction_v2.",
     )
     parser.add_argument(
         "--seed",
@@ -107,9 +118,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids) -> list:
+def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids, split_manifest_path=None) -> list:
+    split_rows = (
+        load_split_manifest(split_manifest_path)
+        if split_manifest_path is not None
+        else load_split_manifest()
+    )
     train_ids = sorted(
-        row.maneuver_id for row in load_split_manifest() if row.split == "train"
+        row.maneuver_id for row in split_rows if row.split == "train"
     )
     if explicit_ids is not None:
         requested = [m.strip() for m in explicit_ids.split(",") if m.strip()]
@@ -129,9 +145,28 @@ def main() -> None:
     ppo_config = load_ppo_config(args.ppo_config)
     reward_config = load_reward_config(ppo_config.reward_config_path)
     seed = args.seed if args.seed is not None else ppo_config.seed
+
+    required_paths = [args.maneuver_table, args.candidate_manifest, args.split_manifest]
+    missing_v2 = [p for p in required_paths if not Path(p).exists()]
+    if missing_v2 and not args.allow_legacy_dataset:
+        raise RuntimeError(
+            "merge_interaction_v2 manifests are not built yet; refusing to train "
+            f"on the invalidated v1 dataset. Missing: {missing_v2}. Run "
+            "scripts/build_merge_v2_manifest.py after acquiring/auditing Scenario protobuf data."
+        )
+    if args.allow_legacy_dataset:
+        from src.environment.full_split_evaluator import MANEUVER_TABLE, CANDIDATE_MANIFEST
+        args.maneuver_table = MANEUVER_TABLE
+        args.candidate_manifest = CANDIDATE_MANIFEST
+        args.split_manifest = None
+
+    # Initialize JAX only after the dataset validity preflight. A missing v2
+    # dataset should fail with one actionable message, not GPU/plugin noise.
     seed_state = make_seed_state(seed)
 
-    maneuver_ids = _resolve_maneuver_ids(args.max_maneuvers, args.maneuver_ids)
+    maneuver_ids = _resolve_maneuver_ids(
+        args.max_maneuvers, args.maneuver_ids, args.split_manifest
+    )
 
     print(f"Loaded PPO config from {ppo_config.source_path}")
     print(f"  network: {ppo_config.network}")
@@ -142,7 +177,14 @@ def main() -> None:
     print(f"Seed: {seed}")
     print(f"Maneuver subset ({len(maneuver_ids)}): {maneuver_ids}")
 
-    all_train_specs = load_maneuver_specs("train")
+    expected_schema = None if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+    all_train_specs = load_maneuver_specs(
+        "train",
+        split_manifest_path=args.split_manifest,
+        maneuver_table_path=args.maneuver_table,
+        candidate_manifest_path=args.candidate_manifest,
+        required_schema_version=expected_schema,
+    )
     specs_by_id = {s.maneuver_id: s for s in all_train_specs}
     missing = [m for m in maneuver_ids if m not in specs_by_id]
     if missing:
@@ -152,6 +194,7 @@ def main() -> None:
     env = MergeEnvironment(
         dataset_config_path=args.dataset_config_path,
         downstream_mode=ppo_config.rollout.downstream_mode,
+        required_dataset_schema_version=expected_schema,
     )
 
     global_env_step = 0
@@ -161,6 +204,12 @@ def main() -> None:
         print(f"--resume={args.resume}: loading checkpoint and continuing training "
               "(not restarting from scratch).")
         payload = load_checkpoint(args.resume)
+        resume_schema = LEGACY_DATASET_SCHEMA if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+        if payload.dataset_schema_version != resume_schema:
+            raise ValueError(
+                f"Cannot resume {payload.dataset_schema_version!r} checkpoint "
+                f"with {resume_schema!r} dataset"
+            )
         training_state = create_train_state(
             seed_state.jax_key,
             learning_rate=ppo_config.hyperparameters.learning_rate,
@@ -270,11 +319,46 @@ def main() -> None:
         reward_version=reward_config.reward_version,
         git_sha=get_git_sha(),
         numpy_rng_state=numpy_rng.get_state(),
+        dataset_schema_version=(
+            LEGACY_DATASET_SCHEMA if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+        ),
     )
     save_checkpoint(payload, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
 
+    try:
+        run_manifest_path = write_run_manifest(
+            checkpoint_path=checkpoint_path,
+            ppo_config_path=ppo_config.source_path,
+            reward_config_path=reward_config.source_path,
+            dataset_config_path=args.dataset_config_path,
+            maneuver_ids=maneuver_ids,
+            seed=seed,
+            num_updates=args.num_updates,
+            max_episode_steps=args.max_episode_steps,
+            reward_version=reward_config.reward_version,
+            git_sha=get_git_sha(),
+            global_env_step=result["global_env_step"],
+            ppo_update_step=result["ppo_update_step"],
+            resumed_from=args.resume,
+            dataset_schema_version=(
+                LEGACY_DATASET_SCHEMA if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+            ),
+        )
+        print(f"Saved run manifest to {run_manifest_path}")
+    except Exception as exc:  # noqa: BLE001 -- additive metadata only;
+        # must never fail a completed training run.
+        print(f"WARNING: failed to write run manifest ({exc}); "
+              "checkpoint itself is unaffected.")
+
     wandb_logger.finish()
+
+    print("\nTraining finished.")
+    print("\nTo visualize this checkpoint:")
+    print(
+        f"\nPYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \\\n"
+        f"  --checkpoint {checkpoint_path}"
+    )
 
 
 if __name__ == "__main__":
