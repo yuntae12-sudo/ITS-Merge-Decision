@@ -88,10 +88,12 @@ BOTH a serial continuation and a merge whose target WOMD feature
 happens to begin exactly at the convergence point -- available
 geometry cannot tell those apart, so it is flagged for manual review
 (Compressed Commit E) rather than confidently decided either way.
-Collinearity and upstream separation are still computed and exposed
-on ``MergeDiagnostic`` as diagnostic context (they may be useful during
-manual review), but neither is used to decide ACCEPT/REJECT/REVIEW
-given how unreliable they proved to be as hard gates.
+Collinearity and upstream separation are still computed and exposed on
+``MergeDiagnostic``. Collinearity is now used only in a narrow, conservative
+serial-boundary guard added after the MAN_0013 regression: target projection
+at its start boundary, <=5 degree heading difference, <=1 m terminal
+collinearity offset, and <=5 m endpoint gap. Outside that conjunction it
+remains diagnostic context rather than a general merge/serial classifier.
 
 Offline vs. online (event-time) distinction
 --------------------------------------------
@@ -133,6 +135,13 @@ class MergeTopologyConfig:
     serial_continuation_max_lateral_m: float
     min_pre_merge_frames: int
     min_target_lane_frames: int
+    # Conservative legacy-v1 guard.  A source endpoint which projects
+    # onto the very beginning of a nearly collinear target is normally a
+    # sampled-map segment boundary, not a merge.  Authoritative v2 data uses
+    # Scenario-protobuf topology instead (src.scenarios.merge_v2).
+    serial_boundary_max_target_s_m: float = 0.5
+    serial_boundary_max_collinear_offset_m: float = 1.0
+    serial_boundary_max_heading_difference_deg: float = 5.0
 
 
 class MergeDecision(enum.Enum):
@@ -164,6 +173,7 @@ REJECT_PARALLEL_LANE_CHANGE = "parallel_lane_change"
 REJECT_INSUFFICIENT_CONVERGENCE = "insufficient_convergence"
 REJECT_INSUFFICIENT_PRE_MERGE = "insufficient_pre_merge_history"
 REJECT_INSUFFICIENT_TARGET_PERSISTENCE = "insufficient_target_persistence"
+REJECT_SERIAL_CONTINUATION = "serial_continuation"
 
 REVIEW_AMBIGUOUS_SERIAL_OR_MERGE = "ambiguous_serial_or_merge"
 
@@ -217,9 +227,8 @@ class MergeDiagnostic:
     parallel_continuation: bool
     separation_reduction_m: Optional[float]
     decreasing_fraction: Optional[float]
-    # Diagnostic-only context, NOT used to decide ACCEPT/REJECT/REVIEW
-    # (see module docstring "Serial-vs-merge ambiguity" for why both
-    # proved unreliable as hard gates): max perpendicular distance from
+    # Context used only by the narrow serial-boundary regression guard (see
+    # module docstring; never a general topology substitute): max perpendicular distance from
     # the source's upstream samples to the target's own backward
     # -extended tangent line, and the farthest (most-upstream) sampled
     # source-target separation.
@@ -398,8 +407,9 @@ def _measure_collinearity_with_target(
     a straight backward extension of the TARGET lane's own tangent at
     the convergence point.
 
-    Diagnostic-only (see module docstring "Serial-vs-merge ambiguity"):
-    this is NOT used to decide ACCEPT/REJECT/REVIEW. Real-WOMD
+    Conservative-boundary diagnostic (see module docstring
+    "Serial-vs-merge ambiguity"): this is used only when the source endpoint
+    also projects to the target's start with matching heading. Real-WOMD
     investigation showed it is unreliable whenever the target lane is
     long or curved -- a local tangent line is only a valid
     approximation very close to the anchor point, so confirmed serial
@@ -629,10 +639,9 @@ def detect_merge(
     # Gate 5 evidence: sampled source-target separation trend
     # (geometry-inferred, see module docstring and _measure_convergence)
     # and terminal collinearity with the target's own backward-extended
-    # tangent (see _measure_collinearity_with_target). The latter is
-    # diagnostic-only context now -- see module docstring "Serial-vs
-    # -merge ambiguity" for why it and the upstream-separation value are
-    # not used to decide ACCEPT/REJECT/REVIEW.
+    # tangent (see _measure_collinearity_with_target). The latter participates
+    # only in the narrow serial-boundary guard below; it is not treated as
+    # authoritative topology.
     separations, reduction_m, decreasing_fraction = _measure_convergence(
         source_polyline, target_polyline, config
     )
@@ -641,6 +650,41 @@ def detect_merge(
     )
     max_collinear_offset = float(np.max(collinear_offsets))
     upstream_separation = float(separations[0])
+
+    # Regression guard for MAN_0013 and the same finite-polyline failure
+    # mode.  The old convergence metric projects every upstream source point
+    # to a finite target polyline.  When the target begins just after a
+    # collinear source ends, all upstream points clamp to target[0], making
+    # ordinary longitudinal progress look like ~30 m of lateral convergence.
+    # Treat this unmistakable boundary geometry as a serial continuation.
+    # Less-clear geometry remains subject to the existing REVIEW path; v2
+    # canonical data requires authoritative protobuf connectivity.
+    serial_boundary = (
+        endpoint_target_arc_length
+        <= config.serial_boundary_max_target_s_m
+        and endpoint_target_distance <= config.max_endpoint_target_distance_m
+        and max_collinear_offset
+        <= config.serial_boundary_max_collinear_offset_m
+        and heading_difference_deg
+        <= config.serial_boundary_max_heading_difference_deg
+    )
+    if serial_boundary:
+        return _reject(
+            REJECT_SERIAL_CONTINUATION,
+            source_lane_ends=True,
+            source_remaining_distance_m=source_remaining,
+            endpoint_target_distance_m=endpoint_target_distance,
+            endpoint_target_arc_length_m=endpoint_target_arc_length,
+            heading_difference_deg=heading_difference_deg,
+            lanes_converge=False,
+            parallel_continuation=False,
+            separation_reduction_m=reduction_m,
+            decreasing_fraction=decreasing_fraction,
+            max_collinear_offset_m=max_collinear_offset,
+            upstream_separation_m=upstream_separation,
+            pre_merge_frames=pre_merge_frames,
+            target_lane_persistent=target_lane_persistent,
+        )
 
     lanes_converge = (
         reduction_m >= config.min_separation_reduction_m

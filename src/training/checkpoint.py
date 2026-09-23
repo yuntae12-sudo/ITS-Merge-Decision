@@ -32,6 +32,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
+from src.scenarios.merge_v2 import LEGACY_DATASET_SCHEMA
+
 
 def get_git_sha(repo_root: str = ".") -> str:
     """Best-effort current Git SHA of the repo containing this code.
@@ -93,6 +95,7 @@ class CheckpointPayload:
     git_sha: str
     extra: Optional[dict] = None
     numpy_rng_state: Optional[tuple] = None
+    dataset_schema_version: str = LEGACY_DATASET_SCHEMA
 
 
 def save_checkpoint(payload: CheckpointPayload, path: str) -> None:
@@ -124,7 +127,33 @@ def load_checkpoint(path: str) -> CheckpointPayload:
     with open(path, "rb") as f:
         raw = pickle.load(f)
     raw.setdefault("numpy_rng_state", None)  # Fix 5: older checkpoints
+    raw.setdefault("dataset_schema_version", LEGACY_DATASET_SCHEMA)
     return CheckpointPayload(**raw)
+
+
+def require_checkpoint_dataset_schema(
+    payload: CheckpointPayload, expected_schema_version: str
+) -> None:
+    """Fail closed instead of mixing legacy and v2 research results."""
+
+    if payload.dataset_schema_version != expected_schema_version:
+        raise ValueError(
+            "Checkpoint/dataset schema mismatch: checkpoint uses "
+            f"{payload.dataset_schema_version!r}, evaluation requires "
+            f"{expected_schema_version!r}. Retrain from scratch; schema "
+            "migration of policy weights is intentionally unsupported."
+        )
+
+
+def require_single_dataset_schema(payloads) -> str:
+    """Reject aggregate reports containing both legacy and v2 checkpoints."""
+
+    schemas = {payload.dataset_schema_version for payload in payloads}
+    if not schemas:
+        raise ValueError("Cannot aggregate an empty checkpoint collection")
+    if len(schemas) != 1:
+        raise ValueError(f"Mixed dataset schemas are not aggregatable: {sorted(schemas)}")
+    return next(iter(schemas))
 
 
 def restore_numpy_rng(numpy_rng_state: Optional[tuple], fallback_seed: int) -> "np.random.RandomState":

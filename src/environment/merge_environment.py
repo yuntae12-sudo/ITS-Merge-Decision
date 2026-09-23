@@ -28,6 +28,7 @@ this value yet.
 """
 
 import dataclasses
+import json
 from typing import Optional
 
 import numpy as np
@@ -69,6 +70,8 @@ from src.planning.frenet_planner import EgoKinematicState, FollowInputs, load_pl
 from src.planning.reference import ReferenceLine
 from src.scenarios.lane_assignment import (
     LaneAssignmentConfig,
+    assign_ego_lane_sequence,
+    compute_stable_lane_sequence,
     load_lane_assignment_config,
 )
 from src.scenarios.lane_geometry import (
@@ -83,6 +86,7 @@ from src.scenarios.scenario_features import (
     AgentSelectionConfig,
     load_agent_selection_config,
 )
+from src.scenarios.merge_v2 import DATASET_SCHEMA_V2, LEGACY_DATASET_SCHEMA
 from src.scenarios.scenario_loader import (
     build_waymax_config,
     iter_scenarios,
@@ -124,6 +128,47 @@ class ManeuverSpec:
     lane_chain: list
     candidate_ids: list
     merge_start_frame: int
+    schema_version: str = LEGACY_DATASET_SCHEMA
+    maneuver_type: Optional[str] = None
+    manual_validation: Optional[str] = None
+    topology_evidence: Optional[dict] = None
+    interaction_evidence: Optional[dict] = None
+
+    @property
+    def is_v2(self) -> bool:
+        return self.schema_version == DATASET_SCHEMA_V2
+
+    def require_schema(self, expected: str) -> None:
+        if self.schema_version != expected:
+            raise ValueError(
+                f"Maneuver {self.maneuver_id} uses dataset schema "
+                f"{self.schema_version!r}, expected {expected!r}"
+            )
+        if expected == DATASET_SCHEMA_V2:
+            if self.manual_validation != "CONFIRMED_MERGE":
+                raise ValueError(
+                    f"v2 maneuver {self.maneuver_id} is not manually confirmed"
+                )
+            if not self.maneuver_type or not self.topology_evidence or not self.interaction_evidence:
+                raise ValueError(
+                    f"v2 maneuver {self.maneuver_id} lacks type/topology/interaction evidence"
+                )
+            if self.maneuver_type not in {
+                "topological_merge", "roundabout_entry"
+            }:
+                raise ValueError(
+                    f"v2 maneuver {self.maneuver_id} has non-canonical type "
+                    f"{self.maneuver_type!r}"
+                )
+            interaction_ids = [
+                self.interaction_evidence.get("front_vehicle_id"),
+                self.interaction_evidence.get("rear_vehicle_id"),
+                *(self.interaction_evidence.get("conflict_vehicle_ids") or ()),
+            ]
+            if not any(value is not None for value in interaction_ids):
+                raise ValueError(
+                    f"v2 maneuver {self.maneuver_id} has no relevant vehicle interaction"
+                )
 
     @staticmethod
     def from_csv_row(row: dict, manifest_by_candidate_id: dict) -> "ManeuverSpec":
@@ -143,7 +188,26 @@ class ManeuverSpec:
             lane_chain=lane_chain,
             candidate_ids=candidate_ids,
             merge_start_frame=int(first_candidate["merge_start_frame"]),
+            schema_version=row.get("schema_version") or first_candidate.get(
+                "schema_version", LEGACY_DATASET_SCHEMA
+            ),
+            maneuver_type=row.get("maneuver_type") or first_candidate.get("maneuver_type") or None,
+            manual_validation=row.get("manual_validation") or first_candidate.get("manual_validation") or None,
+            topology_evidence=_parse_optional_json(
+                row.get("topology_evidence") or first_candidate.get("topology_evidence")
+            ),
+            interaction_evidence=_parse_optional_json(
+                row.get("interaction_evidence") or first_candidate.get("interaction_evidence")
+            ),
         )
+
+
+def _parse_optional_json(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, dict):
+        return value
+    return json.loads(value)
 
 
 class MergeEnvironment:
@@ -163,6 +227,7 @@ class MergeEnvironment:
         max_num_objects: int = 64,
         downstream_mode: str = "legacy",
         downstream_config_path: str = DEFAULT_DOWNSTREAM_CONFIG_PATH,
+        required_dataset_schema_version: Optional[str] = None,
     ):
         """``downstream_mode``:
             "legacy" (DEFAULT -- must never change): the existing
@@ -220,6 +285,7 @@ class MergeEnvironment:
         # (nor imported into any codepath) unless requested, so the
         # legacy default path's runtime behavior/cost is unaffected.
         self._downstream_mode = downstream_mode
+        self._required_dataset_schema_version = required_dataset_schema_version
         self._common_downstream: Optional[CommonDownstream] = None
         self._reference_cache: dict = {}
         if downstream_mode == "frenet_mpc":
@@ -244,6 +310,9 @@ class MergeEnvironment:
         self._merge_end_s: Optional[float] = None
         self._steps_elapsed: int = 0
         self._episode_horizon: int = MAX_EPISODE_HORIZON_FRAMES
+        self._maneuver_spec: Optional[ManeuverSpec] = None
+        self._v2_initial_target_lateral_m: Optional[float] = None
+        self._v2_saw_relevant_interaction: bool = False
 
         # Stage 3-H Section 3: episode-cumulative intervention
         # diagnostics (see step()'s frenet_mpc branch and
@@ -278,6 +347,14 @@ class MergeEnvironment:
         """
 
         del seed  # no stochastic component; accepted for API symmetry
+
+        if self._required_dataset_schema_version is not None:
+            maneuver.require_schema(self._required_dataset_schema_version)
+        elif maneuver.is_v2:
+            # A v2 row may never bypass its own evidence/manual-review contract
+            # merely because the caller did not request a schema explicitly.
+            maneuver.require_schema(DATASET_SCHEMA_V2)
+        self._maneuver_spec = maneuver
 
         shard_path = select_single_shard_for_inspection(
             self._expansion_config,
@@ -367,6 +444,7 @@ class MergeEnvironment:
             self._get_active_reference_lines()  # populate initial pair
 
         observation = self._build_observation()
+        self._initialize_v2_runtime_evidence(observation)
         info = self._build_info(
             requested_action=None,
             executed_action=None,
@@ -397,6 +475,7 @@ class MergeEnvironment:
         executed_action = self._decision_state.advance(action)
 
         observation_before = self._build_observation()
+        self._update_v2_runtime_evidence(observation_before)
         objective = self._executor.compute_objective(
             executed_action, observation_before
         )
@@ -905,7 +984,7 @@ class MergeEnvironment:
         if not self._episode_context.is_on_final_transition:
             return False
         history = self._sim_trajectory_history()
-        return check_online_causal_merge_success(
+        base_success = check_online_causal_merge_success(
             history["x"],
             history["y"],
             history["yaw"],
@@ -915,6 +994,72 @@ class MergeEnvironment:
             lane_assignment_config=self._lane_assignment_config,
             episode_start_frame=self._episode_context.decision_start_frame,
         )
+        if not base_success:
+            return False
+        return self._check_v2_completion_requirements()
+
+    def _initialize_v2_runtime_evidence(self, observation: np.ndarray) -> None:
+        self._v2_initial_target_lateral_m = None
+        self._v2_saw_relevant_interaction = False
+        if self._maneuver_spec is None or not self._maneuver_spec.is_v2:
+            return
+        x, y, _, _ = self._current_ego_pose_and_speed()
+        target = self._polylines_by_id[self._episode_context.final_target_lane_id]
+        projection = project_point_to_polyline_signed(target, x, y)
+        self._v2_initial_target_lateral_m = abs(projection["lateral_distance_m"])
+        self._update_v2_runtime_evidence(observation)
+
+    def _update_v2_runtime_evidence(self, observation: np.ndarray) -> None:
+        if self._maneuver_spec is None or not self._maneuver_spec.is_v2:
+            return
+        # Target-lane front/rear presence is part of the causal 14D state.
+        if observation[2] == 1.0 or observation[6] == 1.0:
+            self._v2_saw_relevant_interaction = True
+            return
+        evidence = self._maneuver_spec.interaction_evidence or {}
+        relevant_ids = set(evidence.get("conflict_vehicle_ids", ()))
+        for key in ("front_vehicle_id", "rear_vehicle_id"):
+            if evidence.get(key) is not None:
+                relevant_ids.add(int(evidence[key]))
+        if not relevant_ids:
+            return
+        ids = np.asarray(self._state.object_metadata.ids)
+        valid = np.asarray(self._state.current_sim_trajectory.valid)[:, 0].astype(bool)
+        if any(valid[i] and int(ids[i]) in relevant_ids for i in range(len(ids))):
+            self._v2_saw_relevant_interaction = True
+
+    def _check_v2_completion_requirements(self) -> bool:
+        """Additional online completion gates for schema-v2 maneuvers."""
+
+        spec = self._maneuver_spec
+        if spec is None or not spec.is_v2:
+            return True
+        if not self._v2_saw_relevant_interaction:
+            return False
+        if spec.maneuver_type != "interactive_cut_in":
+            return True
+        x, y, _, _ = self._current_ego_pose_and_speed()
+        target = self._polylines_by_id[self._episode_context.final_target_lane_id]
+        current = abs(
+            project_point_to_polyline_signed(target, x, y)["lateral_distance_m"]
+        )
+        initial = self._v2_initial_target_lateral_m
+        return initial is not None and initial - current >= 1.0
+
+    def _current_v2_stable_lane_id(self):
+        if self._maneuver_spec is None or not self._maneuver_spec.is_v2:
+            return None
+        history = self._sim_trajectory_history()
+        raw = assign_ego_lane_sequence(
+            history["x"], history["y"], history["yaw"], history["valid"],
+            list(self._polylines_by_id.values()), self._lane_assignment_config,
+        )
+        stable = compute_stable_lane_sequence(
+            raw,
+            persistence_frames=self._lane_assignment_config.persistence_frames,
+            max_ambiguous_gap_frames=self._lane_assignment_config.max_ambiguous_gap_frames,
+        )
+        return stable[-1] if stable else None
 
     def _sim_trajectory_history(self):
         """The SIMULATED ego trajectory from episode start through
@@ -963,6 +1108,10 @@ class MergeEnvironment:
             "final_target_lane_id": self._episode_context.final_target_lane_id,
             "decision_start_frame": self._episode_context.decision_start_frame,
             "merge_start_frame": self._episode_context.merge_start_frame,
+            "dataset_schema_version": self._maneuver_spec.schema_version,
+            "maneuver_type": self._maneuver_spec.maneuver_type,
+            "v2_saw_relevant_interaction": self._v2_saw_relevant_interaction,
+            "current_stable_lane_id": self._current_v2_stable_lane_id(),
             "episode_horizon": self._episode_horizon,
             "chain_advanced": chain_advanced,
             "reference_speed_mps": (

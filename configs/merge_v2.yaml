@@ -1,0 +1,14 @@
+# Interaction-aware MERGE dataset thresholds.
+#
+# `pending` is intentional: canonical manifest construction is blocked until
+# these values are calibrated from the protobuf-backed candidate distribution
+# and manually labelled ACCEPT/REJECT sample. Do not change the status merely
+# to make a target sample count pass.
+calibration_status: pending
+
+classification:
+  min_source_occupancy_frames: 5
+  min_target_stable_frames: 5
+  min_longitudinal_progress_m: 0.1
+  min_cut_in_lateral_displacement_m: 1.0
+  required_gap_order_persistence_frames: 5

@@ -194,10 +194,18 @@ merge_topology:
   # upstream separation shrinking to near zero at the endpoint, and
   # collinearity is unreliable whenever the target lane is long or
   # curved) -- see the module docstring for the detailed investigation.
-  # They remain exposed on MergeDiagnostic as manual-review context
-  # (max_collinear_offset_m, upstream_separation_m) but are not used to
-  # decide ACCEPT/REJECT/REVIEW.
+  # They remain exposed on MergeDiagnostic. After the MAN_0013 regression,
+  # collinearity is used only together with target-start projection, endpoint
+  # gap, and heading in the narrow serial-boundary guard below; it remains
+  # unsuitable as a standalone topology classifier.
   serial_continuation_max_lateral_m: 0.5
+  # Legacy-v1 fail-closed guard for finite-polyline endpoint clamping.
+  # MAN_0013 (204->203) is the regression case: the two lane features are
+  # nearly collinear and separated only by a 1.85 m sampling gap, but the old
+  # metric incorrectly called longitudinal approach "convergence".
+  serial_boundary_max_target_s_m: 0.5
+  serial_boundary_max_collinear_offset_m: 1.0
+  serial_boundary_max_heading_difference_deg: 5.0
 
 event:
   # Minimum number of consecutive stable frames ego must have been on

@@ -20,7 +20,13 @@ CANDIDATE_MANIFEST = "outputs/phase1/training_10shard_pilot/merge_manifest_train
 DEFAULT_MAX_STEPS = 100  # matches MAX_EPISODE_HORIZON_FRAMES
 
 
-def load_maneuver_specs(which_split: str, split_manifest_path: Optional[str] = None) -> List[ManeuverSpec]:
+def load_maneuver_specs(
+    which_split: str,
+    split_manifest_path: Optional[str] = None,
+    maneuver_table_path: str = MANEUVER_TABLE,
+    candidate_manifest_path: str = CANDIDATE_MANIFEST,
+    required_schema_version: Optional[str] = None,
+) -> List[ManeuverSpec]:
     """Loads every ManeuverSpec belonging to one split (no subsampling
     -- Stage B-2.5 explicitly requires the FULL canonical split, unlike
     Stage B-1.5/B-2's representative-sample checks)."""
@@ -30,11 +36,11 @@ def load_maneuver_specs(which_split: str, split_manifest_path: Optional[str] = N
     else:
         split_rows = {r.maneuver_id: r.split for r in load_split_manifest()}
 
-    with open(CANDIDATE_MANIFEST, newline="") as f:
+    with open(candidate_manifest_path, newline="") as f:
         manifest_by_candidate_id = {row["candidate_id"]: row for row in csv.DictReader(f)}
 
     specs = []
-    with open(MANEUVER_TABLE, newline="") as f:
+    with open(maneuver_table_path, newline="") as f:
         for row in csv.DictReader(f):
             if split_rows.get(row["maneuver_id"]) != which_split:
                 continue
@@ -42,6 +48,8 @@ def load_maneuver_specs(which_split: str, split_manifest_path: Optional[str] = N
                 spec = ManeuverSpec.from_csv_row(row, manifest_by_candidate_id)
             except KeyError:
                 continue
+            if required_schema_version is not None:
+                spec.require_schema(required_schema_version)
             specs.append(spec)
     return specs
 
@@ -49,6 +57,8 @@ def load_maneuver_specs(which_split: str, split_manifest_path: Optional[str] = N
 @dataclasses.dataclass
 class EpisodeResult:
     maneuver_id: str
+    dataset_schema_version: str
+    maneuver_type: Optional[str]
     outcome: str  # "success" | "failure_collision" | "failure_offroad" | "timeout" | "exception"
     steps_elapsed: int
     merge_commit_frame: Optional[int]  # None if never committed within horizon
@@ -185,6 +195,8 @@ def run_episode(env: MergeEnvironment, policy, spec: ManeuverSpec, max_steps: in
 
     return EpisodeResult(
         maneuver_id=spec.maneuver_id,
+        dataset_schema_version=spec.schema_version,
+        maneuver_type=spec.maneuver_type,
         outcome=outcome,
         steps_elapsed=steps_elapsed,
         merge_commit_frame=merge_commit_frame,
