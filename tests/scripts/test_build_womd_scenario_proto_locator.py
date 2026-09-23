@@ -102,6 +102,18 @@ def test_failed_shard_is_not_treated_as_done(tmp_path):
     assert done == set()
 
 
+def test_progress_from_different_target_set_is_rejected(tmp_path):
+    progress = tmp_path / "progress.jsonl"
+    progress.write_text(json.dumps({
+        "split": "training", "shard_index": 3, "status": "DONE",
+        "target_sha256": "old-targets",
+    }) + "\n")
+    import pytest
+
+    with pytest.raises(ValueError, match="target checksum mismatch"):
+        locator.load_done_shards(str(progress), "training", "new-targets")
+
+
 def test_progress_file_recovers_after_truncated_final_line(tmp_path):
     """A process killed mid-write can leave one truncated trailing line;
     earlier, already-flushed DONE entries must still resume correctly."""
@@ -111,15 +123,20 @@ def test_progress_file_recovers_after_truncated_final_line(tmp_path):
         json.dumps({"split": "training", "shard_index": 0, "status": "DONE"}) + "\n"
         + '{"split": "training", "shard_index": 1, "stat'  # truncated, no trailing newline
     )
+    done = locator.load_done_shards(str(progress), "training")
+    assert done == {0}
+
+
+def test_progress_file_rejects_malformed_nonfinal_record(tmp_path):
+    progress = tmp_path / "progress.jsonl"
+    progress.write_text(
+        '{"split": "training", "shard_index": 0, "stat\n'
+        + json.dumps({"split": "training", "shard_index": 1, "status": "DONE"}) + "\n"
+    )
     import pytest
 
     with pytest.raises(json.JSONDecodeError):
         locator.load_done_shards(str(progress), "training")
-    # The recovery path a caller takes: drop the truncated last line and retry.
-    lines = progress.read_text().splitlines()
-    progress.write_text("\n".join(lines[:-1]) + "\n")
-    done = locator.load_done_shards(str(progress), "training")
-    assert done == {0}
 
 
 def test_early_stop_when_all_targets_found(monkeypatch, tmp_path):
@@ -149,6 +166,42 @@ def test_early_stop_when_all_targets_found(monkeypatch, tmp_path):
     assert exit_code == 0
     # Only the first shard should ever be scanned once the sole target is found.
     assert scanned_shards == [0]
+
+
+def test_failed_shard_returns_nonzero_and_is_retried(monkeypatch, tmp_path):
+    _write_targets_csv(
+        tmp_path / "targets.csv",
+        [("only-target", "training", "shardA", "cand-1")],
+    )
+    attempts = []
+
+    def failing_scan(*args):
+        attempts.append(args[1])
+        raise OSError("temporary network failure")
+
+    monkeypatch.setattr(locator, "scan_one_shard", failing_scan)
+    common_args = [
+        "--target-scenario-ids", str(tmp_path / "targets.csv"),
+        "--split", "training",
+        "--local-shard-paths", "shard0",
+        "--locator-output", str(tmp_path / "out.csv"),
+        "--progress-file", str(tmp_path / "progress.jsonl"),
+        "--workers", "1",
+    ]
+    assert locator.main(common_args) == 1
+
+    def succeeding_scan(shard_path, shard_index, total_shards, split, remaining_ids, targets):
+        attempts.append(shard_index)
+        return 1, {"only-target": {
+            "scenario_id": "only-target", "proto_split": split,
+            "proto_shard_index": shard_index, "proto_total_shards": total_shards,
+            "record_index": 0, "source_object": shard_path,
+            "matched_candidate_label": "cand-1",
+        }}
+
+    monkeypatch.setattr(locator, "scan_one_shard", succeeding_scan)
+    assert locator.main(common_args) == 0
+    assert attempts == [0, 0]
 
 
 def test_split_isolation_never_mixes_training_and_validation(tmp_path):

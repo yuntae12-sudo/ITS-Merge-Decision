@@ -21,7 +21,10 @@ remaining shards for that split are not scanned.
 
 import argparse
 import csv
+from datetime import datetime, timezone
+import hashlib
 import json
+import os
 import sys
 import time
 from collections import defaultdict
@@ -34,6 +37,13 @@ from src.scenarios.scenario_proto_loader import iter_scenario_protobufs
 
 BUCKET_ROOT = "gs://waymo_open_dataset_motion_v_1_3_1/uncompressed/scenario"
 SPLIT_TOTAL_SHARDS = {"training": 1000, "validation": 150}
+
+
+def log(message):
+    """Emit immediately so redirected long-running logs remain current."""
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"[{timestamp}] {message}", flush=True)
 
 
 def parse_args(argv=None):
@@ -92,7 +102,15 @@ def load_targets(path, split):
     return targets
 
 
-def load_done_shards(progress_file, split):
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_done_shards(progress_file, split, target_sha256=None):
     """Shards already marked DONE for this split in a prior run -- these
     are never rescanned. A FAILED or absent entry means "scan it"."""
 
@@ -101,11 +119,28 @@ def load_done_shards(progress_file, split):
     if not path.exists():
         return done
     with path.open(encoding="utf-8") as f:
-        for line in f:
+        lines = f.readlines()
+        for line_number, line in enumerate(lines, start=1):
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # A hard kill can interrupt only the final append. Earlier
+                # malformed records are genuine corruption and stay fatal.
+                if line_number == len(lines):
+                    log(
+                        f"WARNING: ignoring truncated final progress record "
+                        f"at {path}:{line_number}; its shard will be retried"
+                    )
+                    break
+                raise
+            if target_sha256 is not None and record.get("target_sha256") != target_sha256:
+                raise ValueError(
+                    f"progress target checksum mismatch at {path}:{line_number}; "
+                    "use the original target CSV or a new progress file"
+                )
             if record["split"] == split and record["status"] == "DONE":
                 done.add(record["shard_index"])
     return done
@@ -130,14 +165,14 @@ def load_existing_matches(locator_output, split):
 def append_progress(progress_file, record):
     """Appends one shard's outcome. Append-only + one JSON object per
     line: a process killed mid-write leaves at most one truncated final
-    line, which ``load_done_shards`` skips via ``json.loads`` raising on
-    the next read (never corrupts earlier, already-flushed lines)."""
+    line, which ``load_done_shards`` ignores so that shard is retried."""
 
     path = Path(progress_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
         f.flush()
+        os.fsync(f.fileno())
 
 
 def write_locator_csv(path, matches):
@@ -147,11 +182,15 @@ def write_locator_csv(path, matches):
     ]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in sorted(matches.values(), key=lambda r: (r["proto_split"], r["scenario_id"])):
             writer.writerow({k: row[k] for k in fieldnames})
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_path, path)
 
 
 def _remote_path(split, shard_index, total_shards):
@@ -189,21 +228,22 @@ def main(argv=None):
 
     targets = load_targets(args.target_scenario_ids, split)
     targets_total = len(targets)
-    print(f"[{split}] targets loaded: {targets_total}")
+    target_sha256 = file_sha256(args.target_scenario_ids)
+    log(f"[{split}] targets loaded: {targets_total}")
 
     existing_matches = load_existing_matches(args.locator_output, split)
-    done_shards = load_done_shards(args.progress_file, split)
+    done_shards = load_done_shards(args.progress_file, split, target_sha256)
     remaining_ids = set(targets) - set(existing_matches)
 
-    print(
+    log(
         f"[{split}] resume state: {len(existing_matches)} already matched, "
         f"{len(done_shards)} shard(s) already DONE, "
         f"{len(remaining_ids)} target(s) remaining"
     )
 
     if not remaining_ids:
-        print(f"[{split}] TARGETS_TOTAL={targets_total} TARGETS_FOUND={len(existing_matches)} "
-              f"TARGETS_REMAINING=0 -- nothing to scan, all targets already located.")
+        log(f"[{split}] TARGETS_TOTAL={targets_total} TARGETS_FOUND={len(existing_matches)} "
+            f"TARGETS_REMAINING=0 -- nothing to scan, all targets already located.")
         return 0
 
     all_matches = dict(existing_matches)
@@ -235,6 +275,7 @@ def main(argv=None):
         return shard_index, shard_path, record_count, shard_matches, status, error, time.time() - shard_t0
 
     t0 = time.time()
+    failed_count = 0
     shard_queue = [(i, p) for i, p in shard_iter if i not in done_shards]
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -257,8 +298,8 @@ def main(argv=None):
 
         while pending:
             if not remaining_ids:
-                print(f"[{split}] EARLY STOP: all {targets_total} targets found; "
-                      f"{len(pending)} in-flight shard(s) will still finish, no new shards dispatched.")
+                log(f"[{split}] EARLY STOP: all {targets_total} targets found; "
+                    f"{len(pending)} in-flight shard(s) will still finish, no new shards dispatched.")
                 for future in pending:
                     future.result()  # let in-flight scans finish; results still recorded below.
                 # Fall through to process whatever completed.
@@ -266,6 +307,8 @@ def main(argv=None):
             done_future = next(as_completed(list(pending)))
             shard_index = pending.pop(done_future)
             _, shard_path, record_count, shard_matches, status, error, elapsed = done_future.result()
+            if status == "FAILED":
+                failed_count += 1
 
             # Matches for scenario ids some other in-flight/earlier shard
             # already resolved are dropped here (parent is the single
@@ -277,19 +320,20 @@ def main(argv=None):
 
             append_progress(args.progress_file, {
                 "split": split,
+                "target_sha256": target_sha256,
                 "shard_index": shard_index,
                 "status": status,
                 "record_count": record_count,
                 "matched_count": len(shard_matches),
                 "elapsed_sec": round(elapsed, 2),
-                "timestamp": time.time(),
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "error": error,
             })
             if shard_matches:
                 write_locator_csv(args.locator_output, all_matches)
 
             wall = time.time() - t0
-            print(
+            log(
                 f"[{split}] shard {shard_index}: status={status} "
                 f"records={record_count} +matched={len(shard_matches)} "
                 f"elapsed={elapsed:.1f}s | "
@@ -301,14 +345,17 @@ def main(argv=None):
                 _dispatch_next()
 
     write_locator_csv(args.locator_output, all_matches)
-    print(
+    log(
         f"[{split}] DONE: TARGETS_TOTAL={targets_total} "
         f"TARGETS_FOUND={targets_total - len(remaining_ids)} "
-        f"TARGETS_REMAINING={len(remaining_ids)}"
+        f"TARGETS_REMAINING={len(remaining_ids)} FAILED_SHARDS={failed_count}"
     )
     if remaining_ids:
-        print(f"[{split}] still missing (first 10): {sorted(remaining_ids)[:10]}")
-    return 0
+        log(f"[{split}] still missing (first 10): {sorted(remaining_ids)[:10]}")
+    # A non-zero exit prevents the sequential launcher from advancing to
+    # validation. Re-running the identical command skips DONE shards and
+    # retries FAILED/unfinished shards.
+    return 1 if failed_count else 0
 
 
 if __name__ == "__main__":
