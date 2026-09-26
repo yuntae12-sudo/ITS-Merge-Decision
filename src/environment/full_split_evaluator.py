@@ -9,15 +9,26 @@ gets privileged information or a different evaluation harness.
 
 import csv
 import dataclasses
+import json
 from typing import List, Optional
 
 from src.environment.behavior_action import BehaviorAction
 from src.environment.dataset_split import load_split_manifest, normalize_split_name
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
+from src.scenarios.merge_v2 import DATASET_SCHEMA_MERGE_DECISION_V2
 
 MANEUVER_TABLE = "outputs/phase1/training_10shard_pilot/training_visual_merge_maneuvers.csv"
 CANDIDATE_MANIFEST = "outputs/phase1/training_10shard_pilot/merge_manifest_training_scratch.csv"
 DEFAULT_MAX_STEPS = 100  # matches MAX_EPISODE_HORIZON_FRAMES
+
+DECISION_MANEUVER_TABLE = "data/manifests/v2/merge_decision_maneuvers_v2.csv"
+DECISION_SPLIT_MANIFEST = "data/manifests/v2/merge_decision_split_v2.csv"
+DECISION_EVIDENCE_TRAINING = "data/manifests/v2/evidence_training.jsonl"
+DECISION_EVIDENCE_VALIDATION = "data/manifests/v2/evidence_validation.jsonl"
+
+DECISION_TIERS_FOR_PPO = ("A", "B")
+DECISION_DATASET_ROLES_FOR_PPO = ("CORE", "SUPPORT")
+DECISION_MERGE_CONTEXT_STATUS_ELIGIBLE = "MERGE_CONTEXT_ELIGIBLE"
 
 
 def load_maneuver_specs(
@@ -57,6 +68,81 @@ def load_maneuver_specs(
                 continue
             if required_schema_version is not None:
                 spec.require_schema(required_schema_version)
+            specs.append(spec)
+    return specs
+
+
+def _load_decision_evidence_by_candidate_id(evidence_path: str) -> dict:
+    evidence_by_candidate_id = {}
+    with open(evidence_path) as f:
+        for line in f:
+            row = json.loads(line)
+            evidence_by_candidate_id[row["candidate_id"]] = row
+    return evidence_by_candidate_id
+
+
+def load_decision_dataset_maneuver_specs(
+    which_split: str,
+    maneuver_table_path: str = DECISION_MANEUVER_TABLE,
+    split_manifest_path: str = DECISION_SPLIT_MANIFEST,
+    evidence_training_path: str = DECISION_EVIDENCE_TRAINING,
+    evidence_validation_path: str = DECISION_EVIDENCE_VALIDATION,
+) -> List[ManeuverSpec]:
+    """Loads every ManeuverSpec belonging to one split of the FROZEN
+    final MERGE Decision Dataset v2
+    (data/manifests/v2/merge_decision_*_v2.csv), joined against its
+    authoritative evidence JSONL for the fields
+    (topology_evidence/interaction_evidence) the frozen manifest's own
+    columns do not carry.
+
+    Frozen manifest/split CSVs are read-only here -- never rewritten.
+    Restricts to the PPO training-relevant subset explicitly (Tier
+    A/B, dataset_role CORE/SUPPORT, merge_context_status ELIGIBLE) per
+    the Decision Dataset's own Merge Context Validity + Decision
+    Relevance contract (see ``DATASET_SCHEMA_MERGE_DECISION_V2``) --
+    NOT the legacy CONFIRMED_MERGE-only contract."""
+
+    which_split = normalize_split_name(which_split)
+    evidence_path = (
+        evidence_training_path if which_split == "train" else evidence_validation_path
+    )
+    evidence_by_candidate_id = _load_decision_evidence_by_candidate_id(evidence_path)
+
+    split_rows = {
+        r.maneuver_id: normalize_split_name(r.split)
+        for r in load_split_manifest(split_manifest_path)
+    }
+
+    specs = []
+    seen_maneuver_ids = set()
+    seen_candidate_ids = set()
+    with open(maneuver_table_path, newline="") as f:
+        for row in csv.DictReader(f):
+            if split_rows.get(row["maneuver_id"]) != which_split:
+                continue
+            if row["decision_tier"] not in DECISION_TIERS_FOR_PPO:
+                continue
+            if row["dataset_role"] not in DECISION_DATASET_ROLES_FOR_PPO:
+                continue
+            if row["merge_context_status"] != DECISION_MERGE_CONTEXT_STATUS_ELIGIBLE:
+                continue
+
+            evidence_row = evidence_by_candidate_id.get(row["candidate_id"])
+            if evidence_row is None:
+                continue
+
+            maneuver_id = row["maneuver_id"]
+            candidate_id = row["candidate_id"]
+            if maneuver_id in seen_maneuver_ids or candidate_id in seen_candidate_ids:
+                raise ValueError(
+                    f"duplicate maneuver_id/candidate_id in decision dataset: "
+                    f"{maneuver_id} / {candidate_id}"
+                )
+            seen_maneuver_ids.add(maneuver_id)
+            seen_candidate_ids.add(candidate_id)
+
+            spec = ManeuverSpec.from_decision_dataset_row(row, evidence_row)
+            spec.require_schema(DATASET_SCHEMA_MERGE_DECISION_V2)
             specs.append(spec)
     return specs
 

@@ -29,9 +29,16 @@ from pathlib import Path
 import jax
 
 from src.environment.dataset_split import load_split_manifest, normalize_split_name
-from src.environment.full_split_evaluator import load_maneuver_specs
+from src.environment.full_split_evaluator import (
+    load_decision_dataset_maneuver_specs,
+    load_maneuver_specs,
+)
 from src.environment.merge_environment import MergeEnvironment
-from src.scenarios.merge_v2 import DATASET_SCHEMA_V2, LEGACY_DATASET_SCHEMA
+from src.scenarios.merge_v2 import (
+    DATASET_SCHEMA_MERGE_DECISION_V2,
+    DATASET_SCHEMA_V2,
+    LEGACY_DATASET_SCHEMA,
+)
 from src.policies.ppo.state import create_train_state
 from src.training.checkpoint import (
     CheckpointPayload,
@@ -41,6 +48,7 @@ from src.training.checkpoint import (
     save_checkpoint,
 )
 from src.training.config import load_ppo_config, load_reward_config
+from src.training.provenance import load_dataset_provenance
 from src.training.run_manifest import write_run_manifest
 from src.training.seeding import make_seed_state
 from src.training.trainer import run_training
@@ -63,6 +71,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-legacy-dataset", action="store_true",
         help="Historical debugging only. Paper/P6 training must use merge_interaction_v2.",
+    )
+    parser.add_argument(
+        "--dataset-contract",
+        choices=("merge_interaction_v2", "merge_decision_v2"),
+        default="merge_interaction_v2",
+        help="Which frozen dataset/runtime contract to load maneuvers "
+        "under. 'merge_decision_v2' loads the frozen final MERGE "
+        "Decision Dataset v2 (data/manifests/v2/merge_decision_*_v2.csv) "
+        "via its decision-context loader/schema instead of the legacy "
+        "merge_interaction_v2 CONFIRMED_MERGE-only path. Explicit, "
+        "never auto-detected.",
     )
     parser.add_argument(
         "--seed",
@@ -118,16 +137,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids, split_manifest_path=None) -> list:
-    split_rows = (
-        load_split_manifest(split_manifest_path)
-        if split_manifest_path is not None
-        else load_split_manifest()
-    )
-    train_ids = sorted(
-        row.maneuver_id for row in split_rows
-        if normalize_split_name(row.split) == "train"
-    )
+def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids, split_manifest_path=None, train_ids=None) -> list:
+    """``train_ids``, when given, overrides the split-manifest-derived
+    TRAIN id list entirely (used by the merge_decision_v2 contract,
+    whose TRAIN membership is defined by its own loader's Tier A/B +
+    dataset_role + merge_context_status filters, not by the raw split
+    manifest alone)."""
+
+    if train_ids is None:
+        split_rows = (
+            load_split_manifest(split_manifest_path)
+            if split_manifest_path is not None
+            else load_split_manifest()
+        )
+        train_ids = sorted(
+            row.maneuver_id for row in split_rows
+            if normalize_split_name(row.split) == "train"
+        )
     if explicit_ids is not None:
         requested = [m.strip() for m in explicit_ids.split(",") if m.strip()]
         missing = [m for m in requested if m not in train_ids]
@@ -140,6 +166,10 @@ def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids, split_manifest_path=
     return train_ids[:max_maneuvers]
 
 
+def _decision_dataset_provenance():
+    return load_dataset_provenance()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -147,27 +177,48 @@ def main() -> None:
     reward_config = load_reward_config(ppo_config.reward_config_path)
     seed = args.seed if args.seed is not None else ppo_config.seed
 
-    required_paths = [args.maneuver_table, args.candidate_manifest, args.split_manifest]
-    missing_v2 = [p for p in required_paths if not Path(p).exists()]
-    if missing_v2 and not args.allow_legacy_dataset:
-        raise RuntimeError(
-            "merge_interaction_v2 manifests are not built yet; refusing to train "
-            f"on the invalidated v1 dataset. Missing: {missing_v2}. Run "
-            "scripts/build_merge_v2_manifest.py after acquiring/auditing Scenario protobuf data."
+    if args.dataset_contract == "merge_decision_v2":
+        # Frozen final MERGE Decision Dataset v2's own decision-context
+        # contract -- never routed through the legacy
+        # merge_interaction_v2 preflight/CONFIRMED_MERGE checks below.
+        seed_state = make_seed_state(seed)
+        expected_schema = DATASET_SCHEMA_MERGE_DECISION_V2
+        all_train_specs = load_decision_dataset_maneuver_specs("train")
+        maneuver_ids = _resolve_maneuver_ids(
+            args.max_maneuvers, args.maneuver_ids,
+            train_ids=sorted(s.maneuver_id for s in all_train_specs),
         )
-    if args.allow_legacy_dataset:
-        from src.environment.full_split_evaluator import MANEUVER_TABLE, CANDIDATE_MANIFEST
-        args.maneuver_table = MANEUVER_TABLE
-        args.candidate_manifest = CANDIDATE_MANIFEST
-        args.split_manifest = None
+    else:
+        required_paths = [args.maneuver_table, args.candidate_manifest, args.split_manifest]
+        missing_v2 = [p for p in required_paths if not Path(p).exists()]
+        if missing_v2 and not args.allow_legacy_dataset:
+            raise RuntimeError(
+                "merge_interaction_v2 manifests are not built yet; refusing to train "
+                f"on the invalidated v1 dataset. Missing: {missing_v2}. Run "
+                "scripts/build_merge_v2_manifest.py after acquiring/auditing Scenario protobuf data."
+            )
+        if args.allow_legacy_dataset:
+            from src.environment.full_split_evaluator import MANEUVER_TABLE, CANDIDATE_MANIFEST
+            args.maneuver_table = MANEUVER_TABLE
+            args.candidate_manifest = CANDIDATE_MANIFEST
+            args.split_manifest = None
 
-    # Initialize JAX only after the dataset validity preflight. A missing v2
-    # dataset should fail with one actionable message, not GPU/plugin noise.
-    seed_state = make_seed_state(seed)
+        # Initialize JAX only after the dataset validity preflight. A missing v2
+        # dataset should fail with one actionable message, not GPU/plugin noise.
+        seed_state = make_seed_state(seed)
 
-    maneuver_ids = _resolve_maneuver_ids(
-        args.max_maneuvers, args.maneuver_ids, args.split_manifest
-    )
+        maneuver_ids = _resolve_maneuver_ids(
+            args.max_maneuvers, args.maneuver_ids, args.split_manifest
+        )
+
+        expected_schema = None if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+        all_train_specs = load_maneuver_specs(
+            "train",
+            split_manifest_path=args.split_manifest,
+            maneuver_table_path=args.maneuver_table,
+            candidate_manifest_path=args.candidate_manifest,
+            required_schema_version=expected_schema,
+        )
 
     print(f"Loaded PPO config from {ppo_config.source_path}")
     print(f"  network: {ppo_config.network}")
@@ -176,16 +227,9 @@ def main() -> None:
     print(f"Loaded reward config from {reward_config.source_path} "
           f"(reward_version={reward_config.reward_version})")
     print(f"Seed: {seed}")
+    print(f"Dataset contract: {args.dataset_contract}")
     print(f"Maneuver subset ({len(maneuver_ids)}): {maneuver_ids}")
 
-    expected_schema = None if args.allow_legacy_dataset else DATASET_SCHEMA_V2
-    all_train_specs = load_maneuver_specs(
-        "train",
-        split_manifest_path=args.split_manifest,
-        maneuver_table_path=args.maneuver_table,
-        candidate_manifest_path=args.candidate_manifest,
-        required_schema_version=expected_schema,
-    )
     specs_by_id = {s.maneuver_id: s for s in all_train_specs}
     missing = [m for m in maneuver_ids if m not in specs_by_id]
     if missing:
@@ -205,7 +249,9 @@ def main() -> None:
         print(f"--resume={args.resume}: loading checkpoint and continuing training "
               "(not restarting from scratch).")
         payload = load_checkpoint(args.resume)
-        resume_schema = LEGACY_DATASET_SCHEMA if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+        resume_schema = (
+            expected_schema if expected_schema is not None else LEGACY_DATASET_SCHEMA
+        )
         if payload.dataset_schema_version != resume_schema:
             raise ValueError(
                 f"Cannot resume {payload.dataset_schema_version!r} checkpoint "
@@ -316,12 +362,13 @@ def main() -> None:
             "hyperparameters": dataclasses.asdict(ppo_config.hyperparameters),
             "network_hidden_sizes": list(ppo_config.network.hidden_sizes),
             "maneuver_ids": maneuver_ids,
+            "dataset_contract": args.dataset_contract,
         },
         reward_version=reward_config.reward_version,
         git_sha=get_git_sha(),
         numpy_rng_state=numpy_rng.get_state(),
         dataset_schema_version=(
-            LEGACY_DATASET_SCHEMA if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+            expected_schema if expected_schema is not None else LEGACY_DATASET_SCHEMA
         ),
     )
     save_checkpoint(payload, checkpoint_path)
@@ -343,7 +390,16 @@ def main() -> None:
             ppo_update_step=result["ppo_update_step"],
             resumed_from=args.resume,
             dataset_schema_version=(
-                LEGACY_DATASET_SCHEMA if args.allow_legacy_dataset else DATASET_SCHEMA_V2
+                expected_schema if expected_schema is not None else LEGACY_DATASET_SCHEMA
+            ),
+            dataset_contract=args.dataset_contract,
+            dataset_version=(
+                _decision_dataset_provenance().version
+                if args.dataset_contract == "merge_decision_v2" else None
+            ),
+            dataset_freeze_sha=(
+                _decision_dataset_provenance().git_sha
+                if args.dataset_contract == "merge_decision_v2" else None
             ),
         )
         print(f"Saved run manifest to {run_manifest_path}")

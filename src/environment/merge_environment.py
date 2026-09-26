@@ -86,7 +86,11 @@ from src.scenarios.scenario_features import (
     AgentSelectionConfig,
     load_agent_selection_config,
 )
-from src.scenarios.merge_v2 import DATASET_SCHEMA_V2, LEGACY_DATASET_SCHEMA
+from src.scenarios.merge_v2 import (
+    DATASET_SCHEMA_MERGE_DECISION_V2,
+    DATASET_SCHEMA_V2,
+    LEGACY_DATASET_SCHEMA,
+)
 from src.scenarios.scenario_loader import (
     build_waymax_config,
     iter_scenarios,
@@ -169,6 +173,19 @@ class ManeuverSpec:
                 raise ValueError(
                     f"v2 maneuver {self.maneuver_id} has no relevant vehicle interaction"
                 )
+        elif expected == DATASET_SCHEMA_MERGE_DECISION_V2:
+            # Decision-context contract (Merge Context Validity +
+            # Decision Relevance) -- deliberately does NOT require
+            # manual_validation == CONFIRMED_MERGE or a relevant
+            # interaction vehicle: this dataset legitimately includes
+            # KEEP-only WEAK_INTERACTION maneuvers with zero
+            # interaction vehicles, and every row is UNREVIEWED (never
+            # manually confirmed) by construction.
+            if not self.topology_evidence or not self.interaction_evidence:
+                raise ValueError(
+                    f"decision-dataset maneuver {self.maneuver_id} lacks "
+                    "topology/interaction evidence"
+                )
 
     @staticmethod
     def from_csv_row(row: dict, manifest_by_candidate_id: dict) -> "ManeuverSpec":
@@ -199,6 +216,48 @@ class ManeuverSpec:
             interaction_evidence=_parse_optional_json(
                 row.get("interaction_evidence") or first_candidate.get("interaction_evidence")
             ),
+        )
+
+    @staticmethod
+    def from_decision_dataset_row(
+        maneuver_row: dict, evidence_row: dict
+    ) -> "ManeuverSpec":
+        """Builds a ManeuverSpec for one row of the frozen final MERGE
+        Decision Dataset v2 (data/manifests/v2/merge_decision_*_v2.csv)
+        joined against its authoritative evidence row
+        (data/manifests/v2/evidence_{training,validation}.jsonl, keyed
+        by candidate_id).
+
+        Every decision-dataset maneuver has exactly one candidate (no
+        chained maneuvers in this dataset), so ``lane_chain`` is
+        exactly ``[source_lane_id, target_lane_id]`` from the
+        evidence's own ``topology_evidence`` -- never re-derived from
+        a future/simulated trajectory. ``merge_start_frame`` uses
+        ``interaction_evidence.commit_frame``: the same physical
+        merge-commit reference role ``merge_start_frame`` already
+        plays for the legacy schema (a diagnostic/horizon-shift
+        reference, never the simulation start -- ``decision_start_
+        frame`` is always recomputed live from the scene's logged
+        trajectory by ``MergeEnvironment._resolve_decision_start_
+        frame``, regardless of which schema is in use)."""
+
+        topology_evidence = evidence_row["topology_evidence"]
+        interaction_evidence = evidence_row["interaction_evidence"]
+        return ManeuverSpec(
+            maneuver_id=maneuver_row["maneuver_id"],
+            source_shard=maneuver_row["source_shard"],
+            record_index=int(maneuver_row["record_index"]),
+            lane_chain=[
+                int(topology_evidence["source_lane_id"]),
+                int(topology_evidence["target_lane_id"]),
+            ],
+            candidate_ids=[maneuver_row["candidate_id"]],
+            merge_start_frame=int(interaction_evidence["commit_frame"]),
+            schema_version=DATASET_SCHEMA_MERGE_DECISION_V2,
+            maneuver_type=None,
+            manual_validation=None,
+            topology_evidence=topology_evidence,
+            interaction_evidence=interaction_evidence,
         )
 
 

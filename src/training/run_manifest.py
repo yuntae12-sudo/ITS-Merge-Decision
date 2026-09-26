@@ -46,11 +46,19 @@ def write_run_manifest(
     ppo_update_step: int,
     resumed_from: Optional[str] = None,
     dataset_schema_version: str = LEGACY_DATASET_SCHEMA,
+    dataset_contract: Optional[str] = None,
+    dataset_version: Optional[str] = None,
+    dataset_freeze_sha: Optional[str] = None,
 ) -> str:
     """Writes the ``.run.json`` sidecar and returns its path. Best-
     effort: a caller (train_ppo.py) should treat a failure here as
     non-fatal to training completion (the checkpoint itself is already
-    saved by the time this is called)."""
+    saved by the time this is called).
+
+    ``dataset_contract``/``dataset_version``/``dataset_freeze_sha`` are
+    additive provenance (default None so older callers/manifests are
+    unaffected) recording which frozen dataset a
+    ``merge_decision_v2``-contract run was trained against."""
 
     manifest = {
         "checkpoint_path": checkpoint_path,
@@ -67,6 +75,9 @@ def write_run_manifest(
         "ppo_update_step": ppo_update_step,
         "resumed_from": resumed_from,
         "dataset_schema_version": dataset_schema_version,
+        "dataset_contract": dataset_contract,
+        "dataset_version": dataset_version,
+        "dataset_freeze_sha": dataset_freeze_sha,
     }
 
     output_path = run_manifest_path_for_checkpoint(checkpoint_path)

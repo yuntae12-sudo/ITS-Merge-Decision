@@ -28,9 +28,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import jax
 
 from src.environment.dataset_split import load_split_manifest
-from src.environment.full_split_evaluator import load_maneuver_specs
+from src.environment.full_split_evaluator import (
+    load_decision_dataset_maneuver_specs,
+    load_maneuver_specs,
+)
 from src.environment.merge_environment import MergeEnvironment
-from src.scenarios.merge_v2 import DATASET_SCHEMA_V2
+from src.scenarios.merge_v2 import DATASET_SCHEMA_MERGE_DECISION_V2, DATASET_SCHEMA_V2
 from src.training.config import load_reward_config
 from src.visualization.episode_summary import write_episode_summary
 from src.visualization.manifest import build_manifest, write_manifest
@@ -88,6 +91,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-legacy-dataset", action="store_true",
         help="Permit historical v1 checkpoints for diagnosis only; never combine them with v2 results.",
     )
+    parser.add_argument(
+        "--dataset-contract",
+        choices=("merge_interaction_v2", "merge_decision_v2"),
+        default="merge_interaction_v2",
+        help="Expected dataset contract of the checkpoint being visualized. "
+        "'merge_decision_v2' permits/expects a checkpoint trained against "
+        "the frozen final MERGE Decision Dataset v2. Explicit, never "
+        "auto-detected from the checkpoint before loading -- once loaded, "
+        "--scope checkpoint additionally cross-checks against the "
+        "checkpoint's own recorded dataset_schema_version.",
+    )
     render_group = parser.add_mutually_exclusive_group()
     render_group.add_argument("--scan-only", action="store_true",
                                help="Only run the outcome scan (outcome_index.csv + selected_episodes.json); skip rendering.")
@@ -144,7 +158,13 @@ def _resolve_maneuvers(args, restored):
                 "has no maneuver_ids recorded (older checkpoint?). Use --scope split "
                 "or --scope explicit instead."
             )
-        if args.allow_legacy_dataset:
+        if restored.dataset_schema_version == DATASET_SCHEMA_MERGE_DECISION_V2:
+            # The checkpoint itself was trained under the frozen final
+            # MERGE Decision Dataset v2 contract -- resolve its
+            # maneuver_ids through the same decision-dataset loader,
+            # never the legacy merge_interaction_v2 path.
+            specs = load_decision_dataset_maneuver_specs("train")
+        elif args.allow_legacy_dataset:
             specs = load_maneuver_specs("train")
         else:
             specs = load_maneuver_specs(
@@ -192,11 +212,15 @@ def main() -> None:
     args = parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
+    if args.allow_legacy_dataset:
+        expected_dataset_schema_version = None
+    elif args.dataset_contract == "merge_decision_v2":
+        expected_dataset_schema_version = DATASET_SCHEMA_MERGE_DECISION_V2
+    else:
+        expected_dataset_schema_version = DATASET_SCHEMA_V2
     restored = restore_ppo_checkpoint(
         args.checkpoint,
-        expected_dataset_schema_version=(
-            None if args.allow_legacy_dataset else DATASET_SCHEMA_V2
-        ),
+        expected_dataset_schema_version=expected_dataset_schema_version,
     )
     print(f"  seed={restored.seed} reward_version={restored.reward_version} "
           f"ppo_update_step={restored.ppo_update_step} global_env_step={restored.global_env_step}")

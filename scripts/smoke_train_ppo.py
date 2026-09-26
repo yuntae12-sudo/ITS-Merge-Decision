@@ -27,6 +27,7 @@ import jax
 
 from src.environment.full_split_evaluator import load_maneuver_specs
 from src.environment.merge_environment import MergeEnvironment
+from src.scenarios.merge_v2 import DATASET_SCHEMA_MERGE_DECISION_V2
 from src.policies.ppo.state import create_train_state
 from src.training.checkpoint import (
     CheckpointPayload,
@@ -109,11 +110,21 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DATASET_CONFIG_PATH,
         help="Waymax dataset config path (see MergeEnvironment).",
     )
+    parser.add_argument(
+        "--dataset-contract",
+        choices=("merge_interaction_v2", "merge_decision_v2"),
+        default="merge_interaction_v2",
+        help="Same meaning as scripts/train_ppo.py's --dataset-contract: "
+        "'merge_decision_v2' uses the frozen final MERGE Decision "
+        "Dataset v2 via src.environment.full_split_evaluator."
+        "load_decision_dataset_maneuver_specs instead of the legacy "
+        "merge_interaction_v2 split manifest.",
+    )
     return parser.parse_args()
 
 
 def select_smoke_maneuver_ids(
-    seed: int, max_maneuvers: int, explicit_ids=None
+    seed: int, max_maneuvers: int, explicit_ids=None, train_ids=None
 ) -> list:
     """Deterministically selects a small subset of canonical-TRAIN
     maneuver_ids for Smoke Training.
@@ -125,15 +136,22 @@ def select_smoke_maneuver_ids(
     matters more here than seed-dependent sampling since Smoke
     Training's whole point is pipeline verification, not performance
     variance.
+
+    ``train_ids``, when given, overrides the legacy split-manifest
+    derivation entirely (used by the merge_decision_v2 contract, whose
+    TRAIN membership already reflects Tier A/B + dataset_role +
+    merge_context_status filtering from
+    ``load_decision_dataset_maneuver_specs``).
     """
 
-    from src.environment.dataset_split import load_split_manifest, normalize_split_name
+    if train_ids is None:
+        from src.environment.dataset_split import load_split_manifest, normalize_split_name
 
-    train_rows = [
-        row for row in load_split_manifest()
-        if normalize_split_name(row.split) == "train"
-    ]
-    train_ids = sorted(row.maneuver_id for row in train_rows)
+        train_rows = [
+            row for row in load_split_manifest()
+            if normalize_split_name(row.split) == "train"
+        ]
+        train_ids = sorted(row.maneuver_id for row in train_rows)
 
     if explicit_ids is not None:
         requested = [m.strip() for m in explicit_ids.split(",") if m.strip()]
@@ -173,19 +191,26 @@ def main() -> None:
         else (ppo_config.smoke.max_episode_steps if ppo_config.smoke else 30)
     )
 
+    if args.dataset_contract == "merge_decision_v2":
+        from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
+        all_train_specs = load_decision_dataset_maneuver_specs("train")
+    else:
+        all_train_specs = load_maneuver_specs("train")
+
     maneuver_ids = select_smoke_maneuver_ids(
-        seed=seed, max_maneuvers=max_maneuvers, explicit_ids=args.maneuver_ids
+        seed=seed, max_maneuvers=max_maneuvers, explicit_ids=args.maneuver_ids,
+        train_ids=sorted(s.maneuver_id for s in all_train_specs),
     )
 
     print(f"Loaded PPO config from {ppo_config.source_path}")
     print(f"Loaded reward config from {reward_config.source_path} "
           f"(reward_version={reward_config.reward_version})")
     print(f"Seed: {seed}")
+    print(f"Dataset contract: {args.dataset_contract}")
     print(f"Smoke maneuver subset (canonical TRAIN only, {len(maneuver_ids)} "
           f"maneuvers): {maneuver_ids}")
     print(f"num_updates={num_updates}, max_episode_steps={max_episode_steps}")
 
-    all_train_specs = load_maneuver_specs("train")
     specs_by_id = {s.maneuver_id: s for s in all_train_specs}
     missing = [m for m in maneuver_ids if m not in specs_by_id]
     if missing:
@@ -195,6 +220,10 @@ def main() -> None:
     env = MergeEnvironment(
         dataset_config_path=args.dataset_config_path,
         downstream_mode=ppo_config.rollout.downstream_mode,
+        required_dataset_schema_version=(
+            DATASET_SCHEMA_MERGE_DECISION_V2
+            if args.dataset_contract == "merge_decision_v2" else None
+        ),
     )
 
     global_env_step = 0
