@@ -29,6 +29,7 @@ def build_manifest(
         "current_git_sha": get_git_sha(),
         "reward_version": restored.reward_version,
         "dataset_schema_version": restored.dataset_schema_version,
+        "dataset_contract": restored.dataset_schema_version,
         "seed": restored.seed,
         "ppo_update_step": restored.ppo_update_step,
         "global_env_step": restored.global_env_step,

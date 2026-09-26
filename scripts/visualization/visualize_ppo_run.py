@@ -43,6 +43,8 @@ from src.visualization.outcome_scan import (
     select_representative_episodes,
     write_outcome_index_csv,
 )
+from src.scenarios.merge_v2 import LEGACY_DATASET_SCHEMA
+from src.training.checkpoint import load_checkpoint
 from src.visualization.ppo_checkpoint_policy import restore_ppo_checkpoint
 from src.visualization.ppo_rollout import run_ppo_episode
 from src.visualization.render import (
@@ -94,13 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-contract",
         choices=("merge_interaction_v2", "merge_decision_v2"),
-        default="merge_interaction_v2",
-        help="Expected dataset contract of the checkpoint being visualized. "
-        "'merge_decision_v2' permits/expects a checkpoint trained against "
-        "the frozen final MERGE Decision Dataset v2. Explicit, never "
-        "auto-detected from the checkpoint before loading -- once loaded, "
-        "--scope checkpoint additionally cross-checks against the "
-        "checkpoint's own recorded dataset_schema_version.",
+        default=None,
+        help="Which dataset contract to expect/enforce. Default (unset): "
+        "auto-detected from the checkpoint's own recorded "
+        "dataset_schema_version -- the checkpoint itself is the source "
+        "of truth, never overridden to merge_interaction_v2 by default. "
+        "Pass this explicitly only to additionally assert a specific "
+        "contract (evaluation fails loudly if the checkpoint disagrees).",
     )
     render_group = parser.add_mutually_exclusive_group()
     render_group.add_argument("--scan-only", action="store_true",
@@ -149,7 +151,25 @@ def resolve_render_policy(render_all: bool, scan_only: bool, scope: str, max_per
     return max_per_outcome, {"mode": "representative_per_outcome", "max_per_outcome": max_per_outcome}
 
 
+_KNOWN_DATASET_SCHEMAS = (
+    DATASET_SCHEMA_MERGE_DECISION_V2, DATASET_SCHEMA_V2, LEGACY_DATASET_SCHEMA
+)
+
+
 def _resolve_maneuvers(args, restored):
+    if (
+        not args.allow_legacy_dataset
+        and restored.dataset_schema_version not in _KNOWN_DATASET_SCHEMAS
+    ):
+        raise ValueError(
+            f"Unknown checkpoint dataset_schema_version "
+            f"{restored.dataset_schema_version!r} -- no maneuver-resolution "
+            "loader is defined for this schema. Known schemas: "
+            f"{_KNOWN_DATASET_SCHEMAS}. Pass --allow-legacy-dataset only "
+            "for historical diagnosis, never to silently paper over an "
+            "unrecognized schema."
+        )
+
     if args.scope == "checkpoint":
         maneuver_ids = sorted(restored.maneuver_ids)
         if not maneuver_ids:
@@ -181,6 +201,10 @@ def _resolve_maneuvers(args, restored):
 
     if args.scope == "split":
         split = args.split or "train"
+        if restored.dataset_schema_version == DATASET_SCHEMA_MERGE_DECISION_V2:
+            return sorted(
+                load_decision_dataset_maneuver_specs(split), key=lambda s: s.maneuver_id
+            )
         kwargs = {} if args.allow_legacy_dataset else dict(
             split_manifest_path=args.split_manifest,
             maneuver_table_path=args.maneuver_table,
@@ -193,13 +217,20 @@ def _resolve_maneuvers(args, restored):
         if not args.maneuver_ids:
             raise ValueError("--scope explicit requires --maneuver-ids")
         requested = [m.strip() for m in args.maneuver_ids.split(",") if m.strip()]
-        kwargs = {} if args.allow_legacy_dataset else dict(
-            split_manifest_path=args.split_manifest,
-            maneuver_table_path=args.maneuver_table,
-            candidate_manifest_path=args.candidate_manifest,
-            required_schema_version=DATASET_SCHEMA_V2,
-        )
-        all_specs = {s.maneuver_id: s for split in ("train", "tune", "validation") for s in load_maneuver_specs(split, **kwargs)}
+        if restored.dataset_schema_version == DATASET_SCHEMA_MERGE_DECISION_V2:
+            all_specs = {
+                s.maneuver_id: s
+                for split in ("train", "validation")
+                for s in load_decision_dataset_maneuver_specs(split)
+            }
+        else:
+            kwargs = {} if args.allow_legacy_dataset else dict(
+                split_manifest_path=args.split_manifest,
+                maneuver_table_path=args.maneuver_table,
+                candidate_manifest_path=args.candidate_manifest,
+                required_schema_version=DATASET_SCHEMA_V2,
+            )
+            all_specs = {s.maneuver_id: s for split in ("train", "tune", "validation") for s in load_maneuver_specs(split, **kwargs)}
         missing = [m for m in requested if m not in all_specs]
         if missing:
             raise ValueError(f"--maneuver-ids requested maneuver(s) not found in any split: {missing}")
@@ -212,12 +243,25 @@ def main() -> None:
     args = parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint}")
+    # The checkpoint's own recorded dataset_schema_version is the
+    # source of truth (never overwritten to merge_interaction_v2 by
+    # default) -- peek it once (load_checkpoint is a cheap unpickle,
+    # restore_ppo_checkpoint below re-loads it to actually reconstruct
+    # the policy/value networks) so we know which contract/loader this
+    # checkpoint requires before deciding what to enforce.
+    checkpoint_schema_version = load_checkpoint(args.checkpoint).dataset_schema_version
+
     if args.allow_legacy_dataset:
         expected_dataset_schema_version = None
-    elif args.dataset_contract == "merge_decision_v2":
-        expected_dataset_schema_version = DATASET_SCHEMA_MERGE_DECISION_V2
+    elif args.dataset_contract is not None:
+        # Explicit caller assertion -- validate rather than override.
+        expected_dataset_schema_version = {
+            "merge_interaction_v2": DATASET_SCHEMA_V2,
+            "merge_decision_v2": DATASET_SCHEMA_MERGE_DECISION_V2,
+        }[args.dataset_contract]
     else:
-        expected_dataset_schema_version = DATASET_SCHEMA_V2
+        expected_dataset_schema_version = checkpoint_schema_version
+
     restored = restore_ppo_checkpoint(
         args.checkpoint,
         expected_dataset_schema_version=expected_dataset_schema_version,
@@ -239,9 +283,7 @@ def main() -> None:
     env = MergeEnvironment(
         dataset_config_path=args.dataset_config_path,
         downstream_mode=args.downstream_mode,
-        required_dataset_schema_version=(
-            None if args.allow_legacy_dataset else DATASET_SCHEMA_V2
-        ),
+        required_dataset_schema_version=expected_dataset_schema_version,
     )
 
     rng_key = jax.random.PRNGKey(args.policy_seed) if args.policy_mode == "stochastic" else None
