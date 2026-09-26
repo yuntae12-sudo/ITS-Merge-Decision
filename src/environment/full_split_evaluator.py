@@ -12,7 +12,7 @@ import dataclasses
 from typing import List, Optional
 
 from src.environment.behavior_action import BehaviorAction
-from src.environment.dataset_split import load_split_manifest
+from src.environment.dataset_split import load_split_manifest, normalize_split_name
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
 
 MANEUVER_TABLE = "outputs/phase1/training_10shard_pilot/training_visual_merge_maneuvers.csv"
@@ -32,9 +32,16 @@ def load_maneuver_specs(
     Stage B-1.5/B-2's representative-sample checks)."""
 
     if split_manifest_path is not None:
-        split_rows = {r.maneuver_id: r.split for r in load_split_manifest(split_manifest_path)}
+        split_rows = {
+            r.maneuver_id: normalize_split_name(r.split)
+            for r in load_split_manifest(split_manifest_path)
+        }
     else:
-        split_rows = {r.maneuver_id: r.split for r in load_split_manifest()}
+        split_rows = {
+            r.maneuver_id: normalize_split_name(r.split)
+            for r in load_split_manifest()
+        }
+    which_split = normalize_split_name(which_split)
 
     with open(candidate_manifest_path, newline="") as f:
         manifest_by_candidate_id = {row["candidate_id"]: row for row in csv.DictReader(f)}

@@ -7,6 +7,7 @@ from src.environment.dataset_split import (
     SPLIT_MANIFEST_PATH,
     build_split,
     load_split_manifest,
+    normalize_split_name,
 )
 
 
@@ -45,3 +46,25 @@ def test_tracked_manifest_matches_regenerated_split():
         (row.maneuver_id, row.scene_key, row.split) for row in regenerated_rows
     ]
     assert tracked == regenerated
+
+
+# --- split-name normalization (legacy Phase 2 "train" vs final v2
+# "training" PPO runtime compatibility fix) ---
+
+
+def test_normalize_split_name_legacy_train():
+    assert normalize_split_name("train") == "train"
+
+
+def test_normalize_split_name_final_v2_training():
+    assert normalize_split_name("training") == "train"
+
+
+def test_normalize_split_name_validation():
+    assert normalize_split_name("validation") == "validation"
+
+
+def test_normalize_split_name_unknown_label_is_left_unchanged():
+    # Unknown split labels must never be silently coerced into "train".
+    assert normalize_split_name("tune") == "tune"
+    assert normalize_split_name("bogus_split") == "bogus_split"

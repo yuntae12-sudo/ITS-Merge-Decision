@@ -127,10 +127,11 @@ def select_smoke_maneuver_ids(
     variance.
     """
 
-    from src.environment.dataset_split import load_split_manifest
+    from src.environment.dataset_split import load_split_manifest, normalize_split_name
 
     train_rows = [
-        row for row in load_split_manifest() if row.split == "train"
+        row for row in load_split_manifest()
+        if normalize_split_name(row.split) == "train"
     ]
     train_ids = sorted(row.maneuver_id for row in train_rows)
 

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import jax
 
-from src.environment.dataset_split import load_split_manifest
+from src.environment.dataset_split import load_split_manifest, normalize_split_name
 from src.environment.full_split_evaluator import load_maneuver_specs
 from src.environment.merge_environment import MergeEnvironment
 from src.scenarios.merge_v2 import DATASET_SCHEMA_V2, LEGACY_DATASET_SCHEMA
@@ -125,7 +125,8 @@ def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids, split_manifest_path=
         else load_split_manifest()
     )
     train_ids = sorted(
-        row.maneuver_id for row in split_rows if row.split == "train"
+        row.maneuver_id for row in split_rows
+        if normalize_split_name(row.split) == "train"
     )
     if explicit_ids is not None:
         requested = [m.strip() for m in explicit_ids.split(",") if m.strip()]
