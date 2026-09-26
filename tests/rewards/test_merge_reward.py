@@ -15,6 +15,7 @@ Covers the required-tests list from PPO_PLAN.md SS0.1/P2:
     collision/offroad/success detection code.
 """
 
+import ast
 import inspect
 import math
 
@@ -132,11 +133,25 @@ def test_reward_module_does_not_reimplement_termination_detection():
     anything from src.environment (it must consume only the
     already-computed termination_reason string/enum handed to it, not
     re-derive success/collision/offroad/timeout by importing the
-    environment's own detection machinery)."""
+    environment's own detection machinery).
 
-    source = inspect.getsource(merge_reward)
-    assert "src.environment" not in source
-    assert "waymax" not in source
+    Checks actual import statements (not every substring occurrence) --
+    Reward V1's module docstring/comments legitimately mention
+    ``src.environment.observation_builder`` by name (to document which
+    observation indices its local mirrored constants correspond to)
+    without importing it; a plain substring check would false-positive
+    on that prose."""
+
+    tree = ast.parse(inspect.getsource(merge_reward))
+    imported_modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module)
+
+    assert not any(m == "src.environment" or m.startswith("src.environment.") for m in imported_modules)
+    assert not any(m == "waymax" or m.startswith("waymax.") for m in imported_modules)
 
     # Signature-level check: compute_reward takes termination_reason
     # and is_policy_step as explicit inputs (not, e.g., a raw
@@ -178,8 +193,16 @@ def test_reward_wrapper_episode_sums():
     assert sums["reward/total"] == pytest.approx(sums["reward/terminal"] + sums["reward/decision_cost"])
 
     wrapper.reset()
+    # V0 config has no safety/progress/decision components (both remain
+    # None), so those three keys are always exactly 0.0 for a V0 wrapper
+    # -- present in the dict (Reward V1's episode_sums() contract always
+    # reports all six keys, per REWARD_V1_SPEC_FINAL.md Section 13),
+    # never contributing to reward/total.
     assert wrapper.episode_sums() == {
         "reward/terminal": 0.0,
         "reward/decision_cost": 0.0,
+        "reward/safety": 0.0,
+        "reward/progress": 0.0,
+        "reward/decision": 0.0,
         "reward/total": 0.0,
     }

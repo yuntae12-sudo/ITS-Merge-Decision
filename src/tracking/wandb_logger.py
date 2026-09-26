@@ -58,6 +58,14 @@ MINIMUM_METRICS = (
     "train/episode_length",
     "reward/terminal",
     "reward/decision_cost",
+    # Reward V1 additive components (outputs/reward_v1_spec/
+    # REWARD_V1_SPEC_FINAL.md Section 13/21) -- always 0.0 under a V0
+    # RewardConfig (src.rewards.merge_reward's own V0/V1 dispatch), so
+    # existing V0 runs simply log three constant-0.0 series, nothing
+    # breaks.
+    "reward/safety",
+    "reward/progress",
+    "reward/decision",
     "reward/total",
     "ppo/policy_loss",
     "ppo/value_loss",
@@ -93,6 +101,24 @@ MINIMUM_METRICS = (
     "ppo/value_grad_norm_max",
     "train/policy_decision_count",
     "train/physical_step_count",
+)
+
+# Optional run-provenance config keys (outputs/reward_v1_spec/
+# REWARD_V1_SPEC_FINAL.md Section 13/22) -- NOT added to
+# REQUIRED_CONFIG_KEYS (that would make every existing/future caller
+# that doesn't yet pass them start failing `log_config`'s validation, an
+# unrelated architecture-widening change this session's scope forbids).
+# A caller SHOULD include these when the run trains against the frozen
+# MERGE Decision Dataset v2, sourced from
+# ``data/manifests/v2/MERGE_DECISION_DATASET_V2_FREEZE.json`` (never
+# duplicated/hardcoded a second time -- see
+# ``src.training.provenance.load_dataset_provenance``).
+OPTIONAL_PROVENANCE_KEYS = (
+    "dataset/version",
+    "dataset/freeze_sha",
+    "reward/version",
+    "filter_config_hash",
+    "canonical_manifest_hash",
 )
 
 

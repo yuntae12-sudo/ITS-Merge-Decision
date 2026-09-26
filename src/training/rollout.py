@@ -136,11 +136,27 @@ class Transition:
       immediately after the call that produced this step's ``reward``),
       propagated verbatim -- never re-derived from ``terminated``/
       ``truncated`` here or by any caller. ``reward_terminal_component
-      + reward_decision_cost_component == reward`` for every
+      + reward_decision_cost_component == reward`` for every V0
       ``Transition`` (mirrors ``MergeRewardWrapper.compute``'s own
       internal consistency check). Default to ``0.0`` so a
       ``Transition`` constructed without them (an older/synthetic test
       batch) degrades to "no component data" rather than crashing.
+
+    Reward V1 additive diagnostic fields (outputs/reward_v1_spec/
+    REWARD_V1_SPEC_FINAL.md Section 13/21) -- same propagate-verbatim
+    contract as the two fields above, read from
+    ``MergeRewardWrapper.last_safety_component`` /
+    ``last_progress_component`` / ``last_decision_component`` (already
+    WEIGHTED contributions, not raw). All default to ``0.0`` (a V0
+    ``RewardConfig`` always produces exactly 0.0 for these three, so no
+    special-casing is needed at any call site):
+
+    - ``reward_safety_component`` / ``reward_progress_component`` /
+      ``reward_decision_component``: this step's weighted Safety/
+      Progress/Decision contribution. ``reward_terminal_component +
+      reward_decision_cost_component + reward_safety_component +
+      reward_progress_component + reward_decision_component == reward``
+      for every ``Transition`` (V0 or V1).
     """
 
     observation: Any
@@ -161,6 +177,9 @@ class Transition:
     info: Optional[dict] = None
     reward_terminal_component: float = 0.0
     reward_decision_cost_component: float = 0.0
+    reward_safety_component: float = 0.0
+    reward_progress_component: float = 0.0
+    reward_decision_component: float = 0.0
 
 
 def _value_of(value_network, value_params, observation: np.ndarray) -> float:
@@ -257,6 +276,9 @@ def collect_episode_rollout(
             termination_reason=info_after.get("termination_reason"),
             is_policy_step=is_policy_step,
             info=info_after,
+            observation=observation,
+            next_observation=next_observation,
+            action=action,
         )
         # Reward component logging correctness follow-up fix: read back
         # THIS call's exact terminal/decision-cost components from the
@@ -270,6 +292,12 @@ def collect_episode_rollout(
         # special-casing needed.
         reward_terminal_component = reward_wrapper.last_terminal_component
         reward_decision_cost_component = reward_wrapper.last_decision_cost_component
+        # Reward V1 additive components (always 0.0 for a V0 reward_config
+        # -- see Transition docstring). Read back verbatim, never
+        # re-derived here.
+        reward_safety_component = reward_wrapper.last_safety_component
+        reward_progress_component = reward_wrapper.last_progress_component
+        reward_decision_component = reward_wrapper.last_decision_component
 
         # Fix 1 (episode-aware GAE correctness): an ARTIFICIAL rollout
         # cutoff is when this is the LAST step of the ``max_steps`` loop
@@ -309,6 +337,9 @@ def collect_episode_rollout(
                 info=info_after,
                 reward_terminal_component=reward_terminal_component,
                 reward_decision_cost_component=reward_decision_cost_component,
+                reward_safety_component=reward_safety_component,
+                reward_progress_component=reward_progress_component,
+                reward_decision_component=reward_decision_component,
             )
         )
 

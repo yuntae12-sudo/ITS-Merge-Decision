@@ -118,13 +118,68 @@ class RewardDecisionCost:
 
 
 @dataclasses.dataclass(frozen=True)
+class RewardSafetyConfig:
+    """Reward V1 Safety component (outputs/reward_v1_spec/
+    REWARD_V1_SPEC_FINAL.md Section 5). Target-front TTC/Gap only in the
+    current approved scope -- ``use_target_rear``/``use_source_front``
+    are kept as explicit fields (not silently hardcoded) so a future
+    config revision can opt back in without a code change, but
+    ``src.rewards.merge_reward`` must raise if either is ever set
+    ``true`` (not yet implemented -- see that module's docstring)."""
+
+    weight: float
+    ttc_danger_s: float
+    ttc_safe_s: float
+    gap_sufficient_m: float
+    use_target_front: bool
+    use_target_rear: bool
+    use_source_front: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class RewardProgressConfig:
+    """Reward V1 Progress component. ``use_gamma=False`` selects the
+    plain (non-discounted) potential-difference form
+    ``Phi(s')-Phi(s)`` -- see REWARD_V1_SPEC_FINAL.md Section 6/17 for
+    why this is a deliberate simplification, not the formal RL-theory
+    potential-based-shaping form. A future ``use_gamma=True`` is
+    reserved but not yet implemented (``src.rewards.merge_reward`` must
+    raise if set)."""
+
+    weight: float
+    use_gamma: bool
+    d_m_initial_epsilon_m: float
+
+
+@dataclasses.dataclass(frozen=True)
+class RewardDecisionRegularizerConfig:
+    """Reward V1 Decision component -- an action-switching/chattering
+    regularizer, distinct from (and additive with) the unchanged V0
+    ``RewardDecisionCost``."""
+
+    weight: float
+    switching_only: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class RewardConfig:
-    """One fully-parsed reward config (``configs/reward/*.yaml``)."""
+    """One fully-parsed reward config (``configs/reward/*.yaml``).
+
+    ``safety``/``progress``/``decision`` are ``None`` for a V0 config
+    (``configs/reward/merge_reward_v0.yaml`` has no such keys) --
+    ``src.rewards.merge_reward`` treats a ``None`` component as
+    contributing exactly 0.0, so V0's existing ``R = terminal +
+    decision_cost`` behavior is completely unchanged when this field is
+    absent. A V1 config populates all three.
+    """
 
     reward_version: str
     terminal: RewardTerminalTable
     decision_cost: RewardDecisionCost
     source_path: str
+    safety: Optional[RewardSafetyConfig] = None
+    progress: Optional[RewardProgressConfig] = None
+    decision: Optional[RewardDecisionRegularizerConfig] = None
 
 
 def load_ppo_config(path: str = "configs/ppo/ppo_base.yaml") -> PPOConfig:
@@ -184,6 +239,10 @@ def load_reward_config(path: str = "configs/reward/merge_reward_v0.yaml") -> Rew
     terminal = raw["terminal"]
     decision_cost = raw["decision_cost"]
 
+    safety_raw = raw.get("safety")
+    progress_raw = raw.get("progress")
+    decision_raw = raw.get("decision")
+
     return RewardConfig(
         reward_version=str(raw["reward_version"]),
         terminal=RewardTerminalTable(
@@ -198,4 +257,34 @@ def load_reward_config(path: str = "configs/reward/merge_reward_v0.yaml") -> Rew
             auto_execution_step=float(decision_cost["auto_execution_step"]),
         ),
         source_path=path,
+        safety=(
+            RewardSafetyConfig(
+                weight=float(safety_raw["weight"]),
+                ttc_danger_s=float(safety_raw["ttc_danger_s"]),
+                ttc_safe_s=float(safety_raw["ttc_safe_s"]),
+                gap_sufficient_m=float(safety_raw["gap_sufficient_m"]),
+                use_target_front=bool(safety_raw["use_target_front"]),
+                use_target_rear=bool(safety_raw["use_target_rear"]),
+                use_source_front=bool(safety_raw["use_source_front"]),
+            )
+            if safety_raw is not None
+            else None
+        ),
+        progress=(
+            RewardProgressConfig(
+                weight=float(progress_raw["weight"]),
+                use_gamma=bool(progress_raw["use_gamma"]),
+                d_m_initial_epsilon_m=float(progress_raw["d_m_initial_epsilon_m"]),
+            )
+            if progress_raw is not None
+            else None
+        ),
+        decision=(
+            RewardDecisionRegularizerConfig(
+                weight=float(decision_raw["weight"]),
+                switching_only=bool(decision_raw["switching_only"]),
+            )
+            if decision_raw is not None
+            else None
+        ),
     )
