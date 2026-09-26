@@ -9,6 +9,7 @@ import argparse
 import csv
 import dataclasses
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -113,6 +114,66 @@ def _float(row, key, default):
         return default
 
 
+def load_processed_candidates(output_path):
+    """Returns the set of ``candidate_id``s already written to a prior
+    run's output JSONL, for resume (skip-completed) support.
+
+    A process killed mid-write can leave at most one truncated trailing
+    line -- that line is dropped (its candidate is treated as
+    unprocessed and retried) without disturbing earlier, already-synced
+    records. A malformed line anywhere else in the file is genuine
+    corruption and stays fatal, matching
+    ``scripts/build_womd_scenario_proto_locator.py``'s progress-file
+    recovery philosophy. Raises on a duplicate ``candidate_id`` -- a
+    prior run must never have written the same candidate twice."""
+
+    path = Path(output_path)
+    if not path.exists():
+        return set()
+
+    processed = set()
+    with path.open(encoding="utf-8") as f:
+        lines = f.readlines()
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            if line_number == len(lines):
+                print(
+                    f"WARNING: ignoring truncated final line in {path} "
+                    f"(line {line_number}); its candidate will be retried"
+                )
+                _truncate_trailing_partial_line(path, lines[:-1])
+                break
+            raise ValueError(
+                f"malformed non-final JSONL record at {path}:{line_number} -- "
+                "refusing to silently recover mid-file corruption"
+            )
+        candidate_id = record["candidate_id"]
+        if candidate_id in processed:
+            raise ValueError(
+                f"duplicate candidate_id {candidate_id!r} already present in "
+                f"{path} -- refusing to resume onto a corrupted output"
+            )
+        processed.add(candidate_id)
+    return processed
+
+
+def _truncate_trailing_partial_line(path, good_lines):
+    """Rewrites ``path`` to drop a truncated trailing line so the caller
+    can safely open it in append mode next -- otherwise the broken
+    partial line would sit in the middle of the file once new records
+    are appended after it."""
+
+    with path.open("w", encoding="utf-8") as f:
+        f.writelines(good_lines)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def main(argv=None):
     args = parse_args(argv)
     expansion = load_dataset_config(args.dataset_config)
@@ -145,9 +206,35 @@ def main(argv=None):
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    processed_candidates = load_processed_candidates(output)
+
+    total = len(transition_rows)
+    existing = sum(1 for row in transition_rows if row["candidate_id"] in processed_candidates)
+    print(f"existing={existing} remaining={total - existing} total={total}")
+
+    # Evidence correctness is the source of truth on resume: a
+    # processed candidate's evidence/decision is never recomputed, so a
+    # missing review PNG for it is surfaced as a warning rather than
+    # silently triggering a duplicate evidence computation.
+    review_dir = Path(args.review_dir)
+    missing_png = [
+        row["candidate_id"] for row in transition_rows
+        if row["candidate_id"] in processed_candidates
+        and not any(review_dir.glob(f"*/{row['candidate_id'].replace('/', '_').replace('#', '_')}.png"))
+    ]
+    if missing_png:
+        print(
+            f"WARNING: {len(missing_png)} already-processed candidate(s) have no "
+            f"review PNG under {review_dir} (evidence kept as-is, not re-rendered): "
+            f"{missing_png[:10]}{'...' if len(missing_png) > 10 else ''}"
+        )
+
     written = 0
-    with output.open("w", encoding="utf-8") as out:
+    with output.open("a", encoding="utf-8") as out:
         for row in transition_rows:
+            if row["candidate_id"] in processed_candidates:
+                continue
+
             shard_path = resolve_physical_shard(
                 expansion, row["source_shard"], source_split=row.get("source_split")
             )
@@ -226,6 +313,8 @@ def main(argv=None):
             out.write(
                 json.dumps(evidence_record, allow_nan=True, cls=_NumpyJSONEncoder) + "\n"
             )
+            out.flush()
+            os.fsync(out.fileno())
 
             # Render every decision category (accept/reject/review) for
             # human audit, not only automatic ACCEPTs -- a reject or an
@@ -260,7 +349,7 @@ def main(argv=None):
                 output_path=str(Path(args.review_dir) / decision_subdir / f"{safe_id}.png"),
             )
             written += 1
-    print(f"wrote {written} evidence records to {output}")
+    print(f"written_new={written} skipped_existing={existing} total_complete={existing + written}")
     if skipped_no_topology:
         print(
             f"skipped {len(skipped_no_topology)} candidate row(s) with no "
