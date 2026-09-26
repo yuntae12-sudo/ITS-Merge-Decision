@@ -291,3 +291,49 @@ def test_resume_from_existing_locator_csv_narrows_remaining_targets(tmp_path, mo
         "--progress-file", str(tmp_path / "progress.jsonl"),
     ])
     assert scanned_ids_seen == [{"still-missing"}]
+
+
+def test_scanning_one_split_preserves_other_splits_rows(monkeypatch, tmp_path):
+    """Regression test: running the locator for --split validation must
+    never drop rows a prior --split training run already wrote to the
+    same locator CSV (and vice versa) -- the file is shared across both
+    splits' independent runs."""
+
+    _write_targets_csv(
+        tmp_path / "targets.csv",
+        [
+            ("train-id", "training", "shardA", "cand-t"),
+            ("val-id", "validation", "shardB", "cand-v"),
+        ],
+    )
+    locator_csv = tmp_path / "locator.csv"
+    locator.write_locator_csv(locator_csv, {
+        "train-id": {
+            "scenario_id": "train-id", "proto_split": "training", "proto_shard_index": 0,
+            "proto_total_shards": 1000, "record_index": 0, "source_object": "shard0",
+            "matched_candidate_label": "cand-t",
+        }
+    })
+
+    def fake_scan(shard_path, shard_index, total_shards, split, remaining_ids, targets):
+        return 1, {"val-id": {
+            "scenario_id": "val-id", "proto_split": split, "proto_shard_index": shard_index,
+            "proto_total_shards": total_shards, "record_index": 0, "source_object": shard_path,
+            "matched_candidate_label": "cand-v",
+        }}
+
+    monkeypatch.setattr(locator, "scan_one_shard", fake_scan)
+    exit_code = locator.main([
+        "--target-scenario-ids", str(tmp_path / "targets.csv"),
+        "--split", "validation",
+        "--local-shard-paths", "shardB",
+        "--locator-output", str(locator_csv),
+        "--progress-file", str(tmp_path / "progress.jsonl"),
+        "--workers", "1",
+    ])
+    assert exit_code == 0
+
+    final_matches = locator.load_all_existing_matches(str(locator_csv))
+    assert set(final_matches) == {"train-id", "val-id"}
+    assert final_matches["train-id"]["proto_split"] == "training"
+    assert final_matches["val-id"]["proto_split"] == "validation"

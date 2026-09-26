@@ -151,14 +151,23 @@ def load_existing_matches(locator_output, split):
     both the found-scenario_id set (for early stop) and the rows to keep
     when the locator CSV is rewritten this run."""
 
+    matches = load_all_existing_matches(locator_output)
+    return {sid: row for sid, row in matches.items() if row["proto_split"] == split}
+
+
+def load_all_existing_matches(locator_output):
+    """All matches already recorded in a prior run, across every split.
+    Callers must preserve these when rewriting the locator CSV so that
+    scanning one split never discards another split's already-found
+    rows (the file is a single shared artifact for all splits)."""
+
     matches = {}
     path = Path(locator_output)
     if not path.exists():
         return matches
     with path.open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            if row["proto_split"] == split:
-                matches[row["scenario_id"]] = row
+            matches[row["scenario_id"]] = row
     return matches
 
 
@@ -231,6 +240,11 @@ def main(argv=None):
     target_sha256 = file_sha256(args.target_scenario_ids)
     log(f"[{split}] targets loaded: {targets_total}")
 
+    other_split_matches = {
+        sid: row
+        for sid, row in load_all_existing_matches(args.locator_output).items()
+        if row["proto_split"] != split
+    }
     existing_matches = load_existing_matches(args.locator_output, split)
     done_shards = load_done_shards(args.progress_file, split, target_sha256)
     remaining_ids = set(targets) - set(existing_matches)
@@ -246,7 +260,8 @@ def main(argv=None):
             f"TARGETS_REMAINING=0 -- nothing to scan, all targets already located.")
         return 0
 
-    all_matches = dict(existing_matches)
+    all_matches = dict(other_split_matches)
+    all_matches.update(existing_matches)
 
     if args.local_shard_paths:
         shard_iter = list(enumerate(args.local_shard_paths, start=args.start_shard))
