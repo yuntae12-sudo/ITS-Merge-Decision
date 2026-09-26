@@ -1,0 +1,104 @@
+# MERGE v2 Decision Dataset Filter -- TRAIN-frozen eligibility/tier criteria.
+#
+# Separate from configs/merge_v2.yaml (topology/evidence classifier
+# thresholds, unchanged by this file). This file governs PPO Merge
+# Decision Dataset eligibility and tiering ONLY -- it never feeds back into
+# classify_v2_merge or automatic_decision.
+#
+# Frozen exclusively against TRAIN (data/manifests/v2/evidence_training.jsonl).
+# VALIDATION is applied with these exact criteria, never re-tuned against it.
+
+version: "1.0"
+date: "2026-09-27"
+source_git_sha: "e4c44c9e1466007db7d986eb63b7ee8a587a7753"
+source_branch: "exp/ppo-p6-tuning"
+
+source_evidence:
+  train: "data/manifests/v2/evidence_training.jsonl"
+  train_augmented_source_front: "outputs/merge_v2_decision_audit_v2/training_decision_evidence_augmented.jsonl"
+  validation: "data/manifests/v2/evidence_validation.jsonl"
+  validation_augmented_source_front: "outputs/merge_v2_decision_audit_v2/validation_decision_evidence_augmented.jsonl"
+
+# Merge-context eligibility (Phase B). Grounded directly in
+# classify_v2_merge's fixed gate order (src/scenarios/merge_v2.py) --
+# topology-level gates (fire before any interaction evidence is read) vs
+# interaction/completion-level gates (fire after a real merge maneuver
+# type was already confirmed).
+eligibility:
+  ineligible_reasons:  # topology-level: not a real merge-context lane pair
+    - serial_continuation
+    - map_artifact
+    - diverge_split
+    - lane_change
+    - intersection_transition
+    - cut_in_not_topology_merge
+    - no_authoritative_merge_type
+  eligible_reasons:  # topology confirmed a real merge maneuver type
+    - null  # accept (no reject reason)
+    - insufficient_source_history
+    - no_physical_transition
+    - target_not_stable
+    - gap_order_not_persistent
+  uncertain_reasons:  # genuine ambiguity, not resolved by this audit
+    - ambiguous_topology_requires_manual_review
+    - no_relevant_vehicle_interaction
+
+# K/F/M action-affordance criteria (Phase C source, computed by
+# scripts/recompute_merge_v2_kfm_discriminability.py -- reused unmodified
+# here, not redefined).
+kfm_affordance_criteria:
+  primary_action_set: ["KEEP", "FOLLOW", "MERGE"]
+  stop_handling: secondary_diagnostic_only
+  target_lane_tiers:
+    ttc_safety_critical_s: 3.0
+    ttc_pressure_s: 10.0
+    gap_tight_m: 6.0
+    gap_comfortable_m: 20.0
+  source_front_tiers:  # current (middle) setting from heuristic_sensitivity.csv
+    gap_tight_m: 10.0
+    ttc_pressure_s: 10.0
+    history_presence_min_ratio: 0.3
+  approach_runway_s: 2.0
+
+safety_handling:
+  status: secondary_diagnostic_only
+  rationale: >
+    20-sample targeted geometry audit (outputs/merge_v2_decision_audit_v2/
+    safety_critical_targeted_audit.csv) found 0/20 confirmed real Waymax
+    SAT/OBB overlaps. SAFETY_CRITICAL_UNCERTAIN archetype and
+    stop_affordance are therefore excluded from primary K/F/M tiering and
+    Tier A/B/C eligibility; preserved only as a diagnostic flag, never used
+    to include/exclude a candidate.
+  safety_geometry_status_source: "outputs/merge_v2_decision_audit_v2/safety_geometry_status_v2.csv"
+
+# Tier assignment (Phase C). Applied identically to TRAIN and VALIDATION.
+tier_criteria:
+  A:
+    description: "PPO training core"
+    requires:
+      - merge_context_status == MERGE_CONTEXT_ELIGIBLE
+      - num_meaningful_kfm_actions >= 2
+      - archetype != PATH_FOLLOWING_LIKE
+      - decision_relevance != LOW
+    dataset_role: CORE
+  B:
+    description: "Coverage/generalization supplement"
+    requires:
+      - merge_context_status == MERGE_CONTEXT_ELIGIBLE
+      - num_meaningful_kfm_actions >= 1
+      - not already Tier A
+    dataset_role: SUPPORT
+  C:
+    description: "Weak/uncertain merge-decision context; trivial interaction"
+    requires:
+      - "merge_context_status == MERGE_CONTEXT_UNCERTAIN, OR"
+      - "(merge_context_status == MERGE_CONTEXT_ELIGIBLE AND num_meaningful_kfm_actions == 0)"
+    dataset_role: EXCLUDED
+  INELIGIBLE:
+    description: "Not a real merge context (topology-level)"
+    requires:
+      - merge_context_status == MERGE_CONTEXT_INELIGIBLE
+    dataset_role: EXCLUDED
+
+no_forced_action_balancing: true
+scenario_grouped_split: true  # candidate-level random split is never used

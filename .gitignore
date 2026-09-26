@@ -26,6 +26,20 @@ data/manifests/*
 # analysis/evaluation are visible without rerunning the pipeline.
 !data/manifests/phase2_dataset_difficulty.csv
 
+# MERGE Decision Dataset v2 freeze record: a frozen research decision
+# (version/git SHA/filter config hash/candidate counts/known
+# limitations), not a regeneratable bulk manifest -- tracked directly
+# so the exact frozen state is visible without rerunning the freeze
+# pipeline, matching the phase2_dataset_split.csv precedent above.
+# Git requires every ancestor directory to be explicitly un-ignored for
+# a nested file negation to take effect (data/manifests/* alone blocks
+# it even with a file-level "!" rule); re-excluding the directory's own
+# contents right after keeps every OTHER file under data/manifests/v2/
+# (raw evidence JSONL, GIF-adjacent CSVs, etc.) still hard-ignored.
+!data/manifests/v2
+data/manifests/v2/*
+!data/manifests/v2/MERGE_DECISION_DATASET_V2_FREEZE.json
+
 # Generated outputs
 outputs/*
 !outputs/.gitkeep
