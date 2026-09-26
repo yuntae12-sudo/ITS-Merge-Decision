@@ -113,8 +113,18 @@ class RewardTerminalTable:
 
 @dataclasses.dataclass(frozen=True)
 class RewardDecisionCost:
+    """Legacy V0 per-decision-step cost. ``enabled=False`` (Reward V1's
+    setting) makes this component contribute exactly 0.0 to the reward
+    total regardless of ``real_decision_step``/``auto_execution_step``'s
+    configured values -- V1 replaces this flat per-step cost with the
+    ``RewardDecisionRegularizerConfig`` switching-only regularizer
+    (outputs/reward_v1_spec/REWARD_V1_SPEC_FINAL.md Section 13, this
+    session's correctness patch: V1's total must be exactly Terminal +
+    Safety + Progress + Decision, never a fifth legacy component)."""
+
     real_decision_step: float
     auto_execution_step: float
+    enabled: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,6 +265,7 @@ def load_reward_config(path: str = "configs/reward/merge_reward_v0.yaml") -> Rew
         decision_cost=RewardDecisionCost(
             real_decision_step=float(decision_cost["real_decision_step"]),
             auto_execution_step=float(decision_cost["auto_execution_step"]),
+            enabled=bool(decision_cost.get("enabled", True)),
         ),
         source_path=path,
         safety=(

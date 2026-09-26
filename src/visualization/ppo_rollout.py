@@ -110,9 +110,11 @@ class PPOStepRecord:
     stop_prob: float
     value_estimate: Optional[float]
 
-    # Reward (Reward V0, computed the same way src.training.rollout
+    # Reward (V0 or V1, selected purely by which RewardConfig this
+    # module is given -- computed the same way src.training.rollout
     # computes it: MergeRewardWrapper driven by this step's real
-    # termination_reason + this step's real is_policy_step).
+    # termination_reason + is_policy_step + observation/next_observation
+    # + action, never re-derived independently here).
     reward_total: float
     reward_terminal_component: float
     reward_decision_cost_component: float
@@ -144,6 +146,18 @@ class PPOStepRecord:
     maneuver_type: Optional[str] = None
     current_stable_lane_id: Optional[int] = None
     v2_saw_relevant_interaction: bool = False
+    # Reward V1 additive components (outputs/reward_v1_spec/
+    # REWARD_V1_SPEC_FINAL.md Section 11/13) -- always 0.0 under a V0
+    # RewardConfig (src.rewards.merge_reward's own V0/V1 dispatch), so a
+    # V0 rollout's trace is unaffected (backward-compatible defaults).
+    reward_safety_component: float = 0.0
+    reward_progress_component: float = 0.0
+    reward_decision_component: float = 0.0
+    # Raw (unweighted) safety diagnostics -- NOT part of reward_total's
+    # component sum (see MergeRewardWrapper.last_ttc_penalty_raw/
+    # last_gap_penalty_raw docstring); diagnostic-only.
+    reward_ttc_penalty_raw: float = 0.0
+    reward_gap_penalty_raw: float = 0.0
 
 
 @dataclasses.dataclass
@@ -331,9 +345,19 @@ def run_ppo_episode(
                 termination_reason=info_after.get("termination_reason"),
                 is_policy_step=is_policy_step,
                 info=info_after,
+                observation=observation,
+                next_observation=next_observation,
+                action=action,
             )
             reward_terminal_component = reward_wrapper.last_terminal_component
             reward_decision_cost_component = reward_wrapper.last_decision_cost_component
+            # Reward V1 additive components (always 0.0 for a V0
+            # reward_config -- see PPOStepRecord docstring).
+            reward_safety_component = reward_wrapper.last_safety_component
+            reward_progress_component = reward_wrapper.last_progress_component
+            reward_decision_component = reward_wrapper.last_decision_component
+            reward_ttc_penalty_raw = reward_wrapper.last_ttc_penalty_raw
+            reward_gap_penalty_raw = reward_wrapper.last_gap_penalty_raw
 
             ego_x, ego_y, ego_yaw, ego_speed = _snapshot_ego(env)
 
@@ -353,6 +377,11 @@ def run_ppo_episode(
                     reward_total=reward,
                     reward_terminal_component=reward_terminal_component,
                     reward_decision_cost_component=reward_decision_cost_component,
+                    reward_safety_component=reward_safety_component,
+                    reward_progress_component=reward_progress_component,
+                    reward_decision_component=reward_decision_component,
+                    reward_ttc_penalty_raw=reward_ttc_penalty_raw,
+                    reward_gap_penalty_raw=reward_gap_penalty_raw,
                     observation=np.asarray(observation, dtype=np.float64),
                     downstream_status=info_after.get("downstream_status"),
                     intervention_rate=float(info_after.get("intervention_rate", 0.0)),

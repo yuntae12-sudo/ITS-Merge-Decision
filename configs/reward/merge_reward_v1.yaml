@@ -2,11 +2,19 @@
 #
 # R_t = R_terminal,t + w_s*R_safety,t + w_p*R_progress,t + w_d*R_decision,t
 #
-# Terminal and decision_cost are UNCHANGED from Reward V0 (same values,
-# same source-of-truth contract -- src/rewards/merge_reward.py never
-# re-derives termination itself). Safety/Progress/Decision are new dense
-# shaping components, calibrated against TRAIN Tier A+B (n=1097,
+# Terminal is UNCHANGED from Reward V0 (same values, same source-of-truth
+# contract -- src/rewards/merge_reward.py never re-derives termination
+# itself). Safety/Progress/Decision are new dense shaping components,
+# calibrated against TRAIN Tier A+B (n=1097,
 # MERGE_DECISION_DATASET_V2_FROZEN=YES, freeze commit ef2d55d).
+#
+# decision_cost.enabled=false (final correctness patch): V0's legacy flat
+# per-decision-step cost is NOT part of the V1 total -- V1's Decision
+# component (below) is a switching-only regularizer that replaces it.
+# The real_decision_step/auto_execution_step values are kept here (not
+# deleted) only so the RewardDecisionCost dataclass has well-defined
+# fields; src.rewards.merge_reward._decision_cost returns 0.0
+# unconditionally whenever enabled=false, regardless of these values.
 #
 # Final approved scope (outputs/reward_v1_spec/REWARD_V1_SPEC_FINAL.md
 # Section 5, resolving REWARD_V1_PREIMPLEMENTATION_AUDIT.md's three open
@@ -24,6 +32,7 @@ terminal:
   none: 0.0
 
 decision_cost:
+  enabled: false
   real_decision_step: -0.01
   auto_execution_step: 0.0
 

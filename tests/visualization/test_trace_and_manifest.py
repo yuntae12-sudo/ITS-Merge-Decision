@@ -6,6 +6,7 @@ import csv
 import json
 
 import numpy as np
+import pytest
 
 from src.environment.observation_builder import OBSERVATION_FIELD_NAMES
 from src.visualization.episode_summary import build_episode_summary, write_episode_summary
@@ -101,6 +102,8 @@ def test_trace_fieldnames_cover_required_categories():
         "selected_action", "action_index",
         "keep_prob", "follow_prob", "merge_prob", "stop_prob", "value_estimate",
         "reward_total", "reward_terminal_component", "reward_decision_cost_component",
+        "reward_safety_component", "reward_progress_component", "reward_decision_component",
+        "reward_ttc_penalty_raw", "reward_gap_penalty_raw",
         "downstream_status", "intervention_rate", "fallback_applied",
         "terminated", "truncated", "termination_reason",
         "ego_x", "ego_y", "ego_yaw", "ego_speed_mps",
@@ -109,6 +112,74 @@ def test_trace_fieldnames_cover_required_categories():
         assert name in TRACE_FIELDNAMES
     for obs_field in OBSERVATION_FIELD_NAMES:
         assert obs_field in TRACE_FIELDNAMES
+
+
+def test_v0_trace_backward_compatible_zero_v1_components(tmp_path):
+    """A V0-style PPOStepRecord (constructed without any V1 keyword
+    argument, as _make_step above does) must serialize all five new
+    columns as exactly 0.0 -- never missing, never NaN."""
+
+    episode = _make_episode()
+    path = tmp_path / "trace.csv"
+    write_trace_csv(episode, str(path))
+
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    for row in rows:
+        for col in (
+            "reward_safety_component", "reward_progress_component",
+            "reward_decision_component", "reward_ttc_penalty_raw",
+            "reward_gap_penalty_raw",
+        ):
+            assert float(row[col]) == 0.0
+
+
+def test_v1_trace_contains_all_four_reward_components(tmp_path):
+    step = _make_step(0, "MERGE", 2, True, False)
+    step.reward_terminal_component = 1.0
+    step.reward_safety_component = -0.02
+    step.reward_progress_component = 0.1
+    step.reward_decision_component = -0.02
+    step.reward_ttc_penalty_raw = -1.0
+    step.reward_gap_penalty_raw = 0.0
+    step.reward_total = 1.0 - 0.02 + 0.1 - 0.02
+    step.terminated = True
+    step.termination_reason = "success"
+
+    episode = PPOEpisodeResult(
+        maneuver_id="MAN_TEST", outcome="success", termination_reason="success",
+        steps=[step], physical_step_count=1, policy_decision_count=1,
+        merge_commit_step=0, final_intervention_rate=0.0,
+    )
+    path = tmp_path / "trace.csv"
+    write_trace_csv(episode, str(path))
+
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    row = rows[0]
+    assert float(row["reward_terminal_component"]) == 1.0
+    assert float(row["reward_safety_component"]) == -0.02
+    assert float(row["reward_progress_component"]) == 0.1
+    assert float(row["reward_decision_component"]) == -0.02
+
+    # component-sum consistency: terminal + safety + progress + decision
+    # == total (V1's legacy decision_cost is 0 in this example, matching
+    # the correctness patch's contract).
+    reconstructed = (
+        float(row["reward_terminal_component"])
+        + float(row["reward_safety_component"])
+        + float(row["reward_progress_component"])
+        + float(row["reward_decision_component"])
+        + float(row["reward_decision_cost_component"])
+    )
+    assert reconstructed == pytest.approx(float(row["reward_total"]))
+
+    # raw diagnostics present but distinguishable from the weighted
+    # safety component (never silently identical/double-counted).
+    assert float(row["reward_ttc_penalty_raw"]) == -1.0
+    assert float(row["reward_gap_penalty_raw"]) == 0.0
 
 
 def test_episode_summary_fields(tmp_path):

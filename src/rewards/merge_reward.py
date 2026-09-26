@@ -70,6 +70,25 @@ negative-gap candidates. Both the TTC and the Gap term are masked to 0.0
 whenever ``target_front_present`` is 0.0, or whenever the gap<=0 sentinel
 precondition holds.
 
+Safety-mask correctness audit (this session's correctness patch --
+verified against ``src.scenarios.scenario_features``, the only TTC
+computation path in this repo): TTC is masked together with Gap when
+``gap<=0`` NOT because "a negative gap is scary so we distrust the
+TTC reading" (that would be an arbitrary safety judgment call), but
+because ``front_ttc_s = _compute_ttc(front_gap_m, front_relative_speed_mps)``
+-- TTC is a deterministic function of gap, computed from the exact same
+``front_gap_m`` value, and ``_compute_ttc`` itself unconditionally
+returns exactly ``0.0`` whenever ``gap_m <= 0.0`` (its own first
+branch, before even looking at closing speed). There is no alternate,
+independently-computed TTC path anywhere in ``scenario_features.py``
+that could produce a genuinely separate, trustworthy TTC value when
+gap is non-positive -- so "gap<=0" and "this interaction's TTC is
+structurally the 0.0 sentinel, not a real closing-time measurement"
+are the SAME event, not two correlated-but-independent ones. Masking
+both together is therefore not a design choice between two valid
+options -- it is the only choice consistent with how TTC is actually
+computed upstream of this module.
+
 r_progress (potential-difference form, NOT gamma-discounted -- a
 deliberate simplification, not a claim of exact RL-theory
 policy-invariant shaping): ``Phi(s_next) - Phi(s_current)``, where
@@ -282,12 +301,23 @@ def _terminal_outcome(reward_config: RewardConfig, termination_reason: Optional[
 
 
 def _decision_cost(reward_config: RewardConfig, is_policy_step: bool) -> float:
-    """Looks up the fixed decision-cost value for one step, selected
-    purely by the caller-supplied pre-step ``is_policy_step`` flag
-    (PPO_PLAN.md SS7.1/SS5.1) -- never derived from post-step state.
+    """Looks up the fixed legacy V0 decision-cost value for one step,
+    selected purely by the caller-supplied pre-step ``is_policy_step``
+    flag (PPO_PLAN.md SS7.1/SS5.1) -- never derived from post-step
+    state.
+
+    Returns 0.0 unconditionally if ``reward_config.decision_cost.enabled``
+    is False (Reward V1's setting -- REWARD_V1_SPEC_FINAL.md Section 13:
+    V1's total must be exactly Terminal + Safety + Progress + Decision,
+    never this legacy fifth component). This is resolved here, in the
+    reward source of truth, precisely so no caller (trainer, rollout,
+    visualization) ever has to guess or special-case V0-vs-V1 behavior
+    itself.
     """
 
     cost = reward_config.decision_cost
+    if not cost.enabled:
+        return 0.0
     return cost.real_decision_step if is_policy_step else cost.auto_execution_step
 
 

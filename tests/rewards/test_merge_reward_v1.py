@@ -79,6 +79,101 @@ def test_v1_terminal_outcome_table_unchanged(reason, expected):
 
 
 # ------------------------------------------------------------------
+# Legacy V0 decision_cost exclusion from V1 total (this session's
+# correctness patch, brief Section 15 items 1-8).
+# ------------------------------------------------------------------
+
+
+def test_v0_policy_decision_cost_still_applies():
+    """V0 must be completely unaffected by the V1 correctness patch."""
+
+    assert REWARD_CONFIG_V0.decision_cost.enabled is True
+    value = compute_reward(
+        reward_config=REWARD_CONFIG_V0,
+        termination_reason=TerminationReason.NONE.value,
+        is_policy_step=True,
+    )
+    assert value == pytest.approx(-0.01)
+
+
+def test_v1_legacy_decision_cost_disabled_in_config():
+    assert REWARD_CONFIG_V1.decision_cost.enabled is False
+
+
+def test_v1_policy_decision_legacy_cost_is_zero():
+    breakdown = compute_reward_breakdown(
+        reward_config=REWARD_CONFIG_V1,
+        termination_reason=TerminationReason.NONE.value,
+        is_policy_step=True,
+    )
+    assert breakdown["decision_cost"] == pytest.approx(0.0)
+
+
+def test_v1_auto_execution_legacy_cost_is_zero():
+    breakdown = compute_reward_breakdown(
+        reward_config=REWARD_CONFIG_V1,
+        termination_reason=TerminationReason.NONE.value,
+        is_policy_step=False,
+    )
+    assert breakdown["decision_cost"] == pytest.approx(0.0)
+
+
+def test_v1_total_excludes_legacy_decision_cost_on_switch():
+    """Action switch: V1 total = terminal + 0(legacy) + safety + progress
+    + weighted -1.0 decision regularizer -- never terminal + legacy
+    decision_cost + ... (the pre-patch bug)."""
+
+    obs = make_observation(d_m=10.0, target_front_present=0.0)
+    breakdown = compute_reward_breakdown(
+        reward_config=REWARD_CONFIG_V1,
+        termination_reason=TerminationReason.SUCCESS.value,
+        is_policy_step=True,
+        observation=obs,
+        next_observation=obs,
+        action=BehaviorAction.MERGE,
+        previous_policy_action=BehaviorAction.FOLLOW,
+        d_m_initial=10.0,
+    )
+    assert breakdown["decision_cost"] == pytest.approx(0.0)
+    expected_total = (
+        breakdown["terminal"] + breakdown["safety_weighted"]
+        + breakdown["progress_weighted"] + breakdown["decision_weighted"]
+    )
+    assert breakdown["total"] == pytest.approx(expected_total)
+
+
+def test_v0_total_is_terminal_plus_legacy_decision_cost():
+    breakdown = compute_reward_breakdown(
+        reward_config=REWARD_CONFIG_V0,
+        termination_reason=TerminationReason.SUCCESS.value,
+        is_policy_step=True,
+    )
+    assert breakdown["total"] == pytest.approx(breakdown["terminal"] + breakdown["decision_cost"])
+    assert breakdown["total"] == pytest.approx(1.0 - 0.01)
+
+
+def test_v1_total_is_exactly_four_components():
+    obs = make_observation(d_m=10.0, target_front_gap=5.0, target_front_ttc=4.0)
+    next_obs = make_observation(d_m=8.0)
+    breakdown = compute_reward_breakdown(
+        reward_config=REWARD_CONFIG_V1,
+        termination_reason=TerminationReason.SUCCESS.value,
+        is_policy_step=True,
+        observation=obs,
+        next_observation=next_obs,
+        action=BehaviorAction.MERGE,
+        previous_policy_action=BehaviorAction.FOLLOW,
+        d_m_initial=10.0,
+    )
+    four_component_sum = (
+        breakdown["terminal"] + breakdown["safety_weighted"]
+        + breakdown["progress_weighted"] + breakdown["decision_weighted"]
+    )
+    assert breakdown["total"] == pytest.approx(four_component_sum)
+    assert breakdown["decision_cost"] == pytest.approx(0.0)
+
+
+# ------------------------------------------------------------------
 # TTC (Section 25)
 # ------------------------------------------------------------------
 
@@ -104,6 +199,35 @@ def test_ttc_zero_sentinel_masked():
 
 def test_ttc_negative_masked():
     assert _r_ttc_only(ttc=0.0, gap=-3.0) == pytest.approx(0.0)
+
+
+def test_safety_mask_semantics_audit_against_upstream_ttc_source():
+    """CASE A verification (this session's correctness patch): asserts
+    the actual upstream fact this module's masking rule depends on --
+    that src.scenarios.scenario_features._compute_ttc has NO branch
+    that can produce a genuine (non-sentinel) finite TTC when
+    gap_m<=0.0. If this ever changes upstream, this test must fail
+    before the reward's masking rule silently becomes stale."""
+
+    from src.scenarios.scenario_features import _compute_ttc
+
+    for closing_speed in (-5.0, 0.0, 0.001, 1.0, 100.0):
+        for gap in (-10.0, -0.001, 0.0):
+            assert _compute_ttc(gap, closing_speed) == 0.0, (
+                f"_compute_ttc({gap}, {closing_speed}) did not return the "
+                "expected 0.0 sentinel -- merge_reward's safety-mask "
+                "correctness assumption (gap<=0 implies TTC is "
+                "structurally the sentinel, never an independent "
+                "reading) no longer holds; re-audit CASE A/B before "
+                "trusting r_safety's current masking rule."
+            )
+
+    # And the reverse: for gap>0, _compute_ttc CAN produce a genuine
+    # non-sentinel value (either a finite closing time or +Inf for
+    # non-closing) -- confirming TTC validity is NOT always tied to gap
+    # sign, only specifically at gap<=0.
+    assert _compute_ttc(5.0, 2.0) == pytest.approx(2.5)
+    assert _compute_ttc(5.0, -1.0) == float("inf")
 
 
 def test_ttc_one_second_is_danger():
