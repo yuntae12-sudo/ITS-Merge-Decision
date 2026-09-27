@@ -39,13 +39,13 @@ is unique per run, e.g.:
 
     python scripts/extract_merge_scenes.py \\
         --dataset-config configs/dataset.yaml \\
-        --output outputs/phase1/training_10shard_pilot/merge_candidates_training_10shard.csv \\
-        --summary-dir outputs/phase1/training_10shard_pilot
+        --output data/manifests/merge_candidates_training.csv \\
+        --summary-dir outputs/dataset_construction/training_scan
 
     python scripts/extract_merge_scenes.py \\
-        --dataset-config outputs/phase1/feature_reference_fix/dataset_validation_6shard.yaml \\
-        --output outputs/phase1/feature_reference_fix/merge_candidates_6shard_postfix.csv \\
-        --summary-dir outputs/phase1/feature_reference_fix
+        --dataset-config configs/dataset_validation.yaml \\
+        --output data/manifests/merge_candidates_validation.csv \\
+        --summary-dir outputs/dataset_construction/validation_scan
 
 Example:
     python scripts/extract_merge_scenes.py --limit-scenes 30 --overwrite

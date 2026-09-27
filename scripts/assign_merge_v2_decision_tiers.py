@@ -37,7 +37,7 @@ import csv
 from pathlib import Path
 
 ELIGIBILITY_CSV = "data/manifests/v2/training_merge_context_eligibility.csv"
-KFM_CSV = "outputs/merge_v2_decision_audit_v2/training_kfm_discriminability.csv"
+KFM_CSV = "data/manifests/training_kfm_discriminability.csv"
 OUT_CSV = "data/manifests/v2/merge_decision_train_candidates_v2.csv"
 
 

@@ -25,7 +25,7 @@ import scripts.classify_merge_v2_context_eligibility as elig_mod
 import scripts.assign_merge_v2_decision_tiers as tier_mod
 
 VALIDATION_EVIDENCE = "data/manifests/evidence_validation.jsonl"
-VALIDATION_AUGMENTED = "outputs/merge_v2_decision_audit_v2/validation_decision_evidence_augmented.jsonl"
+VALIDATION_AUGMENTED = "data/manifests/validation_decision_evidence_augmented.jsonl"
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
 EXPECTED_COUNT = 2006
 

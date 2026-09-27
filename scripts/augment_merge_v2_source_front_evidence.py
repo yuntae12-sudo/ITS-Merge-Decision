@@ -43,20 +43,21 @@ from src.scenarios.scenario_loader import build_waymax_config, iter_scenarios, l
 
 PHASE1_CONFIG = "configs/merge.yaml"
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
+AUGMENTED_EVIDENCE_DIR = Path("data/manifests")
 
 SPLIT_DEFAULTS = {
     "training": {
         "evidence": "data/manifests/evidence_training.jsonl",
         "dataset_config": "configs/dataset.yaml",
         "shard_dir": "data/womd/training",
-        "out_path": OUT_DIR / "training_decision_evidence_augmented.jsonl",
+        "out_path": AUGMENTED_EVIDENCE_DIR / "training_decision_evidence_augmented.jsonl",
         "expected_count": 5545,
     },
     "validation": {
         "evidence": "data/manifests/evidence_validation.jsonl",
-        "dataset_config": "outputs/phase1/validation_6shard_pilot/dataset_validation_6shard.yaml",
+        "dataset_config": "configs/dataset_validation.yaml",
         "shard_dir": "data/womd/validation",
-        "out_path": OUT_DIR / "validation_decision_evidence_augmented.jsonl",
+        "out_path": AUGMENTED_EVIDENCE_DIR / "validation_decision_evidence_augmented.jsonl",
         "expected_count": 2006,
     },
 }
@@ -157,6 +158,7 @@ def main(argv=None):
     args = parse_args(argv)
     cfg = SPLIT_DEFAULTS[args.split]
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    AUGMENTED_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     records = load_jsonl(cfg["evidence"])
     assert len(records) == cfg["expected_count"], (
         f"expected {cfg['expected_count']} for split={args.split!r}, got {len(records)}"

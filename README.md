@@ -210,7 +210,7 @@ directories (`wandb/`) are also git-ignored.
 - **Reward V0** (flat per-decision-step `decision_cost`) — replaced.
 - **Reward V1** (Terminal + Safety + Progress + Decision) — adopted as the
   final reward.
-- Earlier Phase 0/1/2/3 and P5/P6 research-stage naming has been fully
-  removed from runtime code, configs, and scripts as part of a final
-  handoff cleanup; historical phase reports are not retained in this
-  document.
+- Historical Phase/P5/P6 naming has been removed from the canonical runtime,
+  configs, and user-facing entrypoints. Some dataset-construction utilities
+  retain historical v1/v2/phase terminology where it is part of the frozen
+  dataset reproduction chain.

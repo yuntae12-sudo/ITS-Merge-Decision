@@ -33,7 +33,7 @@ _proto_paths() {
 
 run_split() {
   local split="$1" dataset_config="$2" candidates_csv="$3" required_file="$4"
-  local output="data/manifests/v2/evidence_${split}.jsonl"
+  local output="data/manifests/evidence_${split}.jsonl"
   local review_dir="outputs/merge_v2_review/${split}"
   local log_file="$LOG_DIR/${split}_full_extraction.log"
 
@@ -66,12 +66,12 @@ run_split() {
 
 run_split training \
   configs/dataset.yaml \
-  outputs/phase1/stage_b0_verify/merge_candidates_training_10shard_postfix.csv \
+  data/manifests/merge_candidates_training.csv \
   data/manifests/v2/required_scenario_proto_shards_training.txt
 
 run_split validation \
-  outputs/phase1/validation_6shard_pilot/dataset_validation_6shard.yaml \
-  outputs/phase1/feature_reference_fix/merge_candidates_6shard_postfix.csv \
+  configs/dataset_validation.yaml \
+  data/manifests/merge_candidates_validation.csv \
   data/manifests/v2/required_scenario_proto_shards_validation.txt
 
 echo "[full] $(date --utc --iso-8601=seconds) ALL DONE git_sha=$GIT_SHA"

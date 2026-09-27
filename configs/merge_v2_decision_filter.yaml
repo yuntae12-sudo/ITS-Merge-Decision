@@ -15,9 +15,9 @@ source_branch: "exp/ppo-p6-tuning"
 
 source_evidence:
   train: "data/manifests/evidence_training.jsonl"
-  train_augmented_source_front: "outputs/merge_v2_decision_audit_v2/training_decision_evidence_augmented.jsonl"
+  train_augmented_source_front: "data/manifests/training_decision_evidence_augmented.jsonl"
   validation: "data/manifests/evidence_validation.jsonl"
-  validation_augmented_source_front: "outputs/merge_v2_decision_audit_v2/validation_decision_evidence_augmented.jsonl"
+  validation_augmented_source_front: "data/manifests/validation_decision_evidence_augmented.jsonl"
 
 # Merge-context eligibility (Phase B). Grounded directly in
 # classify_v2_merge's fixed gate order (src/scenarios/merge_v2.py) --

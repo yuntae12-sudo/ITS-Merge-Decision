@@ -4,7 +4,7 @@ using (1) the SAFETY geometry audit's finding that a sample of 20 sustained
 negative-target-gap candidates showed 0/20 real physical OBB overlaps
 (Waymax's own SAT check) and 17/20 AMBIGUOUS/3/20 PROJECTION_ARTIFACT_LIKELY,
 and (2) the new source-front evidence augmentation
-(outputs/merge_v2_decision_audit_v2/training_decision_evidence_augmented.jsonl)
+(data/manifests/training_decision_evidence_augmented.jsonl)
 giving FOLLOW a real, independent signal for the first time.
 
 Ground rule (unchanged from outputs/merge_v2_decision_audit/audit_report.md):
@@ -36,7 +36,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 TRAIN_EVIDENCE = "data/manifests/evidence_training.jsonl"
-AUGMENTED_EVIDENCE = "outputs/merge_v2_decision_audit_v2/training_decision_evidence_augmented.jsonl"
+AUGMENTED_EVIDENCE = "data/manifests/training_decision_evidence_augmented.jsonl"
+KFM_OUTPUT = Path("data/manifests/training_kfm_discriminability.csv")
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
 DT_S = 0.1
 
@@ -343,13 +344,13 @@ def main():
     ids = [r["candidate_id"] for r in rows]
     assert len(ids) == len(set(ids)), "duplicate candidate_id"
 
-    with open(OUT_DIR / "training_kfm_discriminability.csv", "w", newline="") as f:
+    with open(KFM_OUTPUT, "w", newline="") as f:
         fieldnames = list(rows[0].keys())
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for row in rows:
             w.writerow(row)
-    print(f"wrote training_kfm_discriminability.csv ({len(rows)} rows)")
+    print(f"wrote {KFM_OUTPUT} ({len(rows)} rows)")
 
     # A. K/F/M meaningful action count
     meaningful_counts = Counter(r["num_meaningful_kfm_actions"] for r in rows)
