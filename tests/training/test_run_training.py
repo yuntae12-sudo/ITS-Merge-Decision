@@ -20,7 +20,7 @@ from src.training.trainer import build_training_batch, run_training, run_update
 
 from tests.training.test_rollout import CAUSALITY_MANEUVER, SINGLE_MANEUVER
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -32,7 +32,7 @@ def env():
 
 @pytest.fixture(scope="module")
 def ppo_config():
-    return load_ppo_config("configs/ppo/ppo_smoke.yaml")
+    return load_ppo_config("configs/ppo/smoke.yaml")
 
 
 @pytest.fixture(scope="module")
@@ -407,9 +407,15 @@ def test_run_training_reward_terminal_includes_truncation_horizon(env, ppo_confi
     assert np.isfinite(metrics["reward/terminal"])
     assert np.isfinite(metrics["reward/decision_cost"])
     assert np.isfinite(metrics["reward/total"])
-    assert metrics["reward/terminal"] + metrics["reward/decision_cost"] == pytest.approx(
-        metrics["reward/total"], abs=1e-9
-    )
+    # Final reward config: reward/decision_cost is structurally 0.0
+    # (decision_cost.enabled=false), so the total is terminal + safety
+    # + progress + decision, not terminal + decision_cost alone.
+    assert metrics["reward/decision_cost"] == pytest.approx(0.0, abs=1e-9)
+    assert (
+        metrics["reward/terminal"] + metrics["reward/decision_cost"]
+        + metrics["reward/safety"] + metrics["reward/progress"]
+        + metrics["reward/decision"]
+    ) == pytest.approx(metrics["reward/total"], abs=1e-9)
 
 
 def test_reward_terminal_aggregation_counts_truncated_transitions_directly():
@@ -553,9 +559,8 @@ def test_reward_component_propagation_matches_wandb_metrics():
 def test_run_training_wandb_metrics_use_component_split_end_to_end(env, ppo_config, reward_config):
     """Test H (end-to-end): run_training's actual returned metrics for
     a real small batch against the real environment must satisfy the
-    component-sum identity, and reward/terminal must never exceed the
-    fixed Reward V0 terminal-outcome magnitudes (1.0/0.5) by more than
-    floating-point tolerance -- if the old bug were present,
+    full component-sum identity (terminal + decision_cost + safety +
+    progress + decision == total) -- if the old bug were present,
     reward/terminal could be inflated/deflated by up to one decision
     cost (-0.01/0.0) per terminal episode relative to the fixed table."""
 
@@ -587,6 +592,12 @@ def test_run_training_wandb_metrics_use_component_split_end_to_end(env, ppo_conf
     assert np.isfinite(metrics["reward/terminal"])
     assert np.isfinite(metrics["reward/decision_cost"])
     assert np.isfinite(metrics["reward/total"])
-    assert metrics["reward/terminal"] + metrics["reward/decision_cost"] == pytest.approx(
-        metrics["reward/total"], abs=1e-6
-    )
+    # Final reward config: reward/decision_cost is structurally 0.0
+    # (decision_cost.enabled=false), so the total is terminal + safety
+    # + progress + decision, not terminal + decision_cost alone.
+    assert metrics["reward/decision_cost"] == pytest.approx(0.0, abs=1e-9)
+    assert (
+        metrics["reward/terminal"] + metrics["reward/decision_cost"]
+        + metrics["reward/safety"] + metrics["reward/progress"]
+        + metrics["reward/decision"]
+    ) == pytest.approx(metrics["reward/total"], abs=1e-6)

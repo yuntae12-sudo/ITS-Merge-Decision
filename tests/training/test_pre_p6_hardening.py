@@ -9,9 +9,9 @@ throughput), and Fix 7 (reward component logging correctness). Fix 1
 (episode-aware GAE) has its own dedicated tests in
 ``tests/training/test_gae.py``.
 
-None of these tests change the PPO-Clip objective, Reward V0's values,
-or any frozen Phase 1-3 semantics -- they exercise DIAGNOSTIC/
-correctness code only.
+None of these tests change the PPO-Clip objective, the final reward's
+values, or any frozen environment semantics -- they exercise
+DIAGNOSTIC/correctness code only.
 """
 
 import math
@@ -174,7 +174,7 @@ def test_run_update_aggregation_reflects_full_sweep_not_just_last_minibatch():
             ppo_epochs=1, num_minibatches=1,
         ),
         rollout=RolloutConfig(downstream_mode="frenet_mpc"),
-        reward_config_path="configs/reward/merge_reward_v0.yaml",
+        reward_config_path="configs/reward.yaml",
         tracking=TrackingConfig(wandb_project="test", wandb_mode="offline"),
         smoke=None,
         source_path="<test>",
@@ -309,7 +309,7 @@ def test_run_update_aggregation_not_last_value_across_epochs():
                 ppo_epochs=ppo_epochs, num_minibatches=1,
             ),
             rollout=RolloutConfig(downstream_mode="frenet_mpc"),
-            reward_config_path="configs/reward/merge_reward_v0.yaml",
+            reward_config_path="configs/reward.yaml",
             tracking=TrackingConfig(wandb_project="test", wandb_mode="offline"),
             smoke=None,
             source_path="<test>",
@@ -435,7 +435,7 @@ def test_resumed_minibatch_order_matches_uninterrupted_run():
             ppo_epochs=2, num_minibatches=4,
         ),
         rollout=RolloutConfig(downstream_mode="frenet_mpc"),
-        reward_config_path="configs/reward/merge_reward_v0.yaml",
+        reward_config_path="configs/reward.yaml",
         tracking=TrackingConfig(wandb_project="test", wandb_mode="offline"),
         smoke=None,
         source_path="<test>",
@@ -587,6 +587,25 @@ def test_explained_variance_normal_case_between_reasonable_bounds():
 # ======================================================================
 
 
+def _reward_config_with_decision_cost_enabled():
+    """These Fix 7 bug-guard tests verify terminal/decision-cost
+    aggregation correctness using the flat per-decision-step cost
+    (-0.01) as their reference numbers -- the final canonical config
+    sets decision_cost.enabled=false (replaced by the Decision
+    switching-regularizer), so this constructs the enabled=True
+    variant explicitly rather than relying on load_reward_config()'s
+    default."""
+
+    import dataclasses
+
+    from src.training.config import load_reward_config
+
+    base = load_reward_config()
+    return dataclasses.replace(
+        base, decision_cost=dataclasses.replace(base.decision_cost, enabled=True)
+    )
+
+
 def test_reward_terminal_includes_truncation_horizon_component():
     """The bug this guards against: a TRUNCATION_HORIZON (truncated=True,
     NOT terminated=True) step's -0.5 terminal component must be counted
@@ -595,7 +614,7 @@ def test_reward_terminal_includes_truncation_horizon_component():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
 
     # A truncated (TRUNCATION_HORIZON) step on a real decision frame.
     truncation_reward = compute_reward(
@@ -656,7 +675,7 @@ def test_reward_terminal_success_plus_decision_cost_split_over_episode():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
     nonterminal_reward = compute_reward(reward_config, "none", is_policy_step=True)
     success_reward = compute_reward(reward_config, "success", is_policy_step=True)
 
@@ -684,7 +703,7 @@ def test_reward_nonterminal_decision_cost_only_case():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
     nonterminal_reward = compute_reward(reward_config, "none", is_policy_step=True)
 
     transitions = [
@@ -737,7 +756,7 @@ def test_component_split_success_plus_real_decision_step():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
     success_reward = compute_reward(reward_config, "success", is_policy_step=True)
     assert math.isclose(success_reward, 0.99, abs_tol=1e-9)
 
@@ -776,7 +795,7 @@ def test_component_split_failure_collision_plus_real_decision_step():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
     collision_reward = compute_reward(
         reward_config, "failure_collision", is_policy_step=True
     )
@@ -842,7 +861,7 @@ def test_component_split_truncation_horizon_plus_real_decision_step():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
     truncation_reward = compute_reward(
         reward_config, "truncation_horizon", is_policy_step=True
     )
@@ -875,7 +894,7 @@ def test_component_split_nonterminal_plus_real_decision_step():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
     nonterminal_reward = compute_reward(reward_config, "none", is_policy_step=True)
     assert math.isclose(nonterminal_reward, -0.01, abs_tol=1e-9)
 
@@ -912,7 +931,7 @@ def test_component_split_artificial_rollout_cutoff_excludes_terminal():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
 
     # Cutoff on what would have been a real policy-decision step.
     nonterminal_decision_reward = compute_reward(
@@ -965,7 +984,7 @@ def test_component_split_episode_aggregate_identity():
     from src.rewards.merge_reward import compute_reward
     from src.training.config import load_reward_config
 
-    reward_config = load_reward_config()
+    reward_config = _reward_config_with_decision_cost_enabled()
     nonterminal_decision = compute_reward(reward_config, "none", is_policy_step=True)
     nonterminal_auto = compute_reward(reward_config, "none", is_policy_step=False)
     success_reward = compute_reward(reward_config, "success", is_policy_step=True)

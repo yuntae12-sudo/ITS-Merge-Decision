@@ -7,7 +7,7 @@ constraint set here is a simple pair of box bounds (no rate constraint
 "what ``scipy.optimize.minimize(..., bounds=...)`` needs", rather than
 forcing an artificially separate file for two constants.
 
-Cost terms (all weights loaded from ``configs/phase3_downstream.yaml``
+Cost terms (all weights loaded from ``configs/downstream.yaml``
 ``mpc:`` section -- see that file's comments for the "initial, not
 final" caveat), over a horizon of N steps:
 

@@ -1,0 +1,47 @@
+{
+  "version": "v2.0",
+  "git_sha": "e4c44c9e1466007db7d986eb63b7ee8a587a7753",
+  "git_branch": "exp/ppo-p6-tuning",
+  "freeze_timestamp": "2026-09-27T01:10:00Z",
+  "filter_config": "configs/merge_v2_decision_filter.yaml",
+  "filter_config_sha256": "a5c9b67a19cbc518df0fd4ef90d225426910d7847531644f14d45d8995b99e53",
+  "source_evidence": {
+    "train": "data/manifests/v2/evidence_training.jsonl",
+    "train_augmented_source_front": "outputs/merge_v2_decision_audit_v2/training_decision_evidence_augmented.jsonl",
+    "validation": "data/manifests/v2/evidence_validation.jsonl",
+    "validation_augmented_source_front": "outputs/merge_v2_decision_audit_v2/validation_decision_evidence_augmented.jsonl"
+  },
+  "train_count": 5545,
+  "validation_count": 2006,
+  "train_scenarios": 2533,
+  "validation_scenarios": 919,
+  "scenario_leakage_count": 0,
+  "train_tier_counts": {"A": 546, "B": 551, "C": 818, "INELIGIBLE": 3630},
+  "validation_tier_counts": {"A": 181, "B": 207, "C": 277, "INELIGIBLE": 1341},
+  "canonical_core_support_count": 1485,
+  "canonical_manifest": "data/manifests/v2/merge_decision_manifest_v2.csv",
+  "canonical_manifest_sha256": "ee58ac8a085c5de832af2553536d07d3a84d200765beaf9658336ce54b004bb1",
+  "canonical_scenarios": {"train": 1016, "validation": 352, "overlap": 0},
+  "diagnostic_trivial_policy_sanity": {
+    "path": "outputs/merge_v2_decision_audit_v2/trivial_policy_sanity_diagnostic.json",
+    "diagnostic_only": true,
+    "not_a_final_baseline": true,
+    "sample_size": 30,
+    "always_keep_success_rate": 0.0,
+    "always_keep_hard_failure": false,
+    "always_merge_success_rate": 0.5,
+    "always_merge_dominant_shortcut_risk": false,
+    "blocker_detected": false
+  },
+  "known_limitations": [
+    "SAFETY: negative target-lane projected gap ambiguity -- 20-sample targeted geometry audit (Waymax SAT/OBB overlap, ground truth) found 0/20 confirmed physical overlaps; SAFETY_CRITICAL_UNCERTAIN archetype and STOP are excluded from primary K/F/M discriminability and Tier A/B/C eligibility, preserved only as a secondary diagnostic flag.",
+    "REAR_PRESSURE is the rarest archetype surviving eligibility filtering (14/149 TRAIN, 9/61 VALIDATION in Tier A+B) -- most REAR_PRESSURE-tagged candidates were genuine non-merge-context scenes (serial_continuation/lane_change), not a sampling artifact.",
+    "CLEAR_MERGE_OPPORTUNITY archetype does not appear in Tier A/B for either split -- it is inherently a low-meaningful-action archetype (uncontested merge) that lands in Tier C or INELIGIBLE by construction, not a filtering bug.",
+    "Dataset is derived entirely from WOMD logged (not simulated/adversarial) contexts.",
+    "This dataset is an action-affordance/discriminability dataset, NOT a ground-truth action label dataset -- decision_relevance/archetype/tier fields describe where KEEP/FOLLOW/MERGE plausibly have state-dependent value, never which action is 'correct'. PPO is expected to learn action selection via reward, not supervised imitation of these fields.",
+    "source_front_present (at decision/commit frame) is rare even within Tier A+B (1.46%, 16/1097 TRAIN) -- FOLLOW-vs-KEEP differentiation in the trivial-policy diagnostic sample (n=30) showed 0 candidates with a source-lane lead, so AlwaysFollow was byte-identical to AlwaysKeep in that specific small sample; this is a known schema/sampling sparsity limitation, not evidence that FOLLOW is redundant at full Tier A+B scale (1.46% of 1097 is a real, if thin, non-zero population).",
+    "AlwaysMerge diagnostic success rate (50%, n=30, Tier A/B only) is elevated but not judged dominant (brief's own no-fixed-threshold guidance; below this session's 90% dominant-shortcut heuristic) -- reported for transparency, not treated as a frozen baseline result.",
+    "This entire dataset-filter freeze (Tier A/B/C, eligibility, canonical manifest) is DISTINCT from and does not modify the older, stricter v2 canonical pipeline (scripts/build_merge_v2_manifest.py / src/scenarios/v2_manifest.py) which still requires calibration_status=='calibrated' and per-candidate manual_validation=='CONFIRMED_MERGE' -- neither holds yet for this new Tier system; manual_validation values were never read or modified by this freeze work.",
+    "The diagnostic-only trivial-policy sanity check (scripts/diagnose_merge_v2_trivial_policy_sanity.py) routes ManeuverSpec through MergeEnvironment using schema_version=LEGACY_DATASET_SCHEMA specifically to avoid invoking or weakening ManeuverSpec.require_schema's CONFIRMED_MERGE contract -- this is a narrow, explicitly-scoped diagnostic path, not a new canonical evaluation pipeline, and is not to be used as a final PPO/FSM baseline result."
+  ]
+}

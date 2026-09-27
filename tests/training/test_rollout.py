@@ -20,7 +20,7 @@ from src.training.config import load_ppo_config, load_reward_config
 from src.training.gae import compute_gae, normalize_advantages_masked
 from src.training.rollout import Transition, collect_episode_rollout, collect_rollout
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 # Same real maneuvers used by tests/environment/test_merge_environment_frenet_mpc.py
 # (duplicated by value, matching that file's own stated convention of
@@ -366,12 +366,12 @@ def test_terminal_reward_propagates_to_merge_decision_frame(env, ppo_core, rewar
 
 def test_reward_components_propagate_from_wrapper_to_transitions(env, ppo_core, reward_config):
     """Reward component logging correctness follow-up fix: each real
-    rollout Transition's reward_terminal_component /
-    reward_decision_cost_component must match what MergeRewardWrapper
-    actually computed for that step (never a synthesized/re-derived
-    value), and every transition's two components must sum to exactly
-    its own `reward` -- including the final terminal transition, where
-    the OLD trainer.py bug would have conflated the two."""
+    rollout Transition's component fields must match what
+    MergeRewardWrapper actually computed for that step (never a
+    synthesized/re-derived value), and every transition's components
+    must sum to exactly its own `reward` -- including the final
+    terminal transition, where the OLD trainer.py bug would have
+    conflated terminal and decision-cost."""
 
     scripted_policy = _ScriptedMergePolicy(
         ppo_core["ppo_policy"]._policy_network, ppo_core["ppo_policy"]._policy_params
@@ -392,25 +392,34 @@ def test_reward_components_propagate_from_wrapper_to_transitions(env, ppo_core, 
     assert transitions[-1].terminated, "Expected a true terminal outcome (success/collision/offroad)"
 
     for t in transitions:
-        assert t.reward_terminal_component + t.reward_decision_cost_component == pytest.approx(
-            t.reward, abs=1e-9
-        )
+        assert (
+            t.reward_terminal_component + t.reward_decision_cost_component
+            + t.reward_safety_component + t.reward_progress_component
+            + t.reward_decision_component
+        ) == pytest.approx(t.reward, abs=1e-9)
 
     # The final (terminal) transition's terminal component must be one
-    # of Reward V0's fixed terminal-outcome values, not contaminated by
-    # any decision-cost component -- the exact bug this fix guards
-    # against (the old code would have folded the ENTIRE t.reward,
-    # decision cost included, into what it called "terminal").
+    # of the fixed terminal-outcome values, not contaminated by any
+    # decision-cost component -- the exact bug this fix guards against
+    # (the old code would have folded the ENTIRE t.reward, decision
+    # cost included, into what it called "terminal"). The final reward
+    # config's decision_cost.enabled=false makes this component always
+    # exactly 0.0 (never -0.01).
     final = transitions[-1]
     assert final.reward_terminal_component in (1.0, -1.0)
-    assert final.reward_decision_cost_component in (-0.01, 0.0)
+    assert final.reward_decision_cost_component == pytest.approx(0.0)
 
     # Episode-aggregate identity (Test G, real-environment version):
     # sum of components must equal sum of rewards within tolerance.
     total_terminal = sum(t.reward_terminal_component for t in transitions)
     total_decision_cost = sum(t.reward_decision_cost_component for t in transitions)
+    total_safety = sum(t.reward_safety_component for t in transitions)
+    total_progress = sum(t.reward_progress_component for t in transitions)
+    total_decision = sum(t.reward_decision_component for t in transitions)
     total_reward = sum(t.reward for t in transitions)
-    assert total_terminal + total_decision_cost == pytest.approx(total_reward, abs=1e-6)
+    assert (
+        total_terminal + total_decision_cost + total_safety + total_progress + total_decision
+    ) == pytest.approx(total_reward, abs=1e-6)
 
 
 def test_reward_components_zero_terminal_on_artificial_cutoff(env, ppo_core, reward_config):
@@ -445,11 +454,16 @@ def test_reward_components_zero_terminal_on_artificial_cutoff(env, ppo_core, rew
         assert not last.terminated
         assert not last.truncated
         assert last.reward_terminal_component == pytest.approx(0.0)
-        # Only the decision-cost component (driven by that step's own
-        # policy_mask), never a synthesized terminal outcome.
-        expected_decision_cost = -0.01 if last.policy_mask == 1 else 0.0
-        assert last.reward_decision_cost_component == pytest.approx(expected_decision_cost)
-        assert last.reward == pytest.approx(expected_decision_cost)
+        # Legacy decision_cost is disabled in the final reward config
+        # (always exactly 0.0, regardless of policy_mask); the
+        # remaining components (safety/progress/decision) are real
+        # dense-shaping values, not a synthesized terminal outcome.
+        assert last.reward_decision_cost_component == pytest.approx(0.0)
+        assert last.reward == pytest.approx(
+            last.reward_terminal_component + last.reward_decision_cost_component
+            + last.reward_safety_component + last.reward_progress_component
+            + last.reward_decision_component
+        )
 
 
 # ======================================================================

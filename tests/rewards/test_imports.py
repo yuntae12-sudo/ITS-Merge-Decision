@@ -17,17 +17,19 @@ def test_reward_wrapper_module_imports():
 
 
 def test_compute_reward_is_implemented():
-    reward_config = load_reward_config("configs/reward/merge_reward_v0.yaml")
+    reward_config = load_reward_config("configs/reward.yaml")
     value = merge_reward.compute_reward(
         reward_config=reward_config,
         termination_reason="success",
         is_policy_step=True,
     )
-    assert value == 1.0 - 0.01
+    # Legacy decision_cost is disabled in the final reward config, so a
+    # bare success/is_policy_step case is exactly the terminal reward.
+    assert value == 1.0
 
 
 def test_reward_wrapper_compute_is_implemented():
-    reward_config = load_reward_config("configs/reward/merge_reward_v0.yaml")
+    reward_config = load_reward_config("configs/reward.yaml")
     wrapper = reward_wrapper.MergeRewardWrapper(reward_config)
     value = wrapper.compute(termination_reason="success", is_policy_step=True)
-    assert value == 1.0 - 0.01
+    assert value == 1.0

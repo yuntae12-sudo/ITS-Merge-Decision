@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
-"""PPO training entry point (docs/ppo/PPO_PLAN.md).
+"""PPO training entry point.
 
-Real, working entry point as of P5: loads the PPO + reward configs,
-builds/resumes a training state, runs ``src.training.trainer.run_training``
-against the real ``MergeEnvironment``, and saves a checkpoint.
-
-IMPORTANT (PPO_PLAN.md SS0/SS0.1/P5): through the end of this P0-P5
-effort, this script must only be pointed at the small, deterministic
-canonical-TRAIN maneuver subset via ``--maneuver-ids``/``--max-maneuvers``
-(mirroring ``scripts/smoke_train_ppo.py``'s selection mechanism) --
-never at the full TRAIN split, never for a long/full training run, and
-never for a TRAIN/TUNE split of any kind. Those are explicitly reserved
-for the user to run manually starting at P6 -- see
-docs/ppo/SMOKE_TRAINING_REPORT.md for the exact commands this script
-was verified against during P5.
+Loads the PPO + reward configs, builds/resumes a training state, runs
+``src.training.trainer.run_training`` against the real
+``MergeEnvironment`` on the final canonical MERGE Dataset TRAIN split,
+and saves a checkpoint.
 
 ``--resume`` performs a REAL resume: it loads the checkpoint's policy/
 value params + optimizer state + JAX RNG key + global_env_step/
-ppo_update_step (docs/ppo/PPO_PLAN.md SS10) and continues training from
-there -- not a restart from zero.
+ppo_update_step and continues training from there -- not a restart
+from zero.
 """
 
 import argparse
@@ -27,9 +18,9 @@ import time
 
 import jax
 
-from src.environment.dataset_split import load_split_manifest
-from src.environment.full_split_evaluator import load_maneuver_specs
+from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
 from src.environment.merge_environment import MergeEnvironment
+from src.scenarios.merge_v2 import MERGE_DATASET_SCHEMA
 from src.policies.ppo.state import create_train_state
 from src.training.checkpoint import (
     CheckpointPayload,
@@ -39,18 +30,20 @@ from src.training.checkpoint import (
     save_checkpoint,
 )
 from src.training.config import load_ppo_config, load_reward_config
+from src.training.provenance import load_dataset_provenance
+from src.training.run_manifest import write_run_manifest
 from src.training.seeding import make_seed_state
 from src.training.trainer import run_training
 from src.tracking.wandb_logger import WandbLogger
 
-DEFAULT_DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DEFAULT_DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--ppo-config",
-        default="configs/ppo/ppo_base.yaml",
+        default="configs/ppo/train.yaml",
         help="Path to a PPO run config YAML (see configs/ppo/).",
     )
     parser.add_argument(
@@ -65,15 +58,14 @@ def parse_args() -> argparse.Namespace:
         help="Path to a checkpoint to resume from (see "
         "src/training/checkpoint.py for the save/load contract). "
         "Continues global_env_step/ppo_update_step from the checkpoint "
-        "rather than restarting from zero (PPO_PLAN.md SS10).",
+        "rather than restarting from zero.",
     )
     parser.add_argument(
         "--max-maneuvers",
         type=int,
         default=1,
         help="Number of canonical-TRAIN maneuvers to use, taken in "
-        "fixed sorted maneuver_id order. Pipeline-verification-scale "
-        "only through P5 -- see module docstring.",
+        "fixed sorted maneuver_id order.",
     )
     parser.add_argument(
         "--maneuver-ids",
@@ -97,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-path",
         default=None,
         help="Where to save the final checkpoint. Defaults to "
-        "outputs/ppo_checkpoints/train_<timestamp>.pkl.",
+        "outputs/checkpoints/train_<timestamp>.pkl.",
     )
     parser.add_argument(
         "--dataset-config-path",
@@ -107,10 +99,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids) -> list:
-    train_ids = sorted(
-        row.maneuver_id for row in load_split_manifest() if row.split == "train"
-    )
+def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids, train_ids) -> list:
     if explicit_ids is not None:
         requested = [m.strip() for m in explicit_ids.split(",") if m.strip()]
         missing = [m for m in requested if m not in train_ids]
@@ -131,7 +120,11 @@ def main() -> None:
     seed = args.seed if args.seed is not None else ppo_config.seed
     seed_state = make_seed_state(seed)
 
-    maneuver_ids = _resolve_maneuver_ids(args.max_maneuvers, args.maneuver_ids)
+    all_train_specs = load_decision_dataset_maneuver_specs("train")
+    maneuver_ids = _resolve_maneuver_ids(
+        args.max_maneuvers, args.maneuver_ids,
+        train_ids=sorted(s.maneuver_id for s in all_train_specs),
+    )
 
     print(f"Loaded PPO config from {ppo_config.source_path}")
     print(f"  network: {ppo_config.network}")
@@ -142,7 +135,6 @@ def main() -> None:
     print(f"Seed: {seed}")
     print(f"Maneuver subset ({len(maneuver_ids)}): {maneuver_ids}")
 
-    all_train_specs = load_maneuver_specs("train")
     specs_by_id = {s.maneuver_id: s for s in all_train_specs}
     missing = [m for m in maneuver_ids if m not in specs_by_id]
     if missing:
@@ -152,6 +144,7 @@ def main() -> None:
     env = MergeEnvironment(
         dataset_config_path=args.dataset_config_path,
         downstream_mode=ppo_config.rollout.downstream_mode,
+        required_dataset_schema_version=MERGE_DATASET_SCHEMA,
     )
 
     global_env_step = 0
@@ -161,6 +154,11 @@ def main() -> None:
         print(f"--resume={args.resume}: loading checkpoint and continuing training "
               "(not restarting from scratch).")
         payload = load_checkpoint(args.resume)
+        if payload.dataset_schema_version != MERGE_DATASET_SCHEMA:
+            raise ValueError(
+                f"Cannot resume {payload.dataset_schema_version!r} checkpoint "
+                f"with {MERGE_DATASET_SCHEMA!r} dataset"
+            )
         training_state = create_train_state(
             seed_state.jax_key,
             learning_rate=ppo_config.hyperparameters.learning_rate,
@@ -182,8 +180,8 @@ def main() -> None:
         run_key = payload.jax_rng_key
         global_env_step = payload.global_env_step
         ppo_update_step = payload.ppo_update_step
-        # Fix 5: restore the NumPy RNG (minibatch-shuffle) stream too --
-        # not just the JAX key -- so resumed minibatch ordering matches
+        # Restore the NumPy RNG (minibatch-shuffle) stream too -- not
+        # just the JAX key -- so resumed minibatch ordering matches
         # what an uninterrupted run would have produced.
         numpy_rng = restore_numpy_rng(payload.numpy_rng_state, fallback_seed=seed)
         print(f"Resumed: global_env_step={global_env_step}, "
@@ -223,7 +221,7 @@ def main() -> None:
     })
 
     checkpoint_path = args.checkpoint_path or (
-        f"outputs/ppo_checkpoints/train_seed{seed}_{int(time.time())}.pkl"
+        f"outputs/checkpoints/train_seed{seed}_{int(time.time())}.pkl"
     )
 
     t0 = time.time()
@@ -249,6 +247,8 @@ def main() -> None:
     for i, m in enumerate(result["updates"]):
         print(f"  update {i}: {m}")
 
+    dataset_provenance = load_dataset_provenance()
+
     payload = CheckpointPayload(
         policy_params=result["training_state"].policy_state.params,
         value_params=result["training_state"].value_state.params,
@@ -270,11 +270,44 @@ def main() -> None:
         reward_version=reward_config.reward_version,
         git_sha=get_git_sha(),
         numpy_rng_state=numpy_rng.get_state(),
+        dataset_schema_version=MERGE_DATASET_SCHEMA,
     )
     save_checkpoint(payload, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
 
+    try:
+        run_manifest_path = write_run_manifest(
+            checkpoint_path=checkpoint_path,
+            ppo_config_path=ppo_config.source_path,
+            reward_config_path=reward_config.source_path,
+            dataset_config_path=args.dataset_config_path,
+            maneuver_ids=maneuver_ids,
+            seed=seed,
+            num_updates=args.num_updates,
+            max_episode_steps=args.max_episode_steps,
+            reward_version=reward_config.reward_version,
+            git_sha=get_git_sha(),
+            global_env_step=result["global_env_step"],
+            ppo_update_step=result["ppo_update_step"],
+            resumed_from=args.resume,
+            dataset_schema_version=MERGE_DATASET_SCHEMA,
+            dataset_version=dataset_provenance.version,
+            dataset_freeze_sha=dataset_provenance.git_sha,
+        )
+        print(f"Saved run manifest to {run_manifest_path}")
+    except Exception as exc:  # noqa: BLE001 -- additive metadata only;
+        # must never fail a completed training run.
+        print(f"WARNING: failed to write run manifest ({exc}); "
+              "checkpoint itself is unaffected.")
+
     wandb_logger.finish()
+
+    print("\nTraining finished.")
+    print("\nTo visualize this checkpoint:")
+    print(
+        f"\nPYTHONPATH=. python scripts/visualize_ppo.py \\\n"
+        f"  --checkpoint {checkpoint_path}"
+    )
 
 
 if __name__ == "__main__":

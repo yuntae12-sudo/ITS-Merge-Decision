@@ -5,13 +5,13 @@ This module turns per-scene ``LaneTransition`` + ``MergeDiagnostic`` +
 serializable row per transition -- a ``CandidateRecord`` -- so the whole
 scanned dataset can be written to a single CSV manifest
 (``scripts/extract_merge_scenes.py``) and later manually reviewed
-(``scripts/build_merge_manifest.py``) and re-rendered for validation
-(``scripts/render_merge_validation.py`` / ``validation_viz.py``).
+(``scripts/build_merge_manifest.py``). This candidate pool feeds the
+final MERGE Decision Dataset's own construction chain (see
+``scripts/build_v2_target_scenario_ids.py``).
 
 This module does NOT change any merge-detection or feature-extraction
 logic -- it only calls into ``lane_assignment.py``, ``merge_detector.py``,
-and ``scenario_features.py`` using the exact same call pattern already
-used by ``scripts/inspect_merge_candidate.py``, and flattens the results.
+and ``scenario_features.py``, and flattens the results.
 
 Serialization convention (CSV)
 -------------------------------

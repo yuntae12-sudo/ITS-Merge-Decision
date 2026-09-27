@@ -51,7 +51,7 @@ from src.planning.reference import InvalidReferenceGeometryError, ReferenceLine
 
 @dataclasses.dataclass(frozen=True)
 class PlannerConfig:
-    """Loaded from ``configs/phase3_downstream.yaml`` by
+    """Loaded from ``configs/downstream.yaml`` by
     ``load_planner_config`` below; also constructible directly (e.g.
     in tests) without touching the file."""
 
@@ -66,7 +66,7 @@ def _is_finite(value: float) -> bool:
     return math.isfinite(value)
 
 
-def load_planner_config(path: str = "configs/phase3_downstream.yaml") -> PlannerConfig:
+def load_planner_config(path: str = "configs/downstream.yaml") -> PlannerConfig:
     import yaml
 
     with open(path, "r") as f:

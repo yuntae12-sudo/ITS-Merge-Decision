@@ -21,7 +21,7 @@ import pytest
 from src.environment.behavior_action import BehaviorAction
 from src.environment.merge_environment import MergeEnvironment, ManeuverSpec
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 # Same real maneuvers used by tests/environment/test_merge_environment.py
 # (imported by value here, not by import, to keep this file's fixture

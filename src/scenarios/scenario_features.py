@@ -64,7 +64,7 @@ VEHICLE_OBJECT_TYPE = 1
 class AgentSelectionConfig:
     """Thresholds for target-lane Front/Rear candidate selection.
 
-    See configs/phase1_merge.yaml `agent_selection` and `traffic` for
+    See configs/merge.yaml `agent_selection` and `traffic` for
     field descriptions and rationale.
     """
 

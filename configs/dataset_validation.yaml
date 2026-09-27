@@ -1,0 +1,24 @@
+# Canonical WOMD VALIDATION dataset loading configuration.
+#
+# Waymax's DatasetExpansionConfig binds one fixed split ("training" or
+# "validation") per config -- the two physical splits cannot be mixed
+# in a single configs/dataset.yaml, so canonical VALIDATION access uses
+# this sibling file. Only used by tests/tooling that need to reset a
+# VALIDATION-split maneuver (PPO training/smoke never touches
+# VALIDATION); TRAIN remains configs/dataset.yaml.
+#
+# Shards: exactly the 6 validation shards the final MERGE Dataset's
+# VALIDATION split actually references (see
+# data/manifests/evidence_validation.jsonl's source_shard values).
+dataset_name: WOMD
+split: validation
+shards:
+  - data/womd/validation/validation_tfexample.tfrecord-00000-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00001-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00002-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00003-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00004-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00005-of-00150
+max_num_objects: 64
+repeat: 1
+shuffle_seed: null

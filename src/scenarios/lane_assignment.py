@@ -29,7 +29,7 @@ from src.scenarios.lane_geometry import (
 class LaneAssignmentConfig:
     """Thresholds and weights for per-frame lane assignment.
 
-    See configs/phase1_merge.yaml `lane_assignment` for the source of
+    See configs/merge.yaml `lane_assignment` for the source of
     these values and the real-scene observations behind them.
     """
 
@@ -91,7 +91,7 @@ def _wrap_angle(angle_rad: float) -> float:
 def load_lane_assignment_config(config_path: str) -> LaneAssignmentConfig:
     """Loads the `lane_assignment` section of a Phase 1 merge config YAML.
 
-    See configs/phase1_merge.yaml for the field descriptions and the
+    See configs/merge.yaml for the field descriptions and the
     real-scene observations behind the current values.
     """
 

@@ -47,7 +47,7 @@ def _make_training_state(ppo_config, seed=0):
 
 @pytest.fixture(scope="module")
 def ppo_config():
-    return load_ppo_config("configs/ppo/ppo_smoke.yaml")
+    return load_ppo_config("configs/ppo/smoke.yaml")
 
 
 @pytest.fixture(scope="module")
@@ -169,7 +169,7 @@ def test_full_save_load_resume_additional_update_cycle(tmp_path, ppo_config, rew
     from src.training.trainer import run_training
 
     env = MergeEnvironment(
-        dataset_config_path="outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml",
+        dataset_config_path="configs/dataset.yaml",
         downstream_mode="frenet_mpc",
     )
 

@@ -15,7 +15,7 @@ from src.environment.behavior_action import BehaviorAction
 from src.environment.fsm_policy import FsmPolicy
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 # Same real single-candidate maneuver used in test_merge_environment.py.
 SINGLE_MANEUVER = ManeuverSpec(

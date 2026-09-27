@@ -269,16 +269,16 @@ def test_case_n_legacy_single_path_config_defaults_to_validation(tmp_path):
     assert expansion_config.repeat == 1
 
 
-def test_real_configs_dataset_yaml_still_loads_as_legacy_validation():
-    """Confirms configs/dataset.yaml (untouched by this commit) still
-    parses under the legacy branch and defaults to split=validation.
-    """
+def test_real_configs_dataset_yaml_is_canonical_training_multishard():
+    """configs/dataset.yaml is the canonical final-pipeline dataset
+    config (multi-shard training split), loaded by the same
+    load_dataset_config() dual-schema support tested above."""
 
     expansion_config = load_dataset_config("configs/dataset.yaml")
-    assert expansion_config.split == "validation"
-    assert len(expansion_config.shard_paths) == 1
+    assert expansion_config.split == "training"
+    assert len(expansion_config.shard_paths) == 10
     assert expansion_config.shard_paths[0].endswith(
-        "validation_tfexample.tfrecord-00000-of-00150"
+        "training_tfexample.tfrecord-00000-of-01000"
     )
 
 

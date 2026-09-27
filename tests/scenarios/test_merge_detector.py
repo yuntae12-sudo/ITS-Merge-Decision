@@ -18,6 +18,7 @@ from src.scenarios.merge_detector import (
     REJECT_INSUFFICIENT_CONVERGENCE,
     REJECT_PARALLEL_LANE_CHANGE,
     REVIEW_AMBIGUOUS_SERIAL_OR_MERGE,
+    REJECT_SERIAL_CONTINUATION,
     MergeDecision,
     MergeTopologyConfig,
     compute_merge_start_end_s,
@@ -126,7 +127,7 @@ def test_case2_ordinary_parallel_lane_change_rejected():
     assert diagnostic.parallel_continuation is True
 
 
-def test_case3_collinear_serial_continuation_is_review_not_reject():
+def test_case3_collinear_serial_continuation_is_rejected():
     """Source A ends essentially exactly where target B starts, as
     consecutive serial segments of the same physical lane (collinear
     A-end == B-start). Real-WOMD investigation showed this geometry
@@ -156,12 +157,30 @@ def test_case3_collinear_serial_continuation_is_review_not_reject():
         transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
     )
 
-    assert diagnostic.decision == MergeDecision.REVIEW
-    assert diagnostic.reason == REVIEW_AMBIGUOUS_SERIAL_OR_MERGE
+    assert diagnostic.decision == MergeDecision.REJECT
+    assert diagnostic.reason == REJECT_SERIAL_CONTINUATION
     assert diagnostic.is_merge_candidate is False
     assert diagnostic.endpoint_target_distance_m == pytest.approx(
         0.0, abs=1e-6
     )
+
+
+def test_man0013_style_collinear_segments_with_sampling_gap_rejected():
+    """A finite target starting 1.85 m after a collinear source must not
+    turn longitudinal approach into false lateral convergence."""
+
+    source_xy = np.stack([np.zeros(51), np.linspace(0.0, 50.0, 51)], axis=1)
+    target_xy = np.stack([np.zeros(51), np.linspace(51.85, 101.85, 51)], axis=1)
+    source = _make_lane(204, source_xy)
+    target = _make_lane(203, target_xy)
+    transition = _make_transition(204, 203)
+
+    diagnostic = detect_merge(
+        transition, source, target, source.arc_length[-2], DEFAULT_CONFIG
+    )
+
+    assert diagnostic.decision == MergeDecision.REJECT
+    assert diagnostic.reason == REJECT_SERIAL_CONTINUATION
 
 
 def test_case3b_true_merge_near_convergence_point_accepted():
@@ -177,14 +196,9 @@ def test_case3b_true_merge_near_convergence_point_accepted():
     serial_continuation_max_lateral_m (0.5 m) and must ACCEPT, not
     REVIEW.
 
-    Note: a source ending at EXACTLY 0.0 m from the target is, in the
-    current single-signal (endpoint-distance) REVIEW model, always
-    inside the ambiguous band for any positive threshold -- see Known
-    Limitations in the fix commit report. That exact-zero case is
-    demonstrated separately by test_case3_collinear_serial_continuation
-    _is_review_not_reject, which documents it as REVIEW rather than an
-    automatic REJECT (the actual fix this commit makes for that exact
-    geometry).
+    Note: exact/near-exact collinear target-start boundaries are now rejected
+    by the MAN_0013 serial-continuation guard. This true merge stays outside
+    that guard because its upstream source geometry is not collinear.
     """
 
     # Source curves in from an offset, ending 0.6 m off the target's

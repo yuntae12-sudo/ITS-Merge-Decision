@@ -623,6 +623,21 @@ def run_training(
         reward_decision_cost = float(
             sum(t.reward_decision_cost_component for t in transitions)
         )
+        # Reward V1 additive components (outputs/reward_v1_spec/
+        # REWARD_V1_SPEC_FINAL.md Section 13/21) -- same "sum the
+        # per-Transition component verbatim, never re-derive" pattern as
+        # reward_terminal/reward_decision_cost above. Always 0.0 for a
+        # V0 RewardConfig (Transition's own default), so this is a
+        # no-op extension for any existing V0 run.
+        reward_safety = float(
+            sum(t.reward_safety_component for t in transitions)
+        )
+        reward_progress = float(
+            sum(t.reward_progress_component for t in transitions)
+        )
+        reward_decision = float(
+            sum(t.reward_decision_component for t in transitions)
+        )
         reward_total = float(np.sum(batch["reward"]))
 
         # Fix 6 (W&B full diagnostics): episode-outcome rates, sourced
@@ -702,6 +717,9 @@ def run_training(
             "train/timeout_rate": train_timeout_rate,
             "reward/terminal": reward_terminal,
             "reward/decision_cost": reward_decision_cost,
+            "reward/safety": reward_safety,
+            "reward/progress": reward_progress,
+            "reward/decision": reward_decision,
             "reward/total": reward_total,
             "train/policy_decision_count": float(policy_decision_count),
             "train/physical_step_count": float(physical_step_count),

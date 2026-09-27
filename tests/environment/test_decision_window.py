@@ -3,20 +3,18 @@
 Covers Section 15's checklist:
   - decision_start_frame determinism
   - decision_start <= merge_start for every canonical maneuver
-  - all 168 canonical maneuvers resolvable
+  - every canonical maneuver in the final decision dataset resolvable
   - actual reset timestep == decision_start
   - 14D finite observation at the new reset
   - horizon preserves old absolute episode opportunity (capped safely
     at the scenario's own logged length)
   - canonical split unchanged
-  - Phase 1 canonical labels unchanged
 
 Uses REAL WOMD scenes (see test_merge_environment.py's module
 docstring for why) -- these tests fail, not skip, if the local
 training shards are not present.
 """
 
-import csv
 import hashlib
 
 import numpy as np
@@ -30,6 +28,7 @@ from src.environment.decision_window import (
 )
 from src.environment.dataset_split import load_split_manifest
 from src.environment.episode_context import parse_candidate_ids, parse_lane_chain
+from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
 from src.scenarios.lane_assignment import load_lane_assignment_config
 from src.scenarios.lane_geometry import extract_lane_polylines
@@ -40,10 +39,9 @@ from src.scenarios.scenario_loader import (
     select_single_shard_for_inspection,
 )
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
-MERGE_CONFIG_PATH = "configs/phase1_merge.yaml"
-MANEUVER_TABLE = "outputs/phase1/training_10shard_pilot/training_visual_merge_maneuvers.csv"
-CANDIDATE_MANIFEST = "outputs/phase1/training_10shard_pilot/merge_manifest_training_scratch.csv"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
+VALIDATION_DATASET_CONFIG_PATH = "configs/dataset_validation.yaml"
+MERGE_CONFIG_PATH = "configs/merge.yaml"
 
 # Same real single-candidate maneuver test_merge_environment.py uses.
 SINGLE_MANEUVER = ManeuverSpec(
@@ -64,20 +62,13 @@ def env():
 
 
 def _load_all_specs():
-    """All 168 canonical maneuvers (both splits), as ManeuverSpecs."""
+    """Every canonical maneuver (both splits) in the final decision
+    dataset, as ManeuverSpecs."""
 
-    with open(CANDIDATE_MANIFEST, newline="") as f:
-        manifest_by_candidate_id = {row["candidate_id"]: row for row in csv.DictReader(f)}
-    split_by_id = {r.maneuver_id: r.split for r in load_split_manifest()}
-
-    specs = []
-    with open(MANEUVER_TABLE, newline="") as f:
-        for row in csv.DictReader(f):
-            if row["maneuver_id"] not in split_by_id:
-                continue
-            spec = ManeuverSpec.from_csv_row(row, manifest_by_candidate_id)
-            specs.append(spec)
-    return specs
+    return (
+        load_decision_dataset_maneuver_specs("train")
+        + load_decision_dataset_maneuver_specs("validation")
+    )
 
 
 # ======================================================================
@@ -114,16 +105,34 @@ def test_decision_start_frame_deterministic_across_repeated_resets(env):
 # ======================================================================
 
 
-def test_decision_start_frame_le_merge_start_frame_for_all_canonical_maneuvers():
-    """Section 5's required invariant, checked EXHAUSTIVELY over all
-    168 canonical maneuvers (both splits) using the raw geometric
-    helper directly (no Waymax reset needed -- these are static
-    per-maneuver checks over the logged trajectory)."""
+def _representative_spec_sample(specs, stride=50):
+    """Deterministic representative subset (first/last/stride/per-shard)
+    -- see tests/environment/test_common_state_freeze.py's identical
+    rationale. Kept as a local copy rather than a cross-file import to
+    avoid coupling two independent test modules' internals."""
 
-    expansion_config = load_dataset_config(DATASET_CONFIG_PATH)
+    if not specs:
+        return []
+    sample_by_id = {specs[0].maneuver_id: specs[0], specs[-1].maneuver_id: specs[-1]}
+    for spec in specs[::stride]:
+        sample_by_id[spec.maneuver_id] = spec
+    seen_shards = set()
+    for spec in specs:
+        if spec.source_shard not in seen_shards:
+            seen_shards.add(spec.source_shard)
+            sample_by_id[spec.maneuver_id] = spec
+    return [sample_by_id[m] for m in sorted(sample_by_id)]
+
+
+def _assert_decision_start_frame_bounds(specs):
+    # Waymax binds one fixed physical split per DatasetExpansionConfig
+    # (TRAIN and VALIDATION shards cannot be mixed into a single
+    # config), so each spec is routed to the config matching its own
+    # source_shard prefix -- mirrors test_common_state_freeze.py's
+    # env/validation_env split.
+    train_config = load_dataset_config(DATASET_CONFIG_PATH)
+    validation_config = load_dataset_config(VALIDATION_DATASET_CONFIG_PATH)
     lane_assignment_config = load_lane_assignment_config(MERGE_CONFIG_PATH)
-    specs = _load_all_specs()
-    assert len(specs) == 168
 
     # Cache loaded records by (source_shard, record_index) since many
     # maneuvers share a shard/scene -- avoids redundant TFRecord scans.
@@ -132,6 +141,9 @@ def test_decision_start_frame_le_merge_start_frame_for_all_canonical_maneuvers()
 
     def _load_record(source_shard, record_index):
         nonlocal _cache_key, _cache_records
+        expansion_config = (
+            validation_config if source_shard.startswith("validation_") else train_config
+        )
         shard_path = select_single_shard_for_inspection(
             expansion_config, source_shard=source_shard, record_index=record_index
         )
@@ -181,6 +193,29 @@ def test_decision_start_frame_le_merge_start_frame_for_all_canonical_maneuvers()
             )
 
     assert not failures, "\n".join(failures)
+
+
+def test_decision_start_frame_le_merge_start_frame_for_sample_of_canonical_maneuvers():
+    """Section 5's required invariant, checked over a deterministic
+    representative sample (both splits) using the raw geometric helper
+    directly (no Waymax env reset needed -- these are static
+    per-maneuver checks over the logged trajectory). See the
+    @pytest.mark.slow variant below for the exhaustive full-dataset
+    check (1485 maneuvers)."""
+
+    specs = _representative_spec_sample(_load_all_specs())
+    _assert_decision_start_frame_bounds(specs)
+
+
+@pytest.mark.slow
+def test_decision_start_frame_le_merge_start_frame_for_all_canonical_maneuvers_full():
+    """Exhaustive version of the sampled check above -- every TRAIN +
+    VALIDATION maneuver in the final dataset (1485 total); not run by
+    default targeted test commands (see pytest.ini's `slow` marker)."""
+
+    specs = _load_all_specs()
+    assert len(specs) == 1485
+    _assert_decision_start_frame_bounds(specs)
 
 
 def test_decision_start_unresolved_raises_not_silently_falls_back():
@@ -310,13 +345,3 @@ def test_canonical_split_manifest_unchanged():
     train_scenes = {r.scene_key for r in train}
     validation_scenes = {r.scene_key for r in validation}
     assert train_scenes.isdisjoint(validation_scenes)
-
-
-def test_phase1_canonical_maneuver_table_row_count_unchanged():
-    """Phase 1's maneuver table must still contain exactly the
-    canonical 168-maneuver pool -- Stage B-2.8 does not add, remove,
-    or relabel maneuvers."""
-
-    with open(MANEUVER_TABLE, newline="") as f:
-        rows = list(csv.DictReader(f))
-    assert len(rows) == 168

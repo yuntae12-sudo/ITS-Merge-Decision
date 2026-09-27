@@ -20,7 +20,7 @@ False unless `self._decision_state.is_committed`).
 from src.environment.behavior_action import BehaviorAction
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 # Same real single-candidate maneuver used throughout Stage B-1/B-2
 # tests -- previously confirmed to spuriously "succeed" under pure

@@ -9,39 +9,95 @@ gets privileged information or a different evaluation harness.
 
 import csv
 import dataclasses
+import json
 from typing import List, Optional
 
 from src.environment.behavior_action import BehaviorAction
-from src.environment.dataset_split import load_split_manifest
+from src.environment.dataset_split import load_split_manifest, normalize_split_name
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
+from src.scenarios.merge_v2 import MERGE_DATASET_SCHEMA
 
-MANEUVER_TABLE = "outputs/phase1/training_10shard_pilot/training_visual_merge_maneuvers.csv"
-CANDIDATE_MANIFEST = "outputs/phase1/training_10shard_pilot/merge_manifest_training_scratch.csv"
 DEFAULT_MAX_STEPS = 100  # matches MAX_EPISODE_HORIZON_FRAMES
 
+DECISION_MANEUVER_TABLE = "data/manifests/merge_maneuvers.csv"
+DECISION_SPLIT_MANIFEST = "data/manifests/merge_split.csv"
+DECISION_EVIDENCE_TRAINING = "data/manifests/evidence_training.jsonl"
+DECISION_EVIDENCE_VALIDATION = "data/manifests/evidence_validation.jsonl"
 
-def load_maneuver_specs(which_split: str, split_manifest_path: Optional[str] = None) -> List[ManeuverSpec]:
-    """Loads every ManeuverSpec belonging to one split (no subsampling
-    -- Stage B-2.5 explicitly requires the FULL canonical split, unlike
-    Stage B-1.5/B-2's representative-sample checks)."""
+DECISION_TIERS_FOR_PPO = ("A", "B")
+DECISION_DATASET_ROLES_FOR_PPO = ("CORE", "SUPPORT")
+DECISION_MERGE_CONTEXT_STATUS_ELIGIBLE = "MERGE_CONTEXT_ELIGIBLE"
 
-    if split_manifest_path is not None:
-        split_rows = {r.maneuver_id: r.split for r in load_split_manifest(split_manifest_path)}
-    else:
-        split_rows = {r.maneuver_id: r.split for r in load_split_manifest()}
 
-    with open(CANDIDATE_MANIFEST, newline="") as f:
-        manifest_by_candidate_id = {row["candidate_id"]: row for row in csv.DictReader(f)}
+def _load_decision_evidence_by_candidate_id(evidence_path: str) -> dict:
+    evidence_by_candidate_id = {}
+    with open(evidence_path) as f:
+        for line in f:
+            row = json.loads(line)
+            evidence_by_candidate_id[row["candidate_id"]] = row
+    return evidence_by_candidate_id
+
+
+def load_decision_dataset_maneuver_specs(
+    which_split: str,
+    maneuver_table_path: str = DECISION_MANEUVER_TABLE,
+    split_manifest_path: str = DECISION_SPLIT_MANIFEST,
+    evidence_training_path: str = DECISION_EVIDENCE_TRAINING,
+    evidence_validation_path: str = DECISION_EVIDENCE_VALIDATION,
+) -> List[ManeuverSpec]:
+    """Loads every ManeuverSpec belonging to one split of the FROZEN
+    final MERGE Dataset (data/manifests/merge_*.csv), joined against
+    its authoritative evidence JSONL for the fields
+    (topology_evidence/interaction_evidence) the frozen manifest's own
+    columns do not carry.
+
+    Frozen manifest/split CSVs are read-only here -- never rewritten.
+    Restricts to the PPO training-relevant subset explicitly (Tier
+    A/B, dataset_role CORE/SUPPORT, merge_context_status ELIGIBLE) per
+    the dataset's own Merge Context Validity + Decision Relevance
+    contract (see ``MERGE_DATASET_SCHEMA``)."""
+
+    which_split = normalize_split_name(which_split)
+    evidence_path = (
+        evidence_training_path if which_split == "train" else evidence_validation_path
+    )
+    evidence_by_candidate_id = _load_decision_evidence_by_candidate_id(evidence_path)
+
+    split_rows = {
+        r.maneuver_id: normalize_split_name(r.split)
+        for r in load_split_manifest(split_manifest_path)
+    }
 
     specs = []
-    with open(MANEUVER_TABLE, newline="") as f:
+    seen_maneuver_ids = set()
+    seen_candidate_ids = set()
+    with open(maneuver_table_path, newline="") as f:
         for row in csv.DictReader(f):
             if split_rows.get(row["maneuver_id"]) != which_split:
                 continue
-            try:
-                spec = ManeuverSpec.from_csv_row(row, manifest_by_candidate_id)
-            except KeyError:
+            if row["decision_tier"] not in DECISION_TIERS_FOR_PPO:
                 continue
+            if row["dataset_role"] not in DECISION_DATASET_ROLES_FOR_PPO:
+                continue
+            if row["merge_context_status"] != DECISION_MERGE_CONTEXT_STATUS_ELIGIBLE:
+                continue
+
+            evidence_row = evidence_by_candidate_id.get(row["candidate_id"])
+            if evidence_row is None:
+                continue
+
+            maneuver_id = row["maneuver_id"]
+            candidate_id = row["candidate_id"]
+            if maneuver_id in seen_maneuver_ids or candidate_id in seen_candidate_ids:
+                raise ValueError(
+                    f"duplicate maneuver_id/candidate_id in decision dataset: "
+                    f"{maneuver_id} / {candidate_id}"
+                )
+            seen_maneuver_ids.add(maneuver_id)
+            seen_candidate_ids.add(candidate_id)
+
+            spec = ManeuverSpec.from_decision_dataset_row(row, evidence_row)
+            spec.require_schema(MERGE_DATASET_SCHEMA)
             specs.append(spec)
     return specs
 
@@ -49,6 +105,8 @@ def load_maneuver_specs(which_split: str, split_manifest_path: Optional[str] = N
 @dataclasses.dataclass
 class EpisodeResult:
     maneuver_id: str
+    dataset_schema_version: str
+    maneuver_type: Optional[str]
     outcome: str  # "success" | "failure_collision" | "failure_offroad" | "timeout" | "exception"
     steps_elapsed: int
     merge_commit_frame: Optional[int]  # None if never committed within horizon
@@ -185,6 +243,8 @@ def run_episode(env: MergeEnvironment, policy, spec: ManeuverSpec, max_steps: in
 
     return EpisodeResult(
         maneuver_id=spec.maneuver_id,
+        dataset_schema_version=spec.schema_version,
+        maneuver_type=spec.maneuver_type,
         outcome=outcome,
         steps_elapsed=steps_elapsed,
         merge_commit_frame=merge_commit_frame,
