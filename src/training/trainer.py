@@ -52,6 +52,30 @@ from src.training.gae import compute_gae_segmented, normalize_advantages_masked
 from src.training.rollout import Transition, collect_rollout
 
 
+ManeuverSelector = Callable[[int], List[ManeuverSpec]]
+
+
+def resolve_update_maneuvers(
+    maneuvers: List[ManeuverSpec],
+    maneuver_selector: Optional[ManeuverSelector],
+    ppo_update_step: int,
+) -> List[ManeuverSpec]:
+    """Returns the maneuver batch for one absolute PPO update step.
+
+    With no selector this preserves the original fixed-subset behavior.
+    A selector receives the absolute pre-update ``ppo_update_step``, so a
+    resumed caller can reconstruct the same next batch without mutable
+    sampler state.
+    """
+
+    selected = maneuvers if maneuver_selector is None else maneuver_selector(ppo_update_step)
+    if not selected:
+        raise ValueError(
+            f"run_training: empty maneuver batch at ppo_update_step={ppo_update_step}"
+        )
+    return selected
+
+
 def build_training_batch(
     transitions: List[Transition], ppo_config: PPOConfig
 ) -> Dict[str, np.ndarray]:
@@ -531,11 +555,13 @@ def run_training(
     ppo_update_step: int = 0,
     wandb_logger: Optional[Any] = None,
     on_update: Optional[Callable[[int, PPOTrainingState, jax.Array, int, int], None]] = None,
+    maneuver_selector: Optional[ManeuverSelector] = None,
 ) -> Dict[str, Any]:
     """Runs ``num_updates`` real PPO updates against the real
     ``MergeEnvironment`` (docs/ppo/PPO_PLAN.md SS0.1/P5).
 
-    Each update: collect one rollout over ``maneuvers`` -> build a
+    Each update: collect one rollout over ``maneuvers`` (or the batch
+    returned by ``maneuver_selector(absolute_ppo_update_step)``) -> build a
     training batch (rollout -> GAE -> masked-normalized advantages) ->
     filter Actor-side quantities to ``policy_mask == 1`` -> run
     ``ppo_epochs``/``num_minibatches`` gradient steps for both the
@@ -547,7 +573,7 @@ def run_training(
     -- this is what makes ``--resume`` a real continuation rather than a
     restart (PPO_PLAN.md SS10). ``on_update`` is an optional callback
     invoked after every update with
-    ``(update_index, training_state, global_env_step, ppo_update_step)``
+    ``(update_index, training_state, rng_key, global_env_step, ppo_update_step)``
     -- used by callers (e.g. ``scripts/train_ppo.py``) to save periodic
     checkpoints without this function needing to know about the
     checkpoint contract itself.
@@ -563,6 +589,9 @@ def run_training(
     update_metrics: List[Dict[str, Any]] = []
 
     for update_index in range(num_updates):
+        update_maneuvers = resolve_update_maneuvers(
+            maneuvers, maneuver_selector, ppo_update_step
+        )
         rng_key, rollout_key = jax.random.split(rng_key)
 
         ppo_policy = PPOPolicy(training_state.policy_network, training_state.policy_state.params)
@@ -575,7 +604,7 @@ def run_training(
         rollout_start_time = time.time()
         transitions: List[Transition] = collect_rollout(
             env=env,
-            maneuvers=maneuvers,
+            maneuvers=update_maneuvers,
             ppo_policy=ppo_policy,
             value_network=training_state.value_network,
             value_params=training_state.value_state.params,

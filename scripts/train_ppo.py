@@ -14,9 +14,12 @@ from zero.
 
 import argparse
 import dataclasses
+import hashlib
 import time
+from pathlib import Path
 
 import jax
+import numpy as np
 
 from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
 from src.environment.merge_environment import MergeEnvironment
@@ -37,6 +40,8 @@ from src.training.trainer import run_training
 from src.tracking.wandb_logger import WandbLogger
 
 DEFAULT_DATASET_CONFIG_PATH = "configs/dataset.yaml"
+EXPECTED_TRAIN_POOL_SIZE = 1097
+FULL_TRAIN_SAMPLING_STRATEGY = "deterministic_seeded_shuffle_cycle_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +79,19 @@ def parse_args() -> argparse.Namespace:
         "--max-maneuvers when given.",
     )
     parser.add_argument(
+        "--full-train",
+        action="store_true",
+        help="Use the complete canonical TRAIN pool with a deterministic "
+        "per-update shuffle/cycle schedule.",
+    )
+    parser.add_argument(
+        "--maneuvers-per-update",
+        type=int,
+        default=None,
+        help="Required with --full-train: number of TRAIN maneuvers rolled "
+        "out per PPO update.",
+    )
+    parser.add_argument(
         "--num-updates",
         type=int,
         default=1,
@@ -90,6 +108,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Where to save the final checkpoint. Defaults to "
         "outputs/checkpoints/train_<timestamp>.pkl.",
+    )
+    parser.add_argument(
+        "--checkpoint-every-updates",
+        type=int,
+        default=0,
+        help="Save a periodic checkpoint every N completed PPO updates; "
+        "0 disables periodic saves.",
     )
     parser.add_argument(
         "--dataset-config-path",
@@ -112,8 +137,143 @@ def _resolve_maneuver_ids(max_maneuvers: int, explicit_ids, train_ids) -> list:
     return train_ids[:max_maneuvers]
 
 
+def deterministic_full_train_batch_ids(
+    train_ids: list,
+    seed: int,
+    absolute_ppo_update_step: int,
+    maneuvers_per_update: int,
+) -> list:
+    """Returns one stateless deterministic shuffle/cycle TRAIN batch."""
+
+    pool = sorted(train_ids)
+    if not pool:
+        raise ValueError("full-train pool must not be empty")
+    if len(pool) != len(set(pool)):
+        raise ValueError("full-train pool contains duplicate maneuver_ids")
+    if absolute_ppo_update_step < 0:
+        raise ValueError("absolute_ppo_update_step must be >= 0")
+    if maneuvers_per_update <= 0:
+        raise ValueError("maneuvers_per_update must be > 0")
+
+    pool_size = len(pool)
+    position = absolute_ppo_update_step * maneuvers_per_update
+    remaining = maneuvers_per_update
+    selected = []
+    while remaining:
+        sweep_index, offset = divmod(position, pool_size)
+        digest = hashlib.sha256(f"{seed}:{sweep_index}".encode("utf-8")).digest()
+        sweep_seed = int.from_bytes(digest[:4], "big")
+        shuffled = list(pool)
+        np.random.RandomState(sweep_seed).shuffle(shuffled)
+        take = min(remaining, pool_size - offset)
+        selected.extend(shuffled[offset:offset + take])
+        position += take
+        remaining -= take
+    return selected
+
+
+def _checkpoint_config_snapshot(
+    ppo_config,
+    reward_config,
+    maneuver_ids: list,
+    full_train: bool,
+    maneuvers_per_update,
+) -> dict:
+    return {
+        "ppo_config_path": ppo_config.source_path,
+        "reward_config_path": reward_config.source_path,
+        "hyperparameters": dataclasses.asdict(ppo_config.hyperparameters),
+        "network_hidden_sizes": list(ppo_config.network.hidden_sizes),
+        "maneuver_ids": list(maneuver_ids),
+        "full_train": full_train,
+        "train_pool_size": len(maneuver_ids),
+        "maneuvers_per_update": maneuvers_per_update,
+        "sampling_strategy": (
+            FULL_TRAIN_SAMPLING_STRATEGY if full_train else "fixed_subset"
+        ),
+    }
+
+
+def _build_checkpoint_payload(
+    training_state,
+    rng_key,
+    numpy_rng,
+    global_env_step: int,
+    ppo_update_step: int,
+    seed: int,
+    config_snapshot: dict,
+    reward_version: str,
+) -> CheckpointPayload:
+    return CheckpointPayload(
+        policy_params=training_state.policy_state.params,
+        value_params=training_state.value_state.params,
+        optimizer_state={
+            "policy": training_state.policy_state.opt_state,
+            "value": training_state.value_state.opt_state,
+        },
+        jax_rng_key=rng_key,
+        global_env_step=global_env_step,
+        ppo_update_step=ppo_update_step,
+        seed=seed,
+        config_snapshot=config_snapshot,
+        reward_version=reward_version,
+        git_sha=get_git_sha(),
+        numpy_rng_state=numpy_rng.get_state(),
+        dataset_schema_version=MERGE_DATASET_SCHEMA,
+    )
+
+
+def make_periodic_checkpoint_callback(
+    interval: int,
+    checkpoint_dir,
+    filename_prefix: str,
+    seed: int,
+    reward_version: str,
+    config_snapshot: dict,
+    numpy_rng,
+):
+    if interval is None or interval == 0:
+        return None
+    if interval < 0:
+        raise ValueError("periodic checkpoint interval must be >= 0")
+    checkpoint_dir = Path(checkpoint_dir)
+
+    def on_update(
+        update_index, training_state, rng_key, global_env_step, ppo_update_step
+    ):
+        del update_index
+        if ppo_update_step % interval != 0:
+            return
+        path = checkpoint_dir / f"{filename_prefix}_step{ppo_update_step:06d}.pkl"
+        payload = _build_checkpoint_payload(
+            training_state=training_state,
+            rng_key=rng_key,
+            numpy_rng=numpy_rng,
+            global_env_step=global_env_step,
+            ppo_update_step=ppo_update_step,
+            seed=seed,
+            config_snapshot=config_snapshot,
+            reward_version=reward_version,
+        )
+        save_checkpoint(payload, str(path))
+        print(f"Saved periodic checkpoint to {path}")
+
+    return on_update
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.full_train and args.maneuver_ids is not None:
+        raise ValueError("--full-train cannot be combined with --maneuver-ids")
+    if args.full_train and args.maneuvers_per_update is None:
+        raise ValueError("--maneuvers-per-update is required with --full-train")
+    if args.maneuvers_per_update is not None and args.maneuvers_per_update <= 0:
+        raise ValueError("--maneuvers-per-update must be > 0")
+    if not args.full_train and args.maneuvers_per_update is not None:
+        raise ValueError("--maneuvers-per-update requires --full-train")
+    if args.checkpoint_every_updates < 0:
+        raise ValueError("--checkpoint-every-updates must be >= 0")
 
     ppo_config = load_ppo_config(args.ppo_config)
     reward_config = load_reward_config(ppo_config.reward_config_path)
@@ -121,9 +281,43 @@ def main() -> None:
     seed_state = make_seed_state(seed)
 
     all_train_specs = load_decision_dataset_maneuver_specs("train")
-    maneuver_ids = _resolve_maneuver_ids(
-        args.max_maneuvers, args.maneuver_ids,
-        train_ids=sorted(s.maneuver_id for s in all_train_specs),
+    train_ids = sorted(s.maneuver_id for s in all_train_specs)
+    specs_by_id = {s.maneuver_id: s for s in all_train_specs}
+    if len(specs_by_id) != len(all_train_specs):
+        raise ValueError("Canonical TRAIN contains duplicate maneuver_ids")
+
+    if args.full_train:
+        if len(train_ids) != EXPECTED_TRAIN_POOL_SIZE:
+            raise ValueError(
+                f"--full-train requires exactly {EXPECTED_TRAIN_POOL_SIZE} canonical "
+                f"TRAIN maneuvers, found {len(train_ids)}"
+            )
+        maneuver_ids = train_ids
+        maneuvers = [specs_by_id[maneuver_id] for maneuver_id in maneuver_ids]
+        maneuvers_per_update = args.maneuvers_per_update
+
+        def maneuver_selector(absolute_ppo_update_step):
+            batch_ids = deterministic_full_train_batch_ids(
+                train_ids=maneuver_ids,
+                seed=seed,
+                absolute_ppo_update_step=absolute_ppo_update_step,
+                maneuvers_per_update=maneuvers_per_update,
+            )
+            return [specs_by_id[maneuver_id] for maneuver_id in batch_ids]
+    else:
+        maneuver_ids = _resolve_maneuver_ids(
+            args.max_maneuvers, args.maneuver_ids, train_ids=train_ids
+        )
+        maneuvers = [specs_by_id[maneuver_id] for maneuver_id in maneuver_ids]
+        maneuvers_per_update = len(maneuvers)
+        maneuver_selector = None
+
+    checkpoint_config_snapshot = _checkpoint_config_snapshot(
+        ppo_config=ppo_config,
+        reward_config=reward_config,
+        maneuver_ids=maneuver_ids,
+        full_train=args.full_train,
+        maneuvers_per_update=maneuvers_per_update,
     )
 
     print(f"Loaded PPO config from {ppo_config.source_path}")
@@ -133,13 +327,14 @@ def main() -> None:
     print(f"Loaded reward config from {reward_config.source_path} "
           f"(reward_version={reward_config.reward_version})")
     print(f"Seed: {seed}")
-    print(f"Maneuver subset ({len(maneuver_ids)}): {maneuver_ids}")
-
-    specs_by_id = {s.maneuver_id: s for s in all_train_specs}
-    missing = [m for m in maneuver_ids if m not in specs_by_id]
-    if missing:
-        raise ValueError(f"Selected maneuver_ids not found in TRAIN specs: {missing}")
-    maneuvers = [specs_by_id[m] for m in maneuver_ids]
+    if args.full_train:
+        print(
+            f"Full TRAIN pool: {len(maneuver_ids)} maneuvers; "
+            f"maneuvers_per_update={maneuvers_per_update}; "
+            f"sampling={FULL_TRAIN_SAMPLING_STRATEGY}"
+        )
+    else:
+        print(f"Maneuver subset ({len(maneuver_ids)}): {maneuver_ids}")
 
     env = MergeEnvironment(
         dataset_config_path=args.dataset_config_path,
@@ -159,6 +354,23 @@ def main() -> None:
                 f"Cannot resume {payload.dataset_schema_version!r} checkpoint "
                 f"with {MERGE_DATASET_SCHEMA!r} dataset"
             )
+        if args.full_train:
+            expected_sampling = {
+                "full_train": True,
+                "train_pool_size": EXPECTED_TRAIN_POOL_SIZE,
+                "maneuvers_per_update": maneuvers_per_update,
+                "sampling_strategy": FULL_TRAIN_SAMPLING_STRATEGY,
+            }
+            actual_sampling = {
+                key: payload.config_snapshot.get(key) for key in expected_sampling
+            }
+            if payload.seed != seed or actual_sampling != expected_sampling:
+                raise ValueError(
+                    "Full-train resume sampling contract mismatch: "
+                    f"checkpoint_seed={payload.seed}, requested_seed={seed}, "
+                    f"checkpoint_sampling={actual_sampling}, "
+                    f"requested_sampling={expected_sampling}"
+                )
         training_state = create_train_state(
             seed_state.jax_key,
             learning_rate=ppo_config.hyperparameters.learning_rate,
@@ -212,16 +424,29 @@ def main() -> None:
         "clip_epsilon": ppo_config.hyperparameters.clip_epsilon,
         "entropy_coef": ppo_config.hyperparameters.entropy_coef,
         "value_coef": ppo_config.hyperparameters.value_coef,
-        "batch_size": len(maneuvers) * args.max_episode_steps,
+        "batch_size": maneuvers_per_update * args.max_episode_steps,
         "ppo_epochs": ppo_config.hyperparameters.ppo_epochs,
         "network_layers": ppo_config.network.hidden_sizes,
         "maneuver_ids": maneuver_ids,
         "num_updates": args.num_updates,
         "resumed_from": args.resume,
+        "train_pool_size": len(maneuver_ids),
+        "maneuvers_per_update": maneuvers_per_update,
+        "full_train": args.full_train,
+        "sampling_strategy": checkpoint_config_snapshot["sampling_strategy"],
     })
 
     checkpoint_path = args.checkpoint_path or (
         f"outputs/checkpoints/train_seed{seed}_{int(time.time())}.pkl"
+    )
+    periodic_callback = make_periodic_checkpoint_callback(
+        interval=args.checkpoint_every_updates,
+        checkpoint_dir="outputs/checkpoints",
+        filename_prefix=(f"full_seed{seed}" if args.full_train else f"train_seed{seed}"),
+        seed=seed,
+        reward_version=reward_config.reward_version,
+        config_snapshot=checkpoint_config_snapshot,
+        numpy_rng=numpy_rng,
     )
 
     t0 = time.time()
@@ -238,6 +463,8 @@ def main() -> None:
         global_env_step=global_env_step,
         ppo_update_step=ppo_update_step,
         wandb_logger=wandb_logger,
+        on_update=periodic_callback,
+        maneuver_selector=maneuver_selector,
     )
     elapsed = time.time() - t0
 
@@ -249,28 +476,15 @@ def main() -> None:
 
     dataset_provenance = load_dataset_provenance()
 
-    payload = CheckpointPayload(
-        policy_params=result["training_state"].policy_state.params,
-        value_params=result["training_state"].value_state.params,
-        optimizer_state={
-            "policy": result["training_state"].policy_state.opt_state,
-            "value": result["training_state"].value_state.opt_state,
-        },
-        jax_rng_key=result["rng_key"],
+    payload = _build_checkpoint_payload(
+        training_state=result["training_state"],
+        rng_key=result["rng_key"],
+        numpy_rng=numpy_rng,
         global_env_step=result["global_env_step"],
         ppo_update_step=result["ppo_update_step"],
         seed=seed,
-        config_snapshot={
-            "ppo_config_path": ppo_config.source_path,
-            "reward_config_path": reward_config.source_path,
-            "hyperparameters": dataclasses.asdict(ppo_config.hyperparameters),
-            "network_hidden_sizes": list(ppo_config.network.hidden_sizes),
-            "maneuver_ids": maneuver_ids,
-        },
+        config_snapshot=checkpoint_config_snapshot,
         reward_version=reward_config.reward_version,
-        git_sha=get_git_sha(),
-        numpy_rng_state=numpy_rng.get_state(),
-        dataset_schema_version=MERGE_DATASET_SCHEMA,
     )
     save_checkpoint(payload, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
