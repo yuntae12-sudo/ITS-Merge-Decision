@@ -31,7 +31,7 @@ from src.visualization.ppo_rollout import (
     run_ppo_episode,
 )
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 # Same real maneuver used by tests/training/test_rollout.py (duplicated
 # by value, matching that file's own stated convention).
@@ -128,7 +128,7 @@ def test_restore_ppo_checkpoint_reconstructs_network_from_config_snapshot(fresh_
     assert restored.network_hidden_sizes == [256, 64, 32]
     assert restored.maneuver_ids == ["MAN_0001", "MAN_CAUSALITY"]
     assert restored.seed == 0
-    assert restored.reward_version == "v0"
+    assert restored.reward_version == "v1"
     assert restored.global_env_step == 123
     assert restored.ppo_update_step == 1
     assert isinstance(restored.policy, PPOPolicy)

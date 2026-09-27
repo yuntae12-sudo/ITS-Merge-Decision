@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-TRAIN_EVIDENCE = "data/manifests/v2/evidence_training.jsonl"
+TRAIN_EVIDENCE = "data/manifests/evidence_training.jsonl"
 AUGMENTED_EVIDENCE = "outputs/merge_v2_decision_audit_v2/training_decision_evidence_augmented.jsonl"
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
 DT_S = 0.1

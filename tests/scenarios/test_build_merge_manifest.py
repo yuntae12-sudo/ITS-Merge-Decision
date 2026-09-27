@@ -6,8 +6,8 @@ arrays for a hand-built scene) that flows through the REAL pipeline
 functions (`extract_lane_polylines`, `assign_ego_lane_sequence`,
 `compute_stable_lane_sequence`, `find_lane_transitions`, `detect_merge`,
 `materialize_merge_features`) -- following the same synthetic-geometry
-style as test_merge_detector.py / test_scenario_features.py /
-test_validation_viz.py, rather than depending on real WOMD data.
+style as test_merge_detector.py / test_scenario_features.py,
+rather than depending on real WOMD data.
 """
 
 import sys

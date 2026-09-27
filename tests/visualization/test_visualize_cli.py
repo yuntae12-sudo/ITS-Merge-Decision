@@ -1,4 +1,4 @@
-"""Tests for scripts/visualization/visualize_ppo_run.py's CLI argument
+"""Tests for scripts/visualize_ppo.py's CLI argument
 wiring (PPO Visualization Default-5 Extension, task spec Section 9):
 --scan-only/--render-all mutual exclusivity, and that an explicit
 --maneuver-ids scope is never truncated by the default per-outcome
@@ -13,11 +13,11 @@ import sys
 import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-SCRIPT_PATH = os.path.join(REPO_ROOT, "scripts", "visualization", "visualize_ppo_run.py")
+SCRIPT_PATH = os.path.join(REPO_ROOT, "scripts", "visualize_ppo.py")
 
 
 def _load_module():
-    spec = importlib.util.spec_from_file_location("visualize_ppo_run", SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location("visualize_ppo", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.path.insert(0, REPO_ROOT)
     spec.loader.exec_module(module)

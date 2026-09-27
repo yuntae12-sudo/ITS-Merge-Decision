@@ -53,7 +53,7 @@ run_split() {
       --dataset-config "$dataset_config" \
       --scenario-proto "${proto_paths[@]}" \
       --transitions-csv "$candidates_csv" \
-      --phase1-config configs/phase1_merge.yaml \
+      --phase1-config configs/merge.yaml \
       --output "$output" \
       --review-dir "$review_dir" \
       2>&1 | tee -a "$log_file"; then
@@ -65,7 +65,7 @@ run_split() {
 }
 
 run_split training \
-  outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml \
+  configs/dataset.yaml \
   outputs/phase1/stage_b0_verify/merge_candidates_training_10shard_postfix.csv \
   data/manifests/v2/required_scenario_proto_shards_training.txt
 

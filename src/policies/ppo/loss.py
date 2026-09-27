@@ -14,7 +14,7 @@ while value loss uses the full physical trajectory. P3 validates the
 loss math itself in isolation (synthetic batches, no ``policy_mask``
 plumbing yet -- that lands with the real rollout in P4).
 
-Baseline (not-tuned) coefficients live in ``configs/ppo/ppo_base.yaml``
+Baseline (not-tuned) coefficients live in ``configs/ppo/train.yaml``
 (SS6): ``clip_epsilon=0.2``, ``value_coef=0.5``, ``entropy_coef=0.01``.
 """
 

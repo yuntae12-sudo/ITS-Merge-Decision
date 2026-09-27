@@ -111,7 +111,7 @@ def test_optional_provenance_keys_declared():
 
 def test_load_dataset_provenance_matches_freeze_json():
     provenance = load_dataset_provenance()
-    with open("data/manifests/v2/MERGE_DECISION_DATASET_V2_FREEZE.json", encoding="utf-8") as f:
+    with open("data/manifests/freeze.json", encoding="utf-8") as f:
         raw = json.load(f)
 
     assert provenance.version == raw["version"]
@@ -131,7 +131,7 @@ def test_provenance_not_hardcoded_a_second_time():
     from src.training import provenance as provenance_module
 
     source = inspect.getsource(provenance_module)
-    with open("data/manifests/v2/MERGE_DECISION_DATASET_V2_FREEZE.json", encoding="utf-8") as f:
+    with open("data/manifests/freeze.json", encoding="utf-8") as f:
         raw = json.load(f)
 
     assert raw["filter_config_sha256"] not in source

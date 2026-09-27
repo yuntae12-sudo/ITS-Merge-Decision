@@ -38,7 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-TRAIN_EVIDENCE = "data/manifests/v2/evidence_training.jsonl"
+TRAIN_EVIDENCE = "data/manifests/evidence_training.jsonl"
 OUT_DIR = Path("outputs/merge_v2_decision_audit")
 DT_S = 0.1  # WOMD/Waymax fixed timestep (src/environment/merge_environment.py)
 

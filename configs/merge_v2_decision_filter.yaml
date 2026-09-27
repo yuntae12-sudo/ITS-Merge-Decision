@@ -5,7 +5,7 @@
 # Decision Dataset eligibility and tiering ONLY -- it never feeds back into
 # classify_v2_merge or automatic_decision.
 #
-# Frozen exclusively against TRAIN (data/manifests/v2/evidence_training.jsonl).
+# Frozen exclusively against TRAIN (data/manifests/evidence_training.jsonl).
 # VALIDATION is applied with these exact criteria, never re-tuned against it.
 
 version: "1.0"
@@ -14,9 +14,9 @@ source_git_sha: "e4c44c9e1466007db7d986eb63b7ee8a587a7753"
 source_branch: "exp/ppo-p6-tuning"
 
 source_evidence:
-  train: "data/manifests/v2/evidence_training.jsonl"
+  train: "data/manifests/evidence_training.jsonl"
   train_augmented_source_front: "outputs/merge_v2_decision_audit_v2/training_decision_evidence_augmented.jsonl"
-  validation: "data/manifests/v2/evidence_validation.jsonl"
+  validation: "data/manifests/evidence_validation.jsonl"
   validation_augmented_source_front: "outputs/merge_v2_decision_audit_v2/validation_decision_evidence_augmented.jsonl"
 
 # Merge-context eligibility (Phase B). Grounded directly in

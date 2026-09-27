@@ -38,7 +38,7 @@ explicit distinct path or ``--overwrite``). Always pass an explicit
 is unique per run, e.g.:
 
     python scripts/extract_merge_scenes.py \\
-        --dataset-config outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml \\
+        --dataset-config configs/dataset.yaml \\
         --output outputs/phase1/training_10shard_pilot/merge_candidates_training_10shard.csv \\
         --summary-dir outputs/phase1/training_10shard_pilot
 
@@ -73,7 +73,7 @@ from src.scenarios.scenario_loader import (
 )
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
-DEFAULT_PHASE1_CONFIG = "configs/phase1_merge.yaml"
+DEFAULT_PHASE1_CONFIG = "configs/merge.yaml"
 DEFAULT_OUTPUT = "data/manifests/merge_candidates.csv"
 DEFAULT_SUMMARY_DIR = "outputs/phase1/summaries"
 

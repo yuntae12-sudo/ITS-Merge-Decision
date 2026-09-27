@@ -110,7 +110,7 @@ def test_assign_lane_rejects_heading_mismatch_despite_proximity():
     (e.g. a crossing lane at an intersection) must be rejected in favor
     of a farther lane whose heading actually matches ego -- this is the
     real-world failure mode observed at WOMD intersections during
-    threshold selection (see configs/phase1_merge.yaml).
+    threshold selection (see configs/merge.yaml).
     """
 
     close_crossing_lane = _make_vertical_lane(1, x=10.0)

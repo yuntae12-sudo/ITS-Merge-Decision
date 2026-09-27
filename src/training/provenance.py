@@ -11,7 +11,7 @@ import dataclasses
 import json
 
 
-DEFAULT_FREEZE_METADATA_PATH = "data/manifests/v2/MERGE_DECISION_DATASET_V2_FREEZE.json"
+DEFAULT_FREEZE_METADATA_PATH = "data/manifests/freeze.json"
 
 
 @dataclasses.dataclass(frozen=True)

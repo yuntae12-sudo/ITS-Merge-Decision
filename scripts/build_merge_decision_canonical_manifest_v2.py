@@ -33,8 +33,8 @@ TIER_FILES = {
     "validation": "data/manifests/v2/merge_decision_validation_candidates_v2.csv",
 }
 EVIDENCE_FILES = {
-    "training": "data/manifests/v2/evidence_training.jsonl",
-    "validation": "data/manifests/v2/evidence_validation.jsonl",
+    "training": "data/manifests/evidence_training.jsonl",
+    "validation": "data/manifests/evidence_validation.jsonl",
 }
 OUT_DIR = Path("data/manifests/v2")
 

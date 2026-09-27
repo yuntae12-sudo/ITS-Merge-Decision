@@ -197,7 +197,7 @@ def test_episode_summary_fields(tmp_path):
 
 def test_manifest_contains_required_fields():
     restored = RestoredPPOCheckpoint(
-        checkpoint_path="outputs/ppo_checkpoints/fake.pkl",
+        checkpoint_path="outputs/checkpoints/fake.pkl",
         payload=None,
         policy=None,
         value_network=None,
@@ -209,8 +209,8 @@ def test_manifest_contains_required_fields():
         checkpoint_git_sha="abc123",
         global_env_step=100,
         ppo_update_step=5,
-        reward_config_path="configs/reward/merge_reward_v0.yaml",
-        ppo_config_path="configs/ppo/ppo_p6_baseline.yaml",
+        reward_config_path="configs/reward.yaml",
+        ppo_config_path="configs/ppo/train.yaml",
     )
 
     manifest = build_manifest(
@@ -244,12 +244,12 @@ def test_manifest_contains_required_fields():
 
 def test_manifest_render_policy_modes():
     restored = RestoredPPOCheckpoint(
-        checkpoint_path="outputs/ppo_checkpoints/fake.pkl",
+        checkpoint_path="outputs/checkpoints/fake.pkl",
         payload=None, policy=None, value_network=None, value_params=None,
         network_hidden_sizes=[256, 64, 32], maneuver_ids=["MAN_0001"], seed=0,
         reward_version="v0", checkpoint_git_sha="abc123", global_env_step=100,
-        ppo_update_step=5, reward_config_path="configs/reward/merge_reward_v0.yaml",
-        ppo_config_path="configs/ppo/ppo_p6_baseline.yaml",
+        ppo_update_step=5, reward_config_path="configs/reward.yaml",
+        ppo_config_path="configs/ppo/train.yaml",
     )
 
     for render_policy in (

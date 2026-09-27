@@ -54,7 +54,7 @@ def build_outcome_index(episode_results: List[PPOEpisodeResult]) -> List[Outcome
     the SAME order ``episode_results`` was produced (callers are
     responsible for iterating maneuvers in sorted maneuver_id order so
     this stays deterministic/reproducible -- see
-    ``scripts/visualization/visualize_ppo_run.py``)."""
+    ``scripts/visualize_ppo.py``)."""
 
     schemas = {
         result.steps[0].dataset_schema_version

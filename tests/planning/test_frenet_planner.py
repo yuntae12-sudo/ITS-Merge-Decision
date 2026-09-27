@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from src.environment.behavior_action import BehaviorAction, BehaviorObjective
-from src.environment.full_split_evaluator import load_maneuver_specs
+from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
 from src.environment.merge_environment import MergeEnvironment
 from src.planning.candidate_evaluator import CurrentAgentState, PlannerStatus
 from src.planning.frenet_planner import (
@@ -27,7 +27,7 @@ from src.planning.frenet_planner import (
 from src.planning.reference import ReferenceLine
 from src.scenarios.lane_geometry import LanePolyline, compute_arc_length
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 
 def _make_polyline(xy: np.ndarray, lane_id: int = 1) -> LanePolyline:
@@ -285,7 +285,7 @@ def real_maneuver_fixture():
     whose scene/lanes reset successfully -- mirrors the loading
     pattern in scripts/audit_phase3_frenet_transform.py."""
 
-    specs = load_maneuver_specs("train")
+    specs = load_decision_dataset_maneuver_specs("train")
     env = MergeEnvironment(dataset_config_path=DATASET_CONFIG_PATH)
 
     for spec in specs[:15]:

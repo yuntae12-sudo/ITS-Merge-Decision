@@ -67,7 +67,7 @@ from src.scenarios.scenario_loader import (
 )
 
 DEFAULT_DATASET_CONFIG = "configs/dataset.yaml"
-DEFAULT_PHASE1_CONFIG = "configs/phase1_merge.yaml"
+DEFAULT_PHASE1_CONFIG = "configs/merge.yaml"
 DEFAULT_CANDIDATES = "data/manifests/merge_candidates.csv"
 DEFAULT_LABELS = "data/manifests/merge_manual_labels.csv"
 DEFAULT_MANIFEST_OUTPUT = "data/manifests/merge_manifest.csv"

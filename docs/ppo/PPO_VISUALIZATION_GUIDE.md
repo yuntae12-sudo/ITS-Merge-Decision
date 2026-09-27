@@ -58,7 +58,7 @@ so a reader can never confuse it with a training-time rollout replay.
 ## 4. Basic usage
 
 ```bash
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl
 ```
 
@@ -85,18 +85,18 @@ Rendering more, or none at all:
 
 ```bash
 # Render EVERY evaluated episode per outcome (not just the first 5)
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl \
   --render-all
 
 # Outcome scan only -- outcome_index.csv + selected_episodes.json, no
 # GIF/figure rendering at all (fast iteration)
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl \
   --scan-only
 
 # Raise/lower the default per-outcome cap (ignored with --render-all/--scan-only)
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl \
   --max-per-outcome 10
 ```
@@ -110,25 +110,25 @@ Other useful invocations:
 # Specific maneuvers only -- an explicit --maneuver-ids scope always
 # renders EVERY one of the maneuvers you named (never truncated by the
 # default per-outcome cap, even if several of them share an outcome)
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl \
   --scope explicit --maneuver-ids MAN_0001,MAN_0002
 
 # Stochastic policy (categorical sampling), fixed seed for reproducibility
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl \
   --policy-mode stochastic --policy-seed 0
 
 # Explicit VALIDATION evaluation (never automatic -- see Section 5 of
 # docs/ppo/P6_EXPERIMENT_GUIDE.md: canonical VAL is reserved for a
 # final, already-decided model, never for picking between experiments)
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl \
   --scope split --split validation
 
 # Force additional specific maneuver(s) into the collision selection
 # (added to, never replacing, the default/--render-all picks)
-PYTHONPATH=. python scripts/visualization/visualize_ppo_run.py \
+PYTHONPATH=. python scripts/visualize_ppo.py \
   --checkpoint outputs/ppo_checkpoints/p6_baseline_50m_50u_100s_seed0.pkl \
   --select-collision MAN_0071
 ```

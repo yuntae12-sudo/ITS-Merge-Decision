@@ -1,14 +1,10 @@
 """Rendering (GIF / trace.png / rollout_4panel.png) for one PPO
 visualization episode (docs/ppo/PPO_VISUALIZATION_GUIDE.md).
 
-Reuses this repo's existing Phase-3 figure conventions
-(``scripts/figures/_style.py``'s colors/oriented-box drawing) so PPO
-visualization figures use the same visual language as the existing
-paper/PPT figures, rather than inventing a new one. VISUALIZATION-ONLY:
-every plotted value comes from a real ``PPOStepRecord``
-(``src.visualization.ppo_rollout``) captured during an actual
-``MergeEnvironment`` rollout -- nothing here generates or interpolates
-trajectory/observation/metric data.
+VISUALIZATION-ONLY: every plotted value comes from a real
+``PPOStepRecord`` (``src.visualization.ppo_rollout``) captured during
+an actual ``MergeEnvironment`` rollout -- nothing here generates or
+interpolates trajectory/observation/metric data.
 """
 
 import os
@@ -22,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
-from scripts.figures import _style
+from src.visualization import style as _style
 from src.visualization.ppo_rollout import PPOEpisodeResult, PPOStepRecord
 
 _HALF_WINDOW_M = 22.0

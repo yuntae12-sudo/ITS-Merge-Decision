@@ -10,8 +10,6 @@ the 14D vector itself.
 Uses REAL WOMD scenes (same convention as test_merge_environment.py).
 """
 
-import csv
-
 import numpy as np
 import pytest
 import yaml
@@ -23,9 +21,10 @@ from src.environment.observation_builder import (
     OBSERVATION_FIELD_NAMES,
     TTC_CAP_S,
 )
-from src.environment.full_split_evaluator import load_maneuver_specs
+from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
+VALIDATION_DATASET_CONFIG_PATH = "configs/dataset_validation.yaml"
 COMMON_STATE_CONFIG_PATH = "configs/phase2_common_state.yaml"
 
 SINGLE_MANEUVER = ManeuverSpec(
@@ -60,6 +59,16 @@ def env():
 
 
 @pytest.fixture(scope="module")
+def validation_env():
+    """Separate env for VALIDATION-split resets: Waymax's
+    DatasetExpansionConfig binds one fixed physical split per config,
+    so TRAIN and VALIDATION shards cannot be mixed into a single
+    configs/dataset.yaml."""
+
+    return MergeEnvironment(dataset_config_path=VALIDATION_DATASET_CONFIG_PATH)
+
+
+@pytest.fixture(scope="module")
 def common_state_config():
     with open(COMMON_STATE_CONFIG_PATH) as f:
         return yaml.safe_load(f)
@@ -89,17 +98,41 @@ def test_ttc_cap_matches_frozen_config(common_state_config):
 
 
 # ======================================================================
-# B3: presence / TTC sentinel semantics, exhaustively over full TRAIN
+# B3: presence / TTC sentinel semantics over a deterministic representative
+# sample (fast targeted runs) + an exhaustive full-dataset variant (slow)
 # ======================================================================
 
+_SAMPLE_STRIDE = 50  # mid-section coverage stride for the fast sample.
 
-def test_presence_gated_slots_use_documented_sentinels_across_train(env):
-    """Exhaustive check (all 110 TRAIN maneuvers' reset observation):
-    whenever a presence flag is 0, the corresponding gap/relative-speed
-    is exactly 0.0 and TTC is exactly TTC_CAP_S -- matching
-    configs/phase2_common_state.yaml's documented sentinel semantics."""
 
-    specs = load_maneuver_specs("train")
+def _representative_sample(specs, stride=_SAMPLE_STRIDE):
+    """Deterministic representative subset of a maneuver-spec list:
+    first, last, an even stride through the middle, and at least one
+    spec per distinct source_shard -- so the fast targeted sample
+    exercises multiple physical scenes/shards, not just one repeated
+    shard's geometry, while staying real-env-cheap. ``specs`` must
+    already be in the loader's own stable sorted order (it is, per
+    load_decision_dataset_maneuver_specs's CSV row order)."""
+
+    if not specs:
+        return []
+
+    sample_by_id = {}
+    sample_by_id[specs[0].maneuver_id] = specs[0]
+    sample_by_id[specs[-1].maneuver_id] = specs[-1]
+    for spec in specs[::stride]:
+        sample_by_id[spec.maneuver_id] = spec
+
+    seen_shards = set()
+    for spec in specs:
+        if spec.source_shard not in seen_shards:
+            seen_shards.add(spec.source_shard)
+            sample_by_id[spec.maneuver_id] = spec
+
+    return [sample_by_id[m] for m in sorted(sample_by_id)]
+
+
+def _assert_presence_gated_sentinels(env, specs):
     slot_indices = {
         "target_front": (2, 3, 4, 5),
         "target_rear": (6, 7, 8, 9),
@@ -114,6 +147,28 @@ def test_presence_gated_slots_use_documented_sentinels_across_train(env):
                 assert observation[gap_i] == 0.0, (spec.maneuver_id, slot)
                 assert observation[rel_i] == 0.0, (spec.maneuver_id, slot)
                 assert observation[ttc_i] == TTC_CAP_S, (spec.maneuver_id, slot)
+
+
+def test_presence_gated_slots_use_documented_sentinels_across_train_sample(env):
+    """Deterministic representative TRAIN sample (first/last/stride/
+    per-shard, see _representative_sample): whenever a presence flag is
+    0, the corresponding gap/relative-speed is exactly 0.0 and TTC is
+    exactly TTC_CAP_S -- matching configs/phase2_common_state.yaml's
+    documented sentinel semantics. See the @pytest.mark.slow variant
+    below for the exhaustive full-TRAIN check."""
+
+    specs = _representative_sample(load_decision_dataset_maneuver_specs("train"))
+    _assert_presence_gated_sentinels(env, specs)
+
+
+@pytest.mark.slow
+def test_presence_gated_slots_use_documented_sentinels_across_train_full(env):
+    """Exhaustive version of the sampled check above -- every TRAIN
+    maneuver in the final dataset (1097 real env resets); not run by
+    default targeted test commands (see pytest.ini's `slow` marker)."""
+
+    specs = load_decision_dataset_maneuver_specs("train")
+    _assert_presence_gated_sentinels(env, specs)
 
 
 # ======================================================================
@@ -185,20 +240,45 @@ def test_observation_reflects_active_transition_after_chain_advance(env):
 
 
 # ======================================================================
-# B6: numerical validity across all 168 canonical maneuvers
+# B6: numerical validity across the full final TRAIN+VALIDATION dataset
 # ======================================================================
 
 
-def test_all_168_canonical_maneuvers_reset_to_valid_14d_observation(env):
-    train_specs = load_maneuver_specs("train")
-    validation_specs = load_maneuver_specs("validation")
+def _assert_valid_14d_reset(env, split_name, specs):
+    for spec in specs:
+        observation, info = env.reset(spec)
+        assert observation.shape == (14,), (split_name, spec.maneuver_id)
+        assert np.all(np.isfinite(observation)), (split_name, spec.maneuver_id)
+        assert info["decision_start_frame"] is not None
 
-    for split_name, specs in (("train", train_specs), ("validation", validation_specs)):
-        for spec in specs:
-            observation, info = env.reset(spec)
-            assert observation.shape == (14,), (split_name, spec.maneuver_id)
-            assert np.all(np.isfinite(observation)), (split_name, spec.maneuver_id)
-            assert info["decision_start_frame"] is not None
+
+def test_canonical_maneuver_sample_resets_to_valid_14d_observation(env, validation_env):
+    """Deterministic representative TRAIN+VALIDATION sample (see
+    @pytest.mark.slow variant below for the exhaustive full-dataset,
+    1485-maneuver check). TRAIN and VALIDATION specs are reset against
+    separate envs -- Waymax binds one fixed physical split per
+    DatasetExpansionConfig, so the two shard pools cannot share a
+    single MergeEnvironment instance."""
+
+    train_specs = _representative_sample(load_decision_dataset_maneuver_specs("train"))
+    validation_specs = _representative_sample(load_decision_dataset_maneuver_specs("validation"))
+
+    _assert_valid_14d_reset(env, "train", train_specs)
+    _assert_valid_14d_reset(validation_env, "validation", validation_specs)
+
+
+@pytest.mark.slow
+def test_all_canonical_maneuvers_reset_to_valid_14d_observation_full(env, validation_env):
+    """Exhaustive version of the sampled check above -- every TRAIN
+    (1097) + VALIDATION (388) maneuver in the final dataset, 1485 real
+    env resets total; not run by default targeted test commands (see
+    pytest.ini's `slow` marker)."""
+
+    train_specs = load_decision_dataset_maneuver_specs("train")
+    validation_specs = load_decision_dataset_maneuver_specs("validation")
+
+    _assert_valid_14d_reset(env, "train", train_specs)
+    _assert_valid_14d_reset(validation_env, "validation", validation_specs)
 
 
 # ======================================================================
@@ -238,22 +318,3 @@ def test_behavior_executor_only_reads_documented_indices():
     # dimensions -- no index >= 14 or negative.
     assert accessed_indices, "expected compute_objective to read some observation indices"
     assert all(0 <= i < OBSERVATION_DIM for i in accessed_indices)
-
-
-# ======================================================================
-# B10: dataset-difficulty descriptors must reuse the SAME 14D values,
-# never a second independent definition of the same concept
-# ======================================================================
-
-
-def test_dataset_difficulty_descriptors_reuse_frozen_14d_field_names():
-    """The dataset descriptor CSV's physical-feature column names must
-    be an exact superset match against OBSERVATION_FIELD_NAMES for the
-    overlapping concepts (Section 29's explicit anti-duplication
-    requirement)."""
-
-    with open("data/manifests/phase2_dataset_difficulty.csv", newline="") as f:
-        fieldnames = set(next(csv.reader(f)))
-
-    overlapping = set(OBSERVATION_FIELD_NAMES)
-    assert overlapping.issubset(fieldnames), overlapping - fieldnames

@@ -334,7 +334,7 @@ JSON(`merge_scan_summary.json`)을 쓴다. Stage B에서는 이 summary가 고�
 
 ```bash
 python scripts/extract_merge_scenes.py \
-    --dataset-config outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml \
+    --dataset-config configs/dataset.yaml \
     --output outputs/phase1/training_10shard_pilot/merge_candidates_training_10shard.csv \
     --summary-dir outputs/phase1/training_10shard_pilot
 

@@ -43,9 +43,9 @@ from waymax.utils import geometry as waymax_geometry
 
 from src.scenarios.scenario_loader import build_waymax_config, iter_scenarios, load_dataset_config
 
-TRAIN_EVIDENCE = "data/manifests/v2/evidence_training.jsonl"
+TRAIN_EVIDENCE = "data/manifests/evidence_training.jsonl"
 DECISION_AUDIT_CSV = "outputs/merge_v2_decision_audit/training_decision_relevance.csv"
-DATASET_CONFIG = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG = "configs/dataset.yaml"
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
 EXISTING_GIF_ROOT = Path("outputs/merge_v2_calibration/human_review_rollouts")
 

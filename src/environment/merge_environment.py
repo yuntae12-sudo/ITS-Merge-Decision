@@ -87,7 +87,7 @@ from src.scenarios.scenario_features import (
     load_agent_selection_config,
 )
 from src.scenarios.merge_v2 import (
-    DATASET_SCHEMA_MERGE_DECISION_V2,
+    MERGE_DATASET_SCHEMA,
     DATASET_SCHEMA_V2,
     LEGACY_DATASET_SCHEMA,
 )
@@ -98,7 +98,7 @@ from src.scenarios.scenario_loader import (
     select_single_shard_for_inspection,
 )
 
-DEFAULT_MERGE_CONFIG_PATH = "configs/phase1_merge.yaml"
+DEFAULT_MERGE_CONFIG_PATH = "configs/merge.yaml"
 DEFAULT_DOWNSTREAM_CONFIG_PATH = "configs/phase3_downstream.yaml"
 
 # Stage 3-F fallback command (see step()'s frenet_mpc branch and
@@ -173,7 +173,7 @@ class ManeuverSpec:
                 raise ValueError(
                     f"v2 maneuver {self.maneuver_id} has no relevant vehicle interaction"
                 )
-        elif expected == DATASET_SCHEMA_MERGE_DECISION_V2:
+        elif expected == MERGE_DATASET_SCHEMA:
             # Decision-context contract (Merge Context Validity +
             # Decision Relevance) -- deliberately does NOT require
             # manual_validation == CONFIRMED_MERGE or a relevant
@@ -253,7 +253,7 @@ class ManeuverSpec:
             ],
             candidate_ids=[maneuver_row["candidate_id"]],
             merge_start_frame=int(interaction_evidence["commit_frame"]),
-            schema_version=DATASET_SCHEMA_MERGE_DECISION_V2,
+            schema_version=MERGE_DATASET_SCHEMA,
             maneuver_type=None,
             manual_validation=None,
             topology_evidence=topology_evidence,

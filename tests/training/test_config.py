@@ -18,7 +18,7 @@ from src.training.seeding import make_seed_state, split_key
 
 
 def test_load_ppo_base_config():
-    config = load_ppo_config("configs/ppo/ppo_base.yaml")
+    config = load_ppo_config("configs/ppo/train.yaml")
     assert isinstance(config, PPOConfig)
     assert config.network.observation_dim == 14
     assert config.network.num_actions == 4
@@ -34,7 +34,7 @@ def test_load_ppo_base_config():
 
 
 def test_load_ppo_smoke_config():
-    config = load_ppo_config("configs/ppo/ppo_smoke.yaml")
+    config = load_ppo_config("configs/ppo/smoke.yaml")
     assert isinstance(config, PPOConfig)
     assert config.smoke is not None
     assert config.smoke.max_maneuvers >= 1
@@ -42,10 +42,9 @@ def test_load_ppo_smoke_config():
     assert config.rollout.downstream_mode == "frenet_mpc"
 
 
-def test_load_reward_v0_config():
-    config = load_reward_config("configs/reward/merge_reward_v0.yaml")
+def test_load_reward_config():
+    config = load_reward_config("configs/reward.yaml")
     assert isinstance(config, RewardConfig)
-    assert config.reward_version == "v0"
     assert config.terminal.success == 1.0
     assert config.terminal.failure_collision == -1.0
     assert config.terminal.failure_offroad == -1.0
@@ -53,16 +52,20 @@ def test_load_reward_v0_config():
     assert config.terminal.none == 0.0
     assert config.decision_cost.real_decision_step == -0.01
     assert config.decision_cost.auto_execution_step == 0.0
+    assert config.decision_cost.enabled is False
+    assert config.safety is not None
+    assert config.progress is not None
+    assert config.decision is not None
 
 
 def test_ppo_config_reward_path_resolves():
-    ppo_config = load_ppo_config("configs/ppo/ppo_base.yaml")
+    ppo_config = load_ppo_config("configs/ppo/train.yaml")
     reward_config = load_reward_config(ppo_config.reward_config_path)
-    assert reward_config.reward_version == "v0"
+    assert reward_config.reward_version == "v1"
 
 
 def test_config_values_are_finite():
-    config = load_ppo_config("configs/ppo/ppo_base.yaml")
+    config = load_ppo_config("configs/ppo/train.yaml")
     h = config.hyperparameters
     for value in (
         h.learning_rate,

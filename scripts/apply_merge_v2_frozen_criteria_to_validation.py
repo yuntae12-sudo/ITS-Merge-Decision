@@ -24,7 +24,7 @@ import scripts.recompute_merge_v2_kfm_discriminability as kfm_mod
 import scripts.classify_merge_v2_context_eligibility as elig_mod
 import scripts.assign_merge_v2_decision_tiers as tier_mod
 
-VALIDATION_EVIDENCE = "data/manifests/v2/evidence_validation.jsonl"
+VALIDATION_EVIDENCE = "data/manifests/evidence_validation.jsonl"
 VALIDATION_AUGMENTED = "outputs/merge_v2_decision_audit_v2/validation_decision_evidence_augmented.jsonl"
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
 EXPECTED_COUNT = 2006

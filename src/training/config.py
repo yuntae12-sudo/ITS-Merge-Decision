@@ -173,14 +173,12 @@ class RewardDecisionRegularizerConfig:
 
 @dataclasses.dataclass(frozen=True)
 class RewardConfig:
-    """One fully-parsed reward config (``configs/reward/*.yaml``).
+    """One fully-parsed reward config (``configs/reward.yaml``).
 
-    ``safety``/``progress``/``decision`` are ``None`` for a V0 config
-    (``configs/reward/merge_reward_v0.yaml`` has no such keys) --
-    ``src.rewards.merge_reward`` treats a ``None`` component as
-    contributing exactly 0.0, so V0's existing ``R = terminal +
-    decision_cost`` behavior is completely unchanged when this field is
-    absent. A V1 config populates all three.
+    ``safety``/``progress``/``decision`` are ``Optional`` at the
+    dataclass level (``src.rewards.merge_reward`` treats a ``None``
+    component as contributing exactly 0.0) but the final canonical
+    config always populates all three.
     """
 
     reward_version: str
@@ -192,7 +190,7 @@ class RewardConfig:
     decision: Optional[RewardDecisionRegularizerConfig] = None
 
 
-def load_ppo_config(path: str = "configs/ppo/ppo_base.yaml") -> PPOConfig:
+def load_ppo_config(path: str = "configs/ppo/train.yaml") -> PPOConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
@@ -242,7 +240,7 @@ def load_ppo_config(path: str = "configs/ppo/ppo_base.yaml") -> PPOConfig:
     )
 
 
-def load_reward_config(path: str = "configs/reward/merge_reward_v0.yaml") -> RewardConfig:
+def load_reward_config(path: str = "configs/reward.yaml") -> RewardConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 

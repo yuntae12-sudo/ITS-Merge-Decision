@@ -12,21 +12,25 @@ import enum
 from typing import Optional, Tuple
 
 
+# Historical dataset-construction schema tags. Only ManeuverSpec.
+# from_csv_row (legacy-format CSV loader, still used to reconstruct
+# the intermediate candidate pool feeding the final dataset's own
+# construction chain -- see scripts/build_merge_manifest.py/
+# extract_merge_scenes.py) and ManeuverSpec.require_schema's matching
+# branches ever assign/check these; the final PPO/visualization
+# runtime path uses MERGE_DATASET_SCHEMA exclusively.
 DATASET_SCHEMA_V2 = "merge_interaction_v2"
 LEGACY_DATASET_SCHEMA = "merge_geometry_v1_legacy"
 
-DATASET_SCHEMA_MERGE_DECISION_V2 = "merge_decision_v2"
-"""Final MERGE Decision Dataset v2's PPO decision-context contract
-(data/manifests/v2/merge_decision_*_v2.csv). Distinct from
-``DATASET_SCHEMA_V2``: that schema's ``require_schema`` contract
-requires ``manual_validation == CONFIRMED_MERGE`` and >=1 relevant
-interaction vehicle, because it selects episodes where ego actually
-completed a manually-confirmed merge. This decision dataset selects
-episodes by Merge Context Validity + Decision Relevance instead (a
-maneuver is a valid PPO decision context -- e.g. a KEEP-only
-WEAK_INTERACTION case with no interaction vehicle at all -- without
-ever having been manually reviewed), so it must not be forced through
-the CONFIRMED_MERGE-only contract."""
+MERGE_DATASET_SCHEMA = "merge_decision"
+"""The final MERGE Dataset's PPO decision-context contract
+(data/manifests/merge_*.csv, data/manifests/freeze.json). Selects
+episodes by Merge Context Validity + Decision Relevance (a maneuver is
+a valid PPO decision context -- e.g. a KEEP-only WEAK_INTERACTION case
+with no interaction vehicle at all -- without ever having been
+manually reviewed); deliberately does NOT require manual_validation ==
+CONFIRMED_MERGE or a relevant interaction vehicle, unlike the
+historical DATASET_SCHEMA_V2 contract above."""
 
 
 class ManeuverType(enum.Enum):

@@ -11,7 +11,7 @@ which cannot be meaningfully exercised without a real
 SimulatorState/roadgraph. This matches how
 scripts/inspect_merge_candidate.py and similar Phase 1 CLIs already
 depend on local WOMD data being present -- these tests will fail (not
-skip) if outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml
+skip) if configs/dataset.yaml
 and the shards it points to are not present locally.
 """
 
@@ -21,7 +21,7 @@ import pytest
 from src.environment.behavior_action import BehaviorAction
 from src.environment.merge_environment import MergeEnvironment, ManeuverSpec
 
-DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 # A real single-candidate (non-chained) HIGH-confidence maneuver from
 # the training pool: training_tfexample.tfrecord-00000-of-01000#12,

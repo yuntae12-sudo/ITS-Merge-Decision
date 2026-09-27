@@ -1,16 +1,10 @@
-"""Visualization <-> merge_decision_v2 checkpoint compatibility.
+"""Visualization <-> final MERGE Dataset checkpoint compatibility.
 
-scripts/visualize_ppo_run.py previously hard-coded
-expected_dataset_schema_version=DATASET_SCHEMA_V2 (merge_interaction_v2)
-at its restore_ppo_checkpoint()/MergeEnvironment() call sites, so a
-checkpoint recorded as dataset_schema_version="merge_decision_v2"
-(e.g. outputs/ppo_checkpoints/v2_reward_v1_smoke_seed0_resumed.pkl,
-trained under the frozen final MERGE Decision Dataset v2 + Reward V1)
-was unconditionally rejected. These tests verify the checkpoint's own
-recorded schema is now the source of truth (auto-detected, never
-overwritten), routed to the correct maneuver-resolution loader, while
-merge_interaction_v2/legacy checkpoints keep working exactly as
-before."""
+scripts/visualize_ppo.py resolves a checkpoint's evaluation maneuvers
+through the checkpoint's own recorded dataset_schema_version, which
+must always be MERGE_DATASET_SCHEMA (the final canonical contract) --
+any other schema is a hard, clearly-reported error, since no other
+dataset/runtime contract exists in the final pipeline."""
 
 import dataclasses
 
@@ -18,23 +12,17 @@ import jax
 import numpy as np
 import pytest
 
-from scripts.visualization.visualize_ppo_run import _resolve_maneuvers
+from scripts.visualize_ppo import _resolve_maneuvers
 from src.policies.ppo.networks import build_policy_network, build_value_network
-from src.scenarios.merge_v2 import (
-    DATASET_SCHEMA_MERGE_DECISION_V2,
-    DATASET_SCHEMA_V2,
-    LEGACY_DATASET_SCHEMA,
-)
+from src.scenarios.merge_v2 import MERGE_DATASET_SCHEMA
 from src.training.checkpoint import CheckpointPayload, load_checkpoint, save_checkpoint
-from src.training.config import load_ppo_config, load_reward_config
+from src.training.config import load_ppo_config
 from src.visualization.ppo_checkpoint_policy import restore_ppo_checkpoint
 
-REAL_DECISION_CHECKPOINT = (
-    "outputs/ppo_checkpoints/v2_reward_v1_smoke_seed0_resumed.pkl"
-)
+REAL_SMOKE_CHECKPOINT = "outputs/checkpoints/smoke_seed0.pkl"
 
 
-def _build_checkpoint(tmp_path, dataset_schema_version, maneuver_ids, reward_version="v0"):
+def _build_checkpoint(tmp_path, dataset_schema_version, maneuver_ids, reward_version="v1"):
     ppo_config = load_ppo_config()
     rng_key = jax.random.PRNGKey(ppo_config.seed)
     policy_key, value_key = jax.random.split(rng_key)
@@ -70,70 +58,26 @@ def _build_checkpoint(tmp_path, dataset_schema_version, maneuver_ids, reward_ver
     return checkpoint_path
 
 
-# 1. merge_decision_v2 checkpoint schema accepted.
-def test_merge_decision_v2_checkpoint_schema_accepted(tmp_path):
-    checkpoint_path = _build_checkpoint(
-        tmp_path, DATASET_SCHEMA_MERGE_DECISION_V2, maneuver_ids=[]
-    )
+def test_final_dataset_checkpoint_schema_accepted(tmp_path):
+    checkpoint_path = _build_checkpoint(tmp_path, MERGE_DATASET_SCHEMA, maneuver_ids=[])
     checkpoint_schema = load_checkpoint(checkpoint_path).dataset_schema_version
     restored = restore_ppo_checkpoint(
         checkpoint_path, expected_dataset_schema_version=checkpoint_schema
     )
-    assert restored.dataset_schema_version == DATASET_SCHEMA_MERGE_DECISION_V2
+    assert restored.dataset_schema_version == MERGE_DATASET_SCHEMA
 
 
-# 2. merge_interaction_v2 checkpoint still accepted.
-def test_merge_interaction_v2_checkpoint_still_accepted(tmp_path):
-    checkpoint_path = _build_checkpoint(
-        tmp_path, DATASET_SCHEMA_V2, maneuver_ids=[]
-    )
-    checkpoint_schema = load_checkpoint(checkpoint_path).dataset_schema_version
-    restored = restore_ppo_checkpoint(
-        checkpoint_path, expected_dataset_schema_version=checkpoint_schema
-    )
-    assert restored.dataset_schema_version == DATASET_SCHEMA_V2
-
-
-# 3. schema mismatch still fails when genuinely incompatible.
 def test_genuine_schema_mismatch_still_fails(tmp_path):
-    checkpoint_path = _build_checkpoint(
-        tmp_path, DATASET_SCHEMA_MERGE_DECISION_V2, maneuver_ids=[]
-    )
+    checkpoint_path = _build_checkpoint(tmp_path, MERGE_DATASET_SCHEMA, maneuver_ids=[])
     with pytest.raises(ValueError, match="schema mismatch"):
         restore_ppo_checkpoint(
-            checkpoint_path, expected_dataset_schema_version=DATASET_SCHEMA_V2
+            checkpoint_path, expected_dataset_schema_version="some_other_schema"
         )
 
 
-# 4 + 5. checkpoint scope: decision checkpoint maneuver_ids resolve
-# (real 5-maneuver smoke checkpoint).
-def test_real_decision_checkpoint_five_maneuver_ids_resolve():
-    checkpoint_schema = load_checkpoint(REAL_DECISION_CHECKPOINT).dataset_schema_version
-    assert checkpoint_schema == DATASET_SCHEMA_MERGE_DECISION_V2
-
-    restored = restore_ppo_checkpoint(
-        REAL_DECISION_CHECKPOINT, expected_dataset_schema_version=checkpoint_schema
-    )
-    assert len(restored.maneuver_ids) == 5
-    assert restored.reward_version == "v1"
-
-    class _Args:
-        scope = "checkpoint"
-        allow_legacy_dataset = False
-        split_manifest = None
-        maneuver_table = None
-        candidate_manifest = None
-
-    maneuvers = _resolve_maneuvers(_Args(), restored)
-    assert len(maneuvers) == 5
-    missing = set(restored.maneuver_ids) - {m.maneuver_id for m in maneuvers}
-    assert missing == set()
-
-
-# 6. merge_decision_v2 uses load_decision_dataset_maneuver_specs.
-def test_decision_checkpoint_routes_through_decision_loader(monkeypatch):
+def test_decision_checkpoint_routes_through_decision_loader(monkeypatch, tmp_path):
     calls = []
-    import scripts.visualization.visualize_ppo_run as viz_mod
+    import scripts.visualize_ppo as viz_mod
 
     original = viz_mod.load_decision_dataset_maneuver_specs
 
@@ -143,108 +87,43 @@ def test_decision_checkpoint_routes_through_decision_loader(monkeypatch):
 
     monkeypatch.setattr(viz_mod, "load_decision_dataset_maneuver_specs", _spy)
 
-    checkpoint_schema = load_checkpoint(REAL_DECISION_CHECKPOINT).dataset_schema_version
-    restored = restore_ppo_checkpoint(
-        REAL_DECISION_CHECKPOINT, expected_dataset_schema_version=checkpoint_schema
-    )
-
-    class _Args:
-        scope = "checkpoint"
-        allow_legacy_dataset = False
-        split_manifest = None
-        maneuver_table = None
-        candidate_manifest = None
-
-    viz_mod._resolve_maneuvers(_Args(), restored)
-    assert len(calls) == 1
-
-
-# 7. merge_interaction_v2 uses existing load_maneuver_specs (legacy
-# path untouched -- checked via monkeypatch spy against a fake
-# restored checkpoint, no real merge_interaction_v2 manifest needed).
-def test_legacy_checkpoint_routes_through_legacy_loader(monkeypatch):
-    import scripts.visualization.visualize_ppo_run as viz_mod
-
-    calls = []
-
-    def _fake_load_maneuver_specs(*args, **kwargs):
-        calls.append((args, kwargs))
-        return []
-
-    monkeypatch.setattr(viz_mod, "load_maneuver_specs", _fake_load_maneuver_specs)
-
-    class _FakeRestored:
-        dataset_schema_version = DATASET_SCHEMA_V2
-        maneuver_ids = []
-
-    class _Args:
-        scope = "checkpoint"
-        allow_legacy_dataset = False
-        split_manifest = "data/manifests/v2/dataset_split_v2.csv"
-        maneuver_table = "data/manifests/v2/merge_maneuvers_v2.csv"
-        candidate_manifest = "data/manifests/v2/merge_manifest_v2.csv"
-
-    with pytest.raises(ValueError):
-        # empty maneuver_ids -> "no maneuver_ids recorded" ValueError,
-        # proving we reached the checkpoint-scope branch at all without
-        # ever calling load_decision_dataset_maneuver_specs.
-        viz_mod._resolve_maneuvers(_Args(), _FakeRestored())
-    assert calls == []
-
-
-# 8. MergeEnvironment receives correct required schema (unit-level:
-# verifies main()'s schema-selection logic directly rather than
-# re-running the whole CLI).
-def test_expected_schema_selection_matches_checkpoint():
-    decision_schema = load_checkpoint(REAL_DECISION_CHECKPOINT).dataset_schema_version
-    # Mirrors main()'s auto-detect branch (dataset_contract=None).
-    dataset_contract = None
-    allow_legacy_dataset = False
-    if allow_legacy_dataset:
-        expected = None
-    elif dataset_contract is not None:
-        expected = {
-            "merge_interaction_v2": DATASET_SCHEMA_V2,
-            "merge_decision_v2": DATASET_SCHEMA_MERGE_DECISION_V2,
-        }[dataset_contract]
-    else:
-        expected = decision_schema
-    assert expected == DATASET_SCHEMA_MERGE_DECISION_V2
-
-
-# 9 + 10. Reward V1 trace includes safety/progress/decision + raw
-# TTC/Gap diagnostics (already implemented in a prior session; this
-# re-confirms the exact field names visualize_ppo_run/trace_writer
-# still expose, so a future refactor can't silently drop them).
-def test_reward_v1_trace_fields_present_in_ppo_step_record():
-    from src.visualization.ppo_rollout import PPOStepRecord
-    from src.visualization.trace_writer import TRACE_FIELDNAMES
-
-    v1_fields = {
-        "reward_safety_component", "reward_progress_component",
-        "reward_decision_component", "reward_ttc_penalty_raw",
-        "reward_gap_penalty_raw",
-    }
-    record_fields = {f.name for f in dataclasses.fields(PPOStepRecord)}
-    assert v1_fields.issubset(record_fields)
-    assert v1_fields.issubset(set(TRACE_FIELDNAMES))
-
-
-# 11. V0 visualization backward compatibility (checkpoint with legacy
-# schema still restores/resolves without needing --allow-legacy-dataset
-# special-casing beyond what already existed).
-def test_legacy_schema_checkpoint_backward_compatible(tmp_path):
     checkpoint_path = _build_checkpoint(
-        tmp_path, LEGACY_DATASET_SCHEMA, maneuver_ids=[]
+        tmp_path, MERGE_DATASET_SCHEMA, maneuver_ids=["MAN_DOES_NOT_MATTER"]
     )
     checkpoint_schema = load_checkpoint(checkpoint_path).dataset_schema_version
     restored = restore_ppo_checkpoint(
         checkpoint_path, expected_dataset_schema_version=checkpoint_schema
     )
-    assert restored.dataset_schema_version == LEGACY_DATASET_SCHEMA
+
+    class _Args:
+        scope = "checkpoint"
+
+    with pytest.raises(ValueError, match="not found in TRAIN specs"):
+        # The maneuver_id is fake, so resolution fails downstream --
+        # but load_decision_dataset_maneuver_specs must still have been
+        # called exactly once, proving the routing itself is correct.
+        viz_mod._resolve_maneuvers(_Args(), restored)
+    assert len(calls) == 1
 
 
-# 12. validation split not accidentally mixed into train scope.
+def test_reward_v1_trace_fields_present_in_ppo_step_record():
+    """Reward component fields visualize_ppo.py/trace_writer expose --
+    re-confirms the exact field names so a future refactor can't
+    silently drop them."""
+
+    from src.visualization.ppo_rollout import PPOStepRecord
+    from src.visualization.trace_writer import TRACE_FIELDNAMES
+
+    reward_fields = {
+        "reward_safety_component", "reward_progress_component",
+        "reward_decision_component", "reward_ttc_penalty_raw",
+        "reward_gap_penalty_raw",
+    }
+    record_fields = {f.name for f in dataclasses.fields(PPOStepRecord)}
+    assert reward_fields.issubset(record_fields)
+    assert reward_fields.issubset(set(TRACE_FIELDNAMES))
+
+
 def test_decision_scope_split_train_excludes_validation():
     from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
 
@@ -255,9 +134,8 @@ def test_decision_scope_split_train_excludes_validation():
     assert train_ids.isdisjoint(val_ids)
 
 
-# 13. unknown dataset schema fails clearly.
 def test_unknown_dataset_schema_fails_clearly():
-    import scripts.visualization.visualize_ppo_run as viz_mod
+    import scripts.visualize_ppo as viz_mod
 
     class _FakeRestored:
         dataset_schema_version = "totally_unknown_schema_v99"
@@ -265,10 +143,27 @@ def test_unknown_dataset_schema_fails_clearly():
 
     class _Args:
         scope = "checkpoint"
-        allow_legacy_dataset = False
-        split_manifest = None
-        maneuver_table = None
-        candidate_manifest = None
 
     with pytest.raises(ValueError, match="Unknown checkpoint dataset_schema_version"):
         viz_mod._resolve_maneuvers(_Args(), _FakeRestored())
+
+
+def test_checkpoint_scope_maneuver_ids_resolve_against_real_dataset(tmp_path):
+    """A checkpoint whose config_snapshot names real TRAIN maneuver_ids
+    resolves them all through the final decision-dataset loader."""
+
+    from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
+
+    real_ids = sorted(s.maneuver_id for s in load_decision_dataset_maneuver_specs("train"))[:5]
+    checkpoint_path = _build_checkpoint(tmp_path, MERGE_DATASET_SCHEMA, maneuver_ids=real_ids)
+    checkpoint_schema = load_checkpoint(checkpoint_path).dataset_schema_version
+    restored = restore_ppo_checkpoint(
+        checkpoint_path, expected_dataset_schema_version=checkpoint_schema
+    )
+
+    class _Args:
+        scope = "checkpoint"
+
+    maneuvers = _resolve_maneuvers(_Args(), restored)
+    assert len(maneuvers) == 5
+    assert {m.maneuver_id for m in maneuvers} == set(real_ids)

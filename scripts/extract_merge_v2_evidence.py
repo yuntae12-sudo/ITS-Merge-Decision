@@ -57,7 +57,7 @@ def parse_args(argv=None):
     p.add_argument("--dataset-config", required=True)
     p.add_argument("--scenario-proto", nargs="+", required=True)
     p.add_argument("--transitions-csv", required=True)
-    p.add_argument("--phase1-config", default="configs/phase1_merge.yaml")
+    p.add_argument("--phase1-config", default="configs/merge.yaml")
     p.add_argument("--manual-labels", default=None)
     p.add_argument("--output", default="data/manifests/v2/evidence_review_queue.jsonl")
     p.add_argument("--review-dir", default="outputs/merge_v2_review")

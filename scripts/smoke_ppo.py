@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""P5 Smoke Training entry point (docs/ppo/PPO_PLAN.md SS0.1/P5).
+"""PPO smoke-training entry point.
 
-Runs the real, end-to-end PPO smoke-training loop against the real
+Runs the real, end-to-end PPO training loop against the real
 ``MergeEnvironment`` (``downstream_mode="frenet_mpc"``) on a small,
-deterministic subset of the canonical TRAIN split
-(``data/manifests/phase2_dataset_split.csv``), selected via
-``--max-maneuvers``/``--maneuver-ids``/``--seed`` -- explicitly NOT a
-PPO-FIT/PPO-TUNE split (PPO_PLAN.md SS0/SS9): the subset exists only to
-exercise every pipeline stage once, never for tuning/evaluation.
+deterministic subset of the canonical TRAIN split, selected via
+``--max-maneuvers``/``--maneuver-ids``/``--seed``.
 
-This is pipeline-VERIFICATION only -- not a performance run. Explicitly
-forbidden here (per PPO_PLAN.md SS0.1/P5): long/full-TRAIN training,
-millions of steps, hyperparameter tuning, W&B sweeps, a TRAIN/TUNE
-split, canonical VAL evaluation, FSM-vs-PPO comparison.
+This is pipeline-VERIFICATION only -- not a performance run. Not
+intended for long/full-TRAIN training, hyperparameter tuning, W&B
+sweeps, or canonical VALIDATION evaluation (use scripts/train_ppo.py
+for a real training run).
 
 Saves a checkpoint at the end of the run (and, with ``--checkpoint-every``,
 after intermediate updates too) so ``--resume`` on
@@ -25,9 +22,9 @@ import time
 
 import jax
 
-from src.environment.full_split_evaluator import load_maneuver_specs
+from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
 from src.environment.merge_environment import MergeEnvironment
-from src.scenarios.merge_v2 import DATASET_SCHEMA_MERGE_DECISION_V2
+from src.scenarios.merge_v2 import MERGE_DATASET_SCHEMA
 from src.policies.ppo.state import create_train_state
 from src.training.checkpoint import (
     CheckpointPayload,
@@ -41,14 +38,14 @@ from src.training.seeding import make_seed_state
 from src.training.trainer import run_training
 from src.tracking.wandb_logger import WandbLogger
 
-DEFAULT_DATASET_CONFIG_PATH = "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml"
+DEFAULT_DATASET_CONFIG_PATH = "configs/dataset.yaml"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--ppo-config",
-        default="configs/ppo/ppo_smoke.yaml",
+        default="configs/ppo/smoke.yaml",
         help="Path to a PPO run config YAML (see configs/ppo/).",
     )
     parser.add_argument(
@@ -95,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-path",
         default=None,
         help="Where to save the final checkpoint. Defaults to "
-        "outputs/ppo_checkpoints/smoke_<timestamp>.pkl.",
+        "outputs/checkpoints/smoke_<timestamp>.pkl.",
     )
     parser.add_argument(
         "--checkpoint-every",
@@ -110,48 +107,21 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DATASET_CONFIG_PATH,
         help="Waymax dataset config path (see MergeEnvironment).",
     )
-    parser.add_argument(
-        "--dataset-contract",
-        choices=("merge_interaction_v2", "merge_decision_v2"),
-        default="merge_interaction_v2",
-        help="Same meaning as scripts/train_ppo.py's --dataset-contract: "
-        "'merge_decision_v2' uses the frozen final MERGE Decision "
-        "Dataset v2 via src.environment.full_split_evaluator."
-        "load_decision_dataset_maneuver_specs instead of the legacy "
-        "merge_interaction_v2 split manifest.",
-    )
     return parser.parse_args()
 
 
 def select_smoke_maneuver_ids(
-    seed: int, max_maneuvers: int, explicit_ids=None, train_ids=None
+    max_maneuvers: int, explicit_ids, train_ids: list
 ) -> list:
     """Deterministically selects a small subset of canonical-TRAIN
-    maneuver_ids for Smoke Training.
+    maneuver_ids for smoke training.
 
     If ``explicit_ids`` is given, uses exactly those (still validated
-    against the TRAIN split below). Otherwise takes the first
-    ``max_maneuvers`` TRAIN maneuver_ids in a fixed, seed-independent
-    sorted order -- deterministic and reproducible run-over-run, which
-    matters more here than seed-dependent sampling since Smoke
-    Training's whole point is pipeline verification, not performance
-    variance.
-
-    ``train_ids``, when given, overrides the legacy split-manifest
-    derivation entirely (used by the merge_decision_v2 contract, whose
-    TRAIN membership already reflects Tier A/B + dataset_role +
-    merge_context_status filtering from
-    ``load_decision_dataset_maneuver_specs``).
-    """
-
-    if train_ids is None:
-        from src.environment.dataset_split import load_split_manifest, normalize_split_name
-
-        train_rows = [
-            row for row in load_split_manifest()
-            if normalize_split_name(row.split) == "train"
-        ]
-        train_ids = sorted(row.maneuver_id for row in train_rows)
+    against ``train_ids``). Otherwise takes the first ``max_maneuvers``
+    TRAIN maneuver_ids in a fixed sorted order -- deterministic and
+    reproducible run-over-run, which matters more here than sampling
+    since smoke training's whole point is pipeline verification, not
+    performance variance."""
 
     if explicit_ids is not None:
         requested = [m.strip() for m in explicit_ids.split(",") if m.strip()]
@@ -163,7 +133,6 @@ def select_smoke_maneuver_ids(
             )
         return requested
 
-    del seed  # selection is deterministic/sorted, not seed-sampled.
     return train_ids[:max_maneuvers]
 
 
@@ -191,14 +160,9 @@ def main() -> None:
         else (ppo_config.smoke.max_episode_steps if ppo_config.smoke else 30)
     )
 
-    if args.dataset_contract == "merge_decision_v2":
-        from src.environment.full_split_evaluator import load_decision_dataset_maneuver_specs
-        all_train_specs = load_decision_dataset_maneuver_specs("train")
-    else:
-        all_train_specs = load_maneuver_specs("train")
-
+    all_train_specs = load_decision_dataset_maneuver_specs("train")
     maneuver_ids = select_smoke_maneuver_ids(
-        seed=seed, max_maneuvers=max_maneuvers, explicit_ids=args.maneuver_ids,
+        max_maneuvers=max_maneuvers, explicit_ids=args.maneuver_ids,
         train_ids=sorted(s.maneuver_id for s in all_train_specs),
     )
 
@@ -206,7 +170,6 @@ def main() -> None:
     print(f"Loaded reward config from {reward_config.source_path} "
           f"(reward_version={reward_config.reward_version})")
     print(f"Seed: {seed}")
-    print(f"Dataset contract: {args.dataset_contract}")
     print(f"Smoke maneuver subset (canonical TRAIN only, {len(maneuver_ids)} "
           f"maneuvers): {maneuver_ids}")
     print(f"num_updates={num_updates}, max_episode_steps={max_episode_steps}")
@@ -220,10 +183,7 @@ def main() -> None:
     env = MergeEnvironment(
         dataset_config_path=args.dataset_config_path,
         downstream_mode=ppo_config.rollout.downstream_mode,
-        required_dataset_schema_version=(
-            DATASET_SCHEMA_MERGE_DECISION_V2
-            if args.dataset_contract == "merge_decision_v2" else None
-        ),
+        required_dataset_schema_version=MERGE_DATASET_SCHEMA,
     )
 
     global_env_step = 0
@@ -255,12 +215,12 @@ def main() -> None:
             ),
         )
         # Continue the RNG stream from exactly where the checkpoint left
-        # off, per PPO_PLAN.md SS10 -- never re-derive it from --seed.
+        # off -- never re-derive it from --seed.
         run_key = payload.jax_rng_key
         global_env_step = payload.global_env_step
         ppo_update_step = payload.ppo_update_step
-        # Fix 5: restore the NumPy RNG (minibatch-shuffle) stream too --
-        # not just the JAX key -- so resumed minibatch ordering matches
+        # Restore the NumPy RNG (minibatch-shuffle) stream too -- not
+        # just the JAX key -- so resumed minibatch ordering matches
         # what an uninterrupted run would have produced.
         numpy_rng = restore_numpy_rng(payload.numpy_rng_state, fallback_seed=seed)
         print(
@@ -301,7 +261,7 @@ def main() -> None:
     })
 
     checkpoint_path = args.checkpoint_path or (
-        f"outputs/ppo_checkpoints/smoke_seed{seed}_{int(time.time())}.pkl"
+        f"outputs/checkpoints/smoke_seed{seed}_{int(time.time())}.pkl"
     )
 
     def _save(training_state_, global_env_step_, ppo_update_step_, rng_key_, path):
@@ -326,6 +286,7 @@ def main() -> None:
             reward_version=reward_config.reward_version,
             git_sha=get_git_sha(),
             numpy_rng_state=numpy_rng.get_state(),
+            dataset_schema_version=MERGE_DATASET_SCHEMA,
         )
         save_checkpoint(payload, path)
         print(f"Saved checkpoint to {path}")

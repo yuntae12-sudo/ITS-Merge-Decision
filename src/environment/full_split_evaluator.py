@@ -15,61 +15,18 @@ from typing import List, Optional
 from src.environment.behavior_action import BehaviorAction
 from src.environment.dataset_split import load_split_manifest, normalize_split_name
 from src.environment.merge_environment import ManeuverSpec, MergeEnvironment
-from src.scenarios.merge_v2 import DATASET_SCHEMA_MERGE_DECISION_V2
+from src.scenarios.merge_v2 import MERGE_DATASET_SCHEMA
 
-MANEUVER_TABLE = "outputs/phase1/training_10shard_pilot/training_visual_merge_maneuvers.csv"
-CANDIDATE_MANIFEST = "outputs/phase1/training_10shard_pilot/merge_manifest_training_scratch.csv"
 DEFAULT_MAX_STEPS = 100  # matches MAX_EPISODE_HORIZON_FRAMES
 
-DECISION_MANEUVER_TABLE = "data/manifests/v2/merge_decision_maneuvers_v2.csv"
-DECISION_SPLIT_MANIFEST = "data/manifests/v2/merge_decision_split_v2.csv"
-DECISION_EVIDENCE_TRAINING = "data/manifests/v2/evidence_training.jsonl"
-DECISION_EVIDENCE_VALIDATION = "data/manifests/v2/evidence_validation.jsonl"
+DECISION_MANEUVER_TABLE = "data/manifests/merge_maneuvers.csv"
+DECISION_SPLIT_MANIFEST = "data/manifests/merge_split.csv"
+DECISION_EVIDENCE_TRAINING = "data/manifests/evidence_training.jsonl"
+DECISION_EVIDENCE_VALIDATION = "data/manifests/evidence_validation.jsonl"
 
 DECISION_TIERS_FOR_PPO = ("A", "B")
 DECISION_DATASET_ROLES_FOR_PPO = ("CORE", "SUPPORT")
 DECISION_MERGE_CONTEXT_STATUS_ELIGIBLE = "MERGE_CONTEXT_ELIGIBLE"
-
-
-def load_maneuver_specs(
-    which_split: str,
-    split_manifest_path: Optional[str] = None,
-    maneuver_table_path: str = MANEUVER_TABLE,
-    candidate_manifest_path: str = CANDIDATE_MANIFEST,
-    required_schema_version: Optional[str] = None,
-) -> List[ManeuverSpec]:
-    """Loads every ManeuverSpec belonging to one split (no subsampling
-    -- Stage B-2.5 explicitly requires the FULL canonical split, unlike
-    Stage B-1.5/B-2's representative-sample checks)."""
-
-    if split_manifest_path is not None:
-        split_rows = {
-            r.maneuver_id: normalize_split_name(r.split)
-            for r in load_split_manifest(split_manifest_path)
-        }
-    else:
-        split_rows = {
-            r.maneuver_id: normalize_split_name(r.split)
-            for r in load_split_manifest()
-        }
-    which_split = normalize_split_name(which_split)
-
-    with open(candidate_manifest_path, newline="") as f:
-        manifest_by_candidate_id = {row["candidate_id"]: row for row in csv.DictReader(f)}
-
-    specs = []
-    with open(maneuver_table_path, newline="") as f:
-        for row in csv.DictReader(f):
-            if split_rows.get(row["maneuver_id"]) != which_split:
-                continue
-            try:
-                spec = ManeuverSpec.from_csv_row(row, manifest_by_candidate_id)
-            except KeyError:
-                continue
-            if required_schema_version is not None:
-                spec.require_schema(required_schema_version)
-            specs.append(spec)
-    return specs
 
 
 def _load_decision_evidence_by_candidate_id(evidence_path: str) -> dict:
@@ -89,18 +46,16 @@ def load_decision_dataset_maneuver_specs(
     evidence_validation_path: str = DECISION_EVIDENCE_VALIDATION,
 ) -> List[ManeuverSpec]:
     """Loads every ManeuverSpec belonging to one split of the FROZEN
-    final MERGE Decision Dataset v2
-    (data/manifests/v2/merge_decision_*_v2.csv), joined against its
-    authoritative evidence JSONL for the fields
+    final MERGE Dataset (data/manifests/merge_*.csv), joined against
+    its authoritative evidence JSONL for the fields
     (topology_evidence/interaction_evidence) the frozen manifest's own
     columns do not carry.
 
     Frozen manifest/split CSVs are read-only here -- never rewritten.
     Restricts to the PPO training-relevant subset explicitly (Tier
     A/B, dataset_role CORE/SUPPORT, merge_context_status ELIGIBLE) per
-    the Decision Dataset's own Merge Context Validity + Decision
-    Relevance contract (see ``DATASET_SCHEMA_MERGE_DECISION_V2``) --
-    NOT the legacy CONFIRMED_MERGE-only contract."""
+    the dataset's own Merge Context Validity + Decision Relevance
+    contract (see ``MERGE_DATASET_SCHEMA``)."""
 
     which_split = normalize_split_name(which_split)
     evidence_path = (
@@ -142,7 +97,7 @@ def load_decision_dataset_maneuver_specs(
             seen_candidate_ids.add(candidate_id)
 
             spec = ManeuverSpec.from_decision_dataset_row(row, evidence_row)
-            spec.require_schema(DATASET_SCHEMA_MERGE_DECISION_V2)
+            spec.require_schema(MERGE_DATASET_SCHEMA)
             specs.append(spec)
     return specs
 

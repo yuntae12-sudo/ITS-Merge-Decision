@@ -121,7 +121,7 @@ from src.scenarios.lane_geometry import LanePolyline, project_point_to_polyline
 class MergeTopologyConfig:
     """Thresholds for merge topology classification.
 
-    See configs/phase1_merge.yaml `merge_topology` and `event` for the
+    See configs/merge.yaml `merge_topology` and `event` for the
     field descriptions and the real-scene observations behind them.
     """
 
@@ -500,7 +500,7 @@ def detect_merge(
         ego_source_arc_length_m: ego's source-lane arc-length position
             (from ``project_point_to_polyline`` on the source lane) at
             the transition frame, or None if unavailable.
-        config: thresholds (see configs/phase1_merge.yaml).
+        config: thresholds (see configs/merge.yaml).
 
     Returns:
         MergeDiagnostic with every gate's evidence populated as far as

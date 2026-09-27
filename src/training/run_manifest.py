@@ -3,7 +3,7 @@
 
 Writes a small ``<checkpoint_stem>.run.json`` file next to a saved
 checkpoint, purely for human/tooling convenience (e.g. so
-``scripts/visualization/visualize_ppo_run.py`` or a future script can
+``scripts/visualize_ppo.py`` or a future script can
 discover a run's config paths without unpickling the checkpoint).
 
 This is deliberately ADDITIVE: it changes nothing about
@@ -22,8 +22,8 @@ from src.scenarios.merge_v2 import LEGACY_DATASET_SCHEMA
 
 
 def run_manifest_path_for_checkpoint(checkpoint_path: str) -> str:
-    """``outputs/ppo_checkpoints/reward_v1_seed0.pkl`` ->
-    ``outputs/ppo_checkpoints/reward_v1_seed0.run.json`` (matches the
+    """``outputs/checkpoints/reward_v1_seed0.pkl`` ->
+    ``outputs/checkpoints/reward_v1_seed0.run.json`` (matches the
     task spec's exact naming: replace the checkpoint's own suffix with
     ``.run.json``, not merely append)."""
 

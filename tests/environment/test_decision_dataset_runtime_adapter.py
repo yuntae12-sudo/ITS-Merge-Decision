@@ -18,10 +18,9 @@ from src.environment.full_split_evaluator import (
     DECISION_DATASET_ROLES_FOR_PPO,
     DECISION_TIERS_FOR_PPO,
     load_decision_dataset_maneuver_specs,
-    load_maneuver_specs,
 )
 from src.environment.merge_environment import ManeuverSpec
-from src.scenarios.merge_v2 import DATASET_SCHEMA_MERGE_DECISION_V2, DATASET_SCHEMA_V2
+from src.scenarios.merge_v2 import DATASET_SCHEMA_V2, MERGE_DATASET_SCHEMA
 
 
 MANEUVER_FIELDS = [
@@ -126,6 +125,11 @@ def _write_dataset(tmp_path, maneuver_rows, evidence_rows, split_rows=None):
 def test_final_frozen_train_ab_1097_rows_load():
     specs = load_decision_dataset_maneuver_specs("train")
     assert len(specs) == 1097
+
+
+def test_final_frozen_validation_ab_388_rows_load():
+    specs = load_decision_dataset_maneuver_specs("validation")
+    assert len(specs) == 388
 
 
 # 2. training split normalization (real repo file uses "training").
@@ -260,7 +264,7 @@ def test_decision_context_contract_does_not_require_confirmed_merge(tmp_path):
     spec = specs[0]
     assert spec.manual_validation is None
     # require_schema must not raise for an UNREVIEWED/no-interaction-vehicle spec.
-    spec.require_schema(DATASET_SCHEMA_MERGE_DECISION_V2)
+    spec.require_schema(MERGE_DATASET_SCHEMA)
 
 
 # 11. legacy DATASET_SCHEMA_V2 still DOES require CONFIRMED_MERGE.
@@ -389,13 +393,13 @@ def test_train_ppo_explicit_ids_validation_against_decision_dataset():
 # 16. visualization checkpoint scope can resolve decision dataset maneuver IDs.
 def test_visualize_resolve_maneuvers_checkpoint_scope_decision_dataset():
     import argparse
-    from scripts.visualization.visualize_ppo_run import _resolve_maneuvers
+    from scripts.visualize_ppo import _resolve_maneuvers
 
     specs = load_decision_dataset_maneuver_specs("train")
     target_ids = sorted(s.maneuver_id for s in specs)[:2]
 
     class _FakeRestored:
-        dataset_schema_version = DATASET_SCHEMA_MERGE_DECISION_V2
+        dataset_schema_version = MERGE_DATASET_SCHEMA
         maneuver_ids = target_ids
 
     args = argparse.Namespace(

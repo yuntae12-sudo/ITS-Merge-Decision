@@ -41,19 +41,19 @@ from src.scenarios.lane_assignment import load_lane_assignment_config
 from src.scenarios.scenario_features import extract_interaction_features, load_agent_selection_config
 from src.scenarios.scenario_loader import build_waymax_config, iter_scenarios, load_dataset_config
 
-PHASE1_CONFIG = "configs/phase1_merge.yaml"
+PHASE1_CONFIG = "configs/merge.yaml"
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
 
 SPLIT_DEFAULTS = {
     "training": {
-        "evidence": "data/manifests/v2/evidence_training.jsonl",
-        "dataset_config": "outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml",
+        "evidence": "data/manifests/evidence_training.jsonl",
+        "dataset_config": "configs/dataset.yaml",
         "shard_dir": "data/womd/training",
         "out_path": OUT_DIR / "training_decision_evidence_augmented.jsonl",
         "expected_count": 5545,
     },
     "validation": {
-        "evidence": "data/manifests/v2/evidence_validation.jsonl",
+        "evidence": "data/manifests/evidence_validation.jsonl",
         "dataset_config": "outputs/phase1/validation_6shard_pilot/dataset_validation_6shard.yaml",
         "shard_dir": "data/womd/validation",
         "out_path": OUT_DIR / "validation_decision_evidence_augmented.jsonl",

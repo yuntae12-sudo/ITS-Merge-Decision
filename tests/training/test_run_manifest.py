@@ -11,8 +11,8 @@ from src.training.run_manifest import run_manifest_path_for_checkpoint, write_ru
 
 def test_run_manifest_path_replaces_pkl_suffix():
     assert (
-        run_manifest_path_for_checkpoint("outputs/ppo_checkpoints/reward_v1_seed0.pkl")
-        == "outputs/ppo_checkpoints/reward_v1_seed0.run.json"
+        run_manifest_path_for_checkpoint("outputs/checkpoints/reward_v1_seed0.pkl")
+        == "outputs/checkpoints/reward_v1_seed0.run.json"
     )
 
 
@@ -21,9 +21,9 @@ def test_write_run_manifest_writes_expected_fields(tmp_path):
 
     output_path = write_run_manifest(
         checkpoint_path=checkpoint_path,
-        ppo_config_path="configs/ppo/ppo_p6_baseline.yaml",
-        reward_config_path="configs/reward/merge_reward_v0.yaml",
-        dataset_config_path="outputs/phase1/training_10shard_pilot/dataset_training_10shard.yaml",
+        ppo_config_path="configs/ppo/train.yaml",
+        reward_config_path="configs/reward.yaml",
+        dataset_config_path="configs/dataset.yaml",
         maneuver_ids=["MAN_0001", "MAN_0002"],
         seed=0,
         num_updates=50,

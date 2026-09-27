@@ -97,7 +97,7 @@ def test_selection_is_stable_sorted_regardless_of_input_order():
 
     # Both must select the exact same first-5-in-sorted-order maneuvers
     # -- callers are responsible for feeding stable sorted-maneuver_id
-    # order (as scripts/visualization/visualize_ppo_run.py does), but
+    # order (as scripts/visualize_ppo.py does), but
     # the selection function itself must not depend on incidental list
     # order for two runs fed the SAME already-sorted sequence.
     assert selected_from_sorted["success"]["maneuver_ids"] == sorted_ids[:5]

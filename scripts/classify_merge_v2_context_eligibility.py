@@ -69,7 +69,7 @@ import csv
 import json
 from pathlib import Path
 
-TRAIN_EVIDENCE = "data/manifests/v2/evidence_training.jsonl"
+TRAIN_EVIDENCE = "data/manifests/evidence_training.jsonl"
 OUT_DIR = Path("outputs/merge_v2_decision_audit_v2")
 
 INELIGIBLE_REASONS = {

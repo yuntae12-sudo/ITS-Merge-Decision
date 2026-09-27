@@ -110,7 +110,7 @@ MINIMUM_METRICS = (
 # unrelated architecture-widening change this session's scope forbids).
 # A caller SHOULD include these when the run trains against the frozen
 # MERGE Decision Dataset v2, sourced from
-# ``data/manifests/v2/MERGE_DECISION_DATASET_V2_FREEZE.json`` (never
+# ``data/manifests/freeze.json`` (never
 # duplicated/hardcoded a second time -- see
 # ``src.training.provenance.load_dataset_provenance``).
 OPTIONAL_PROVENANCE_KEYS = (
