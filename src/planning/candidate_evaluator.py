@@ -14,7 +14,7 @@ when a candidate fails a check. It only classifies one already
     (e.g. non-finite candidate output caused by a degenerate
     reference -- surfaced explicitly rather than crashing).
 
-Checks performed (all thresholds from ``configs/phase3_downstream.yaml``,
+Checks performed (all thresholds from ``configs/downstream.yaml``,
 see that file for the justification of each number):
   1. Longitudinal acceleration bound: |s_dd(t)| <= max_longitudinal_accel_mps2.
   2. Non-negative forward progress: s_d(t) >= min_forward_progress_s_dot_mps.

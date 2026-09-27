@@ -13,7 +13,7 @@ action value is plausible here", not "the correct action is MERGE".
 TRAIN only -- VALIDATION is never read by this script.
 
 Uses the production PPO action semantics (src/environment/behavior_
-action.py) and observation contract (configs/phase2_common_state.yaml)
+action.py) and observation contract (configs/observation.yaml)
 to define affordance diagnostics, but the diagnostics themselves are
 audit heuristics over stored evidence, not a re-implementation of
 those modules and not a change to classify_v2_merge's semantics.

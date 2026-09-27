@@ -99,7 +99,7 @@ from src.scenarios.scenario_loader import (
 )
 
 DEFAULT_MERGE_CONFIG_PATH = "configs/merge.yaml"
-DEFAULT_DOWNSTREAM_CONFIG_PATH = "configs/phase3_downstream.yaml"
+DEFAULT_DOWNSTREAM_CONFIG_PATH = "configs/downstream.yaml"
 
 # Stage 3-F fallback command (see step()'s frenet_mpc branch and
 # docs/phase3/OVERNIGHT_PROGRESS.md Stage 3-F entry for the full

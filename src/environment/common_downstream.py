@@ -57,7 +57,7 @@ therefore builds the MPC reference list from trajectory indices
 ``[1, horizon]`` inclusive (skipping index 0), requiring the
 planner's own ``trajectory_horizon_s`` to produce strictly more
 samples than the MPC's ``horizon`` -- true for the shipped
-``configs/phase3_downstream.yaml`` (31 planner samples at
+``configs/downstream.yaml`` (31 planner samples at
 trajectory_horizon_s=3.0s/dt=0.1s vs. an MPC horizon of 20 steps) and
 checked explicitly (returns ``CONTROLLER_FAILURE`` rather than
 crashing if a caller-supplied config ever violates it).

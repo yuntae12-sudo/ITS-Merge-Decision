@@ -181,10 +181,9 @@ is a runtime input to any canonical entrypoint.
   `configs/dataset_validation.yaml` (a separate `MergeEnvironment`
   instance) for VALIDATION-split resets.
 - **Checkpoint fails to resume with a dataset-schema error** — the
-  checkpoint was produced under a pre-cleanup schema
-  (`merge_decision_v2`/`merge_interaction_v2`). Only checkpoints
-  produced by the current `scripts/train_ppo.py`/`scripts/smoke_ppo.py`
-  (schema `merge_decision`) are supported.
+  checkpoint was produced before the final MERGE Dataset contract. Only
+  checkpoints produced by the current `scripts/train_ppo.py`/
+  `scripts/smoke_ppo.py` (schema `merge_decision`) are supported.
 
 ## 12. Remaining Research Work
 

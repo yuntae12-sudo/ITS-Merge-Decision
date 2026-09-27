@@ -2,7 +2,7 @@
 
 Verifies observation_builder.py's ACTUAL production behavior against
 the frozen research-interface contract in
-configs/phase2_common_state.yaml, and adds targeted coverage for the
+configs/observation.yaml, and adds targeted coverage for the
 chained-maneuver observation-consistency requirement (Section 22)
 that the existing Stage B-1 tests check only at the `info` level, not
 the 14D vector itself.
@@ -25,7 +25,7 @@ from src.environment.full_split_evaluator import load_decision_dataset_maneuver_
 
 DATASET_CONFIG_PATH = "configs/dataset.yaml"
 VALIDATION_DATASET_CONFIG_PATH = "configs/dataset_validation.yaml"
-COMMON_STATE_CONFIG_PATH = "configs/phase2_common_state.yaml"
+COMMON_STATE_CONFIG_PATH = "configs/observation.yaml"
 
 SINGLE_MANEUVER = ManeuverSpec(
     maneuver_id="MAN_0001",
@@ -153,7 +153,7 @@ def test_presence_gated_slots_use_documented_sentinels_across_train_sample(env):
     """Deterministic representative TRAIN sample (first/last/stride/
     per-shard, see _representative_sample): whenever a presence flag is
     0, the corresponding gap/relative-speed is exactly 0.0 and TTC is
-    exactly TTC_CAP_S -- matching configs/phase2_common_state.yaml's
+    exactly TTC_CAP_S -- matching configs/observation.yaml's
     documented sentinel semantics. See the @pytest.mark.slow variant
     below for the exhaustive full-TRAIN check."""
 

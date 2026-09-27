@@ -185,9 +185,9 @@ class MpcConfig:
     max_iterations: int = 100
 
 
-def load_mpc_config(path: str = "configs/phase3_downstream.yaml") -> MpcConfig:
+def load_mpc_config(path: str = "configs/downstream.yaml") -> MpcConfig:
     """Loads the ``mpc:`` section Stage 3-D added to
-    ``configs/phase3_downstream.yaml`` (additive to Stage 3-C's
+    ``configs/downstream.yaml`` (additive to Stage 3-C's
     existing ``planner:``/``feasibility:``/``collision:`` sections)."""
 
     import yaml
