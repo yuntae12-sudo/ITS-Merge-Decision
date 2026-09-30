@@ -67,7 +67,7 @@ DEFAULT_COLLISION_LIMITS = CollisionLimits(
 
 def test_feasible_keep_candidate_is_ok(straight_ref):
     ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
+    path, _ = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
     result = evaluate_candidate(path, straight_ref, DEFAULT_LIMITS, DEFAULT_COLLISION_LIMITS)
     assert result.status == PlannerStatus.OK
     assert "longitudinal_accel" in result.checks_evaluated
@@ -79,13 +79,36 @@ def test_kinematically_infeasible_speed_change_returns_planner_infeasible(straig
     # A speed change requiring far more than 6.0 m/s^2 over the
     # horizon: 0 -> 100 m/s in 3s implies avg accel > 33 m/s^2.
     ego = FrenetState(s=10.0, s_d=0.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 100.0, HORIZON_S, DT_S)
+    path, _ = generate_keep_candidate(ego, 100.0, HORIZON_S, DT_S)
     result = evaluate_candidate(path, straight_ref, DEFAULT_LIMITS, DEFAULT_COLLISION_LIMITS)
     assert result.status == PlannerStatus.PLANNER_INFEASIBLE
     assert "longitudinal_accel" in result.checks_failed
     # Must not silently become a different, "fixed" trajectory
     # reported as OK.
     assert result.status != PlannerStatus.OK
+    # Diagnostic-only: the measured extreme value backing the failed
+    # check must be exposed and must itself exceed the threshold that
+    # caused the failure (read-only, never fed back into the decision
+    # above).
+    assert result.feasibility_values["max_abs_longitudinal_accel_mps2"] > DEFAULT_LIMITS.max_longitudinal_accel_mps2
+
+
+def test_feasibility_values_present_and_within_bounds_on_ok_candidate(straight_ref):
+    """Diagnostic values must be populated on a PASSING candidate too
+    (not only on failure), and must be consistent with the checks
+    contract having actually passed (Instrumentation-only requirement:
+    behavior/classification itself is unchanged, see the OK assertion
+    below)."""
+
+    ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
+    path, _ = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
+    result = evaluate_candidate(path, straight_ref, DEFAULT_LIMITS, DEFAULT_COLLISION_LIMITS)
+    assert result.status == PlannerStatus.OK
+    values = result.feasibility_values
+    assert values["max_abs_longitudinal_accel_mps2"] <= DEFAULT_LIMITS.max_longitudinal_accel_mps2
+    assert values["min_forward_progress_s_dot_mps"] >= DEFAULT_LIMITS.min_forward_progress_s_dot_mps
+    assert values["max_abs_curvature_per_m"] <= DEFAULT_LIMITS.max_curvature_per_m
+    assert values["max_abs_longitudinal_jerk_mps3"] <= DEFAULT_LIMITS.max_longitudinal_jerk_mps3
 
 
 def test_unreasonable_lateral_shift_in_short_time_returns_planner_infeasible(straight_ref):
@@ -97,7 +120,7 @@ def test_unreasonable_lateral_shift_in_short_time_returns_planner_infeasible(str
     # produces -- the infeasibility itself is a real property of the
     # continuous trajectory, not an artifact of sampling.
     ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=20.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 15.0, horizon_s=0.5, dt_s=0.05)
+    path, _ = generate_keep_candidate(ego, 15.0, horizon_s=0.5, dt_s=0.05)
     result = evaluate_candidate(path, straight_ref, DEFAULT_LIMITS, DEFAULT_COLLISION_LIMITS)
     assert result.status == PlannerStatus.PLANNER_INFEASIBLE
     assert len(result.checks_failed) > 0
@@ -105,7 +128,7 @@ def test_unreasonable_lateral_shift_in_short_time_returns_planner_infeasible(str
 
 def test_collision_blocked_when_agent_directly_in_path(straight_ref):
     ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
+    path, _ = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
     # Stationary agent placed directly on the ego's future path
     # (KEEP travels roughly from x=10 to x=10+15*3=55 along y=0).
     agent = CurrentAgentState(
@@ -125,7 +148,7 @@ def test_collision_blocked_when_agent_directly_in_path(straight_ref):
 
 def test_collision_blocked_status_is_not_silently_reclassified_as_ok(straight_ref):
     ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
+    path, _ = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
     agent = CurrentAgentState(agent_id=7, x=25.0, y=0.0, velocity_x_mps=0.0, velocity_y_mps=0.0)
     result = evaluate_candidate(
         path, straight_ref, DEFAULT_LIMITS, DEFAULT_COLLISION_LIMITS, agents=[agent],
@@ -137,7 +160,7 @@ def test_collision_blocked_status_is_not_silently_reclassified_as_ok(straight_re
 
 def test_no_collision_when_agent_far_from_path(straight_ref):
     ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
+    path, _ = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
     agent = CurrentAgentState(
         agent_id=1, x=30.0, y=50.0, velocity_x_mps=0.0, velocity_y_mps=0.0,
     )
@@ -149,7 +172,7 @@ def test_no_collision_when_agent_far_from_path(straight_ref):
 
 def test_moving_agent_constant_velocity_prediction_causes_collision(straight_ref):
     ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
+    path, _ = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
     # Agent starts far off the path laterally but moves toward it,
     # timed to intercept the ego's projected position.
     agent = CurrentAgentState(
@@ -180,7 +203,7 @@ def test_reference_construction_failure_surfaces_as_invalid_reference():
 
 def test_check_collision_returns_none_when_no_agents(straight_ref):
     ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
-    path = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
+    path, _ = generate_keep_candidate(ego, 15.0, HORIZON_S, DT_S)
     from src.planning.candidate_evaluator import _frenet_path_to_cartesian
     cart = _frenet_path_to_cartesian(path, straight_ref)
     assert check_collision(cart, [], DEFAULT_COLLISION_LIMITS) is None

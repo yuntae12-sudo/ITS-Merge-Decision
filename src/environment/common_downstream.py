@@ -197,7 +197,10 @@ class CommonDownstream:
         )
         plan_result = plan(plan_request, self._planner_config)
 
-        diagnostics = {"planner": plan_result.diagnostics}
+        diagnostics = {
+            "planner": plan_result.diagnostics,
+            "follow_inputs": dataclasses.asdict(request.follow_inputs),
+        }
 
         if plan_result.status != PlannerStatus.OK:
             status_map = {

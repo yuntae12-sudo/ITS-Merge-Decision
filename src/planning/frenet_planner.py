@@ -29,6 +29,8 @@ import math
 import time
 from typing import List, Optional
 
+import numpy as np
+
 from src.environment.behavior_action import BehaviorAction, BehaviorObjective
 from src.planning.candidate_evaluator import (
     CollisionLimits,
@@ -238,25 +240,36 @@ def plan(request: PlanRequest, config: PlannerConfig) -> PlanResult:
             },
         )
     diagnostics["timing_s"]["projection"] = time.perf_counter() - t_project_start
+    diagnostics["reference_lane"] = reference_lane
+    diagnostics["ego_frenet_state"] = {
+        "s": ego_frenet.s, "s_d": ego_frenet.s_d, "s_dd": ego_frenet.s_dd,
+        "d": ego_frenet.d, "d_d": ego_frenet.d_d, "d_dd": ego_frenet.d_dd,
+    }
+    diagnostics["reference_speed_mps"] = objective.reference_speed_mps
+    diagnostics["delta_v_mps"] = objective.reference_speed_mps - ego_frenet.s_d
 
     # --- Generate the one candidate for this action.
     t_gen_start = time.perf_counter()
     stop_target_clamped = False
+    terminal_speed_feasibility = None
     try:
         if action == BehaviorAction.KEEP:
-            frenet_path = generate_keep_candidate(
+            frenet_path, terminal_speed_feasibility = generate_keep_candidate(
                 ego_frenet, objective.reference_speed_mps,
                 config.trajectory_horizon_s, dt_s,
+                config.feasibility_limits.max_longitudinal_accel_mps2,
             )
         elif action == BehaviorAction.FOLLOW:
-            frenet_path = generate_follow_or_merge_candidate(
+            frenet_path, terminal_speed_feasibility = generate_follow_or_merge_candidate(
                 ego_frenet, objective.reference_speed_mps,
                 config.trajectory_horizon_s, dt_s,
+                config.feasibility_limits.max_longitudinal_accel_mps2,
             )
         elif action == BehaviorAction.MERGE:
-            frenet_path = generate_follow_or_merge_candidate(
+            frenet_path, terminal_speed_feasibility = generate_follow_or_merge_candidate(
                 ego_frenet, objective.reference_speed_mps,
                 config.trajectory_horizon_s, dt_s,
+                config.feasibility_limits.max_longitudinal_accel_mps2,
             )
         elif action == BehaviorAction.STOP:
             stop_result = generate_stop_candidate(
@@ -282,6 +295,23 @@ def plan(request: PlanRequest, config: PlannerConfig) -> PlanResult:
         )
     diagnostics["timing_s"]["generation"] = time.perf_counter() - t_gen_start
     diagnostics["stop_target_clamped"] = stop_target_clamped
+    if terminal_speed_feasibility is not None:
+        diagnostics["terminal_speed_feasibility"] = dataclasses.asdict(terminal_speed_feasibility)
+
+    # Diagnostic-only summary of the generated candidate's longitudinal
+    # profile (never consulted by the feasibility decision below,
+    # which reads frenet_path directly via evaluate_candidate).
+    abs_s_dd = np.abs(frenet_path.s_dd)
+    max_abs_index = int(np.argmax(abs_s_dd))
+    diagnostics["generated_longitudinal_profile"] = {
+        "min_s_dd_mps2": float(np.min(frenet_path.s_dd)),
+        "max_s_dd_mps2": float(np.max(frenet_path.s_dd)),
+        "max_abs_s_dd_mps2": float(abs_s_dd[max_abs_index]),
+        "time_of_max_abs_s_dd_s": float(frenet_path.t[max_abs_index]),
+        "min_s_d_mps": float(np.min(frenet_path.s_d)),
+        "max_s_d_mps": float(np.max(frenet_path.s_d)),
+        "terminal_s_d_mps": float(frenet_path.s_d[-1]),
+    }
 
     # --- Evaluate: explicit feasibility + collision status.
     t_eval_start = time.perf_counter()
@@ -295,6 +325,7 @@ def plan(request: PlanRequest, config: PlannerConfig) -> PlanResult:
     diagnostics["timing_s"]["evaluation"] = time.perf_counter() - t_eval_start
     diagnostics["checks_evaluated"] = evaluation.checks_evaluated
     diagnostics["checks_failed"] = evaluation.checks_failed
+    diagnostics["feasibility_values"] = evaluation.feasibility_values
     if evaluation.reason is not None:
         diagnostics["reason"] = evaluation.reason
     if evaluation.colliding_agent_id is not None:

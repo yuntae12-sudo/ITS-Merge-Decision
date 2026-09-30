@@ -90,19 +90,164 @@ def _lateral_quintic(
     )
 
 
+MAX_TERMINAL_SPEED_SEARCH_ITERATIONS = 40
+# Bisection iteration cap for _solve_feasible_terminal_speed. 2^-40 of
+# any physically reasonable initial search bracket (bounded by
+# NOMINAL_CRUISE_SPEED_MPS-scale speeds, i.e. at most ~tens of m/s) is
+# far below floating-point-meaningful precision, so this is a
+# deterministic, generous cap, never actually exhausted in practice
+# (see TERMINAL_SPEED_SEARCH_TOLERANCE_MPS below for the real stopping
+# condition).
+TERMINAL_SPEED_SEARCH_TOLERANCE_MPS = 1e-6
+
+
+@dataclasses.dataclass(frozen=True)
+class FeasibleTerminalSpeedResult:
+    """Diagnostic-only (read-only) record of how
+    ``_solve_feasible_terminal_speed`` arrived at the terminal speed
+    actually used for one quartic velocity-keeping candidate. Never
+    consulted by any behavior/training/reward decision -- surfaced
+    purely for observability (see frenet_planner.py's diagnostics
+    dict)."""
+
+    requested_reference_speed_mps: float
+    feasible_terminal_speed_mps: float
+    terminal_speed_was_limited: bool
+    terminal_speed_limit_reason: Optional[str]
+    original_predicted_max_abs_accel_mps2: float
+    final_predicted_max_abs_accel_mps2: float
+    acceleration_limit_mps2: float
+
+
+def _exact_max_abs_longitudinal_accel(
+    s_d0: float, s_dd0: float, vT: float, horizon_s: float,
+) -> float:
+    """Exact continuous-time max|acceleration(t)| over t in [0, T] for
+    the quartic velocity-keeping profile solved with
+    (v0=s_d0, a0_acc=s_dd0, vT=vT, aT=0.0, T=horizon_s).
+
+    acceleration(t) = 2*a2 + 6*a3*t + 12*a4*t^2 is QUADRATIC in t (see
+    QuarticPolynomial.acceleration), so its exact extrema over a closed
+    interval are just the two endpoints plus (if it falls inside the
+    interval) the single vertex t* = -a3/(4*a4) -- no sampling/search
+    over t is needed, only over the 3 candidate points below."""
+
+    poly = QuarticPolynomial.solve(
+        p0=0.0, v0=s_d0, a0_acc=s_dd0, vT=vT, aT=0.0, T=horizon_s,
+    )
+    a2, a3, a4 = poly.coeffs[2], poly.coeffs[3], poly.coeffs[4]
+
+    candidate_times = [0.0, horizon_s]
+    if abs(a4) > 1e-12:
+        t_star = -a3 / (4.0 * a4)
+        if 0.0 <= t_star <= horizon_s:
+            candidate_times.append(t_star)
+
+    return max(abs(2.0 * a2 + 6.0 * a3 * t + 12.0 * a4 * t * t) for t in candidate_times)
+
+
+def _solve_feasible_terminal_speed(
+    s_d0: float, s_dd0: float, desired_vT: float, horizon_s: float,
+    max_longitudinal_accel_mps2: float,
+) -> FeasibleTerminalSpeedResult:
+    """Finds the terminal speed closest to ``desired_vT`` (on the
+    segment between ``s_d0`` and ``desired_vT``) whose quartic
+    velocity-keeping profile satisfies
+    ``max|acceleration(t)| <= max_longitudinal_accel_mps2`` over the
+    full continuous horizon -- handles BOTH speed-up
+    (desired_vT > s_d0) and speed-down (desired_vT < s_d0) symmetrically.
+
+    Deterministic bisection (not a general-purpose optimizer): for
+    fixed (s_d0, s_dd0, horizon_s), ``_exact_max_abs_longitudinal_accel``
+    is monotonically non-decreasing as vT moves AWAY from s_d0 in
+    either direction (verified: the quartic's t=0/t=T/vertex-extrema
+    accelerations are each affine in vT for fixed s_d0/s_dd0/horizon_s,
+    so the max of their absolute values is a convex, unimodal function
+    of vT with its minimum at/near vT=s_d0) -- so a simple bisection
+    between s_d0 (always the least-demanding endpoint) and desired_vT
+    converges to the unique feasible boundary point on that segment.
+    """
+
+    original_accel = _exact_max_abs_longitudinal_accel(s_d0, s_dd0, desired_vT, horizon_s)
+    if original_accel <= max_longitudinal_accel_mps2:
+        return FeasibleTerminalSpeedResult(
+            requested_reference_speed_mps=desired_vT,
+            feasible_terminal_speed_mps=desired_vT,
+            terminal_speed_was_limited=False,
+            terminal_speed_limit_reason=None,
+            original_predicted_max_abs_accel_mps2=original_accel,
+            final_predicted_max_abs_accel_mps2=original_accel,
+            acceleration_limit_mps2=max_longitudinal_accel_mps2,
+        )
+
+    # desired_vT is infeasible; s_d0 itself (zero net speed change) is
+    # always at least as feasible as any point further from it, so the
+    # feasible boundary lies strictly between s_d0 and desired_vT.
+    lo, hi = s_d0, desired_vT  # lo: feasible side, hi: infeasible side
+    for _ in range(MAX_TERMINAL_SPEED_SEARCH_ITERATIONS):
+        if abs(hi - lo) <= TERMINAL_SPEED_SEARCH_TOLERANCE_MPS:
+            break
+        mid = 0.5 * (lo + hi)
+        mid_accel = _exact_max_abs_longitudinal_accel(s_d0, s_dd0, mid, horizon_s)
+        if mid_accel <= max_longitudinal_accel_mps2:
+            lo = mid
+        else:
+            hi = mid
+
+    feasible_vT = lo
+    final_accel = _exact_max_abs_longitudinal_accel(s_d0, s_dd0, feasible_vT, horizon_s)
+    reason = (
+        "requested reference speed exceeds max_longitudinal_accel_mps2 "
+        f"over trajectory_horizon_s={horizon_s}s from current "
+        f"s_d0={s_d0:.3f} m/s (speed-up)" if desired_vT > s_d0 else
+        "requested reference speed exceeds max_longitudinal_accel_mps2 "
+        f"over trajectory_horizon_s={horizon_s}s from current "
+        f"s_d0={s_d0:.3f} m/s (speed-down)"
+    )
+    return FeasibleTerminalSpeedResult(
+        requested_reference_speed_mps=desired_vT,
+        feasible_terminal_speed_mps=feasible_vT,
+        terminal_speed_was_limited=True,
+        terminal_speed_limit_reason=reason,
+        original_predicted_max_abs_accel_mps2=original_accel,
+        final_predicted_max_abs_accel_mps2=final_accel,
+        acceleration_limit_mps2=max_longitudinal_accel_mps2,
+    )
+
+
 def _longitudinal_quartic_velocity_keeping(
     s0: float, s_d0: float, s_dd0: float,
     target_speed_mps: float, horizon_s: float,
-) -> QuarticPolynomial:
+    max_longitudinal_accel_mps2: Optional[float] = None,
+) -> "tuple[QuarticPolynomial, Optional[FeasibleTerminalSpeedResult]]":
     """KEEP/FOLLOW/MERGE-with-no-lead longitudinal profile: converge
     toward a target speed, terminal position free (Stage 3-B's own
     quartic primitive, used exactly as documented for velocity-
-    keeping)."""
+    keeping).
 
+    When ``max_longitudinal_accel_mps2`` is given, the ACTUAL terminal
+    speed used is shaped to the closest physically feasible speed (see
+    ``_solve_feasible_terminal_speed``) -- ``target_speed_mps`` itself
+    (the caller's desired/requested speed, i.e.
+    ``BehaviorObjective.reference_speed_mps``) is never mutated by this
+    function; only the trajectory generated FROM it is shaped. When
+    ``None`` (default, e.g. STOP's own quintic path never calls this),
+    the terminal speed is used exactly as given, matching this
+    function's original unconditional behavior."""
+
+    if max_longitudinal_accel_mps2 is None:
+        return QuarticPolynomial.solve(
+            p0=s0, v0=s_d0, a0_acc=s_dd0,
+            vT=target_speed_mps, aT=0.0, T=horizon_s,
+        ), None
+
+    feasibility_result = _solve_feasible_terminal_speed(
+        s_d0, s_dd0, target_speed_mps, horizon_s, max_longitudinal_accel_mps2,
+    )
     return QuarticPolynomial.solve(
         p0=s0, v0=s_d0, a0_acc=s_dd0,
-        vT=target_speed_mps, aT=0.0, T=horizon_s,
-    )
+        vT=feasibility_result.feasible_terminal_speed_mps, aT=0.0, T=horizon_s,
+    ), feasibility_result
 
 
 def generate_keep_candidate(
@@ -110,21 +255,31 @@ def generate_keep_candidate(
     reference_speed_mps: float,
     horizon_s: float,
     dt_s: float,
-) -> FrenetPath:
+    max_longitudinal_accel_mps2: Optional[float] = None,
+) -> "tuple[FrenetPath, Optional[FeasibleTerminalSpeedResult]]":
     """KEEP: lateral quintic to d=0 in the SOURCE frame; longitudinal
     quartic velocity-keeping toward ``reference_speed_mps`` (terminal
-    position free -- no fixed cruise target position exists)."""
+    position free -- no fixed cruise target position exists).
 
-    return _build_frenet_path(
+    ``reference_speed_mps`` is never mutated (see
+    ``_longitudinal_quartic_velocity_keeping``'s docstring) -- when
+    ``max_longitudinal_accel_mps2`` is given, the returned
+    ``FrenetPath`` is shaped toward the closest physically feasible
+    terminal speed instead, and the second return value documents how.
+    """
+
+    longitudinal_poly, feasibility_result = _longitudinal_quartic_velocity_keeping(
+        ego_frenet.s, ego_frenet.s_d, ego_frenet.s_dd,
+        reference_speed_mps, horizon_s, max_longitudinal_accel_mps2,
+    )
+    frenet_path = _build_frenet_path(
         lateral_poly=_lateral_quintic(
             ego_frenet.d, ego_frenet.d_d, ego_frenet.d_dd, horizon_s
         ),
-        longitudinal_poly=_longitudinal_quartic_velocity_keeping(
-            ego_frenet.s, ego_frenet.s_d, ego_frenet.s_dd,
-            reference_speed_mps, horizon_s,
-        ),
+        longitudinal_poly=longitudinal_poly,
         horizon_s=horizon_s, dt_s=dt_s,
     )
+    return frenet_path, feasibility_result
 
 
 def generate_follow_or_merge_candidate(
@@ -132,7 +287,8 @@ def generate_follow_or_merge_candidate(
     reference_speed_mps: float,
     horizon_s: float,
     dt_s: float,
-) -> FrenetPath:
+    max_longitudinal_accel_mps2: Optional[float] = None,
+) -> "tuple[FrenetPath, Optional[FeasibleTerminalSpeedResult]]":
     """FOLLOW (source frame) and MERGE-longitudinal (target frame):
     identical shape to KEEP's longitudinal profile -- a quartic
     velocity-keeping trajectory toward ``reference_speed_mps``.
@@ -141,14 +297,18 @@ def generate_follow_or_merge_candidate(
     ``BehaviorExecutor.compute_objective`` already decided (a time-gap
     -style follow speed against the current causal lead, or the
     nominal cruise speed if no lead/objective calls for it) -- this
-    function does not re-derive that speed, only executes it. Lateral
-    handling is identical to KEEP's (quintic to d=0), just expressed
-    in whichever frame the caller has already projected ``ego_frenet``
-    into (source for FOLLOW, target for MERGE -- see
-    frenet_planner.py).
+    function does not re-derive that speed, only executes it (the
+    DESIRED speed is unchanged; only the generated trajectory is
+    feasibility-shaped, exactly as ``generate_keep_candidate``
+    documents). Lateral handling is identical to KEEP's (quintic to
+    d=0), just expressed in whichever frame the caller has already
+    projected ``ego_frenet`` into (source for FOLLOW, target for MERGE
+    -- see frenet_planner.py).
     """
 
-    return generate_keep_candidate(ego_frenet, reference_speed_mps, horizon_s, dt_s)
+    return generate_keep_candidate(
+        ego_frenet, reference_speed_mps, horizon_s, dt_s, max_longitudinal_accel_mps2,
+    )
 
 
 MIN_STOP_HORIZON_S = 1.0

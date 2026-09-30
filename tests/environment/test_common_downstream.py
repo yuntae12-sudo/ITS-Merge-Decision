@@ -273,6 +273,13 @@ def test_planner_infeasible_propagates_and_mpc_never_invoked(planner_config, mpc
     assert result.command is None
     assert len(calls) == 0, "MPC solve() must not be invoked when the planner reports PLANNER_INFEASIBLE"
 
+    # Diagnostic instrumentation (additive, read-only): the planner's
+    # own checks_failed/feasibility_values must survive verbatim into
+    # CommonDownstream's own diagnostics, under the "planner" key.
+    planner_diagnostics = result.diagnostics["planner"]
+    assert len(planner_diagnostics["checks_failed"]) > 0
+    assert planner_diagnostics["feasibility_values"]
+
 
 def test_invalid_reference_propagates_and_mpc_never_invoked(planner_config, mpc_config, source_ref, target_ref):
     downstream = _downstream(planner_config, mpc_config)

@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 
 from src.planning.candidate_generator import (
+    _exact_max_abs_longitudinal_accel,
+    _solve_feasible_terminal_speed,
     generate_follow_or_merge_candidate,
     generate_keep_candidate,
     generate_stop_candidate,
@@ -56,7 +58,7 @@ def _straight_ego_state(s=10.0, s_d=15.0, d=0.5):
 
 def test_keep_converges_toward_reference_speed(straight_ref):
     ego = _straight_ego_state(s_d=10.0)
-    path = generate_keep_candidate(ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S)
+    path, _ = generate_keep_candidate(ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S)
     assert np.isclose(path.s_d[-1], 15.0, atol=1e-6)
     assert np.isclose(path.d[-1], 0.0, atol=1e-6)
     assert np.isclose(path.d_d[-1], 0.0, atol=1e-6)
@@ -64,7 +66,7 @@ def test_keep_converges_toward_reference_speed(straight_ref):
 
 def test_keep_lateral_converges_to_zero_from_nonzero_offset(straight_ref):
     ego = _straight_ego_state(d=1.2)
-    path = generate_keep_candidate(ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S)
+    path, _ = generate_keep_candidate(ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S)
     assert np.isclose(path.d[0], 1.2, atol=1e-6)
     assert np.isclose(path.d[-1], 0.0, atol=1e-8)
     # monotonically converging, not oscillating wildly
@@ -100,7 +102,7 @@ def test_stop_clamps_when_target_exceeds_reference_domain():
 
 def test_keep_and_stop_produce_physically_different_longitudinal_trajectories(straight_ref):
     ego = _straight_ego_state(s=10.0, s_d=15.0)
-    keep_path = generate_keep_candidate(ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S)
+    keep_path, _ = generate_keep_candidate(ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S)
     stop_result = generate_stop_candidate(ego, COMFORTABLE_DECEL, HORIZON_S, DT_S, straight_ref)
     stop_path = stop_result.frenet_path
 
@@ -132,10 +134,10 @@ def test_follow_reacts_to_closer_faster_closing_lead_with_lower_target_speed():
     close_fast_speed = follow_speed(relative_speed_mps=8.0)  # closing fast
     far_slow_speed = follow_speed(relative_speed_mps=0.0)  # not closing
 
-    close_path = generate_follow_or_merge_candidate(
+    close_path, _ = generate_follow_or_merge_candidate(
         ego, close_fast_speed, HORIZON_S, DT_S,
     )
-    far_path = generate_follow_or_merge_candidate(
+    far_path, _ = generate_follow_or_merge_candidate(
         ego, far_slow_speed, HORIZON_S, DT_S,
     )
 
@@ -161,7 +163,7 @@ def test_merge_terminal_lateral_position_converges_to_zero_in_target_frame():
     # Ego should show up ~3.5m to the right (d<0) of the target lane.
     assert ego_frenet_in_target.d < -3.0
 
-    merge_path = generate_follow_or_merge_candidate(
+    merge_path, _ = generate_follow_or_merge_candidate(
         ego_frenet_in_target, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S,
     )
     assert np.isclose(merge_path.d[-1], 0.0, atol=1e-6)
@@ -190,9 +192,9 @@ def test_merge_keep_stop_produce_meaningfully_different_trajectories():
     ego_frenet_source = project_cartesian_to_frame(ego_x, ego_y, ego_yaw, ego_speed, source_ref)
     ego_frenet_target = project_cartesian_to_frame(ego_x, ego_y, ego_yaw, ego_speed, target_ref)
 
-    keep_path = generate_keep_candidate(ego_frenet_source, 15.0, HORIZON_S, DT_S)
+    keep_path, _ = generate_keep_candidate(ego_frenet_source, 15.0, HORIZON_S, DT_S)
     stop_result = generate_stop_candidate(ego_frenet_source, COMFORTABLE_DECEL, HORIZON_S, DT_S, source_ref)
-    merge_path = generate_follow_or_merge_candidate(ego_frenet_target, 15.0, HORIZON_S, DT_S)
+    merge_path, _ = generate_follow_or_merge_candidate(ego_frenet_target, 15.0, HORIZON_S, DT_S)
 
     # Convert all three to Cartesian (their own respective frames) to
     # compare physical trajectories on common ground.
@@ -226,3 +228,144 @@ def test_merge_keep_stop_produce_meaningfully_different_trajectories():
     assert merge_y[-1] > 3.0
     assert abs(keep_y[-1]) < 0.5
     assert abs(stop_y[-1]) < 0.5
+
+
+# ======================================================================
+# Planner-side terminal-speed feasibility shaping
+# (_solve_feasible_terminal_speed / _exact_max_abs_longitudinal_accel)
+# ======================================================================
+
+ACCEL_LIMIT = 6.0
+
+
+def test_feasibility_a_within_limit_terminal_speed_unchanged():
+    """A small requested speed-up (well within the acceleration bound)
+    must pass through unshaped -- the feasible terminal speed is
+    exactly the requested one, not merely close to it."""
+
+    result = _solve_feasible_terminal_speed(
+        s_d0=10.0, s_dd0=0.0, desired_vT=12.0, horizon_s=HORIZON_S,
+        max_longitudinal_accel_mps2=ACCEL_LIMIT,
+    )
+    assert not result.terminal_speed_was_limited
+    assert result.feasible_terminal_speed_mps == pytest.approx(12.0)
+    assert result.final_predicted_max_abs_accel_mps2 <= ACCEL_LIMIT
+
+
+def test_feasibility_b_large_speed_up_is_limited_within_bound():
+    """A large speed-up request infeasible at the desired speed must be
+    shaped to a feasible terminal speed whose continuous-time
+    max|accel| stays within the limit."""
+
+    desired_vT = 20.0
+    result = _solve_feasible_terminal_speed(
+        s_d0=0.0, s_dd0=0.0, desired_vT=desired_vT, horizon_s=HORIZON_S,
+        max_longitudinal_accel_mps2=ACCEL_LIMIT,
+    )
+    assert result.terminal_speed_was_limited
+    assert result.feasible_terminal_speed_mps < desired_vT
+    assert result.final_predicted_max_abs_accel_mps2 <= ACCEL_LIMIT + 1e-6
+    assert result.original_predicted_max_abs_accel_mps2 > ACCEL_LIMIT
+
+
+def test_feasibility_c_large_speed_down_is_limited_within_bound():
+    """A large speed-DOWN request must be shaped symmetrically --
+    deceleration is bound by the same acceleration-magnitude limit, and
+    the feasible terminal speed must land strictly between the desired
+    (0.0) and current (20.0) speed, not silently ignored."""
+
+    result = _solve_feasible_terminal_speed(
+        s_d0=20.0, s_dd0=0.0, desired_vT=0.0, horizon_s=HORIZON_S,
+        max_longitudinal_accel_mps2=ACCEL_LIMIT,
+    )
+    assert result.terminal_speed_was_limited
+    assert 0.0 < result.feasible_terminal_speed_mps < 20.0
+    assert result.final_predicted_max_abs_accel_mps2 <= ACCEL_LIMIT + 1e-6
+
+
+def test_feasibility_d_nonzero_initial_acceleration_still_bounded():
+    """A nonzero initial s_dd0 (ego already accelerating/decelerating)
+    must not break the continuous-time bound -- the shaped trajectory's
+    EXACT (endpoint + interior extremum) max|accel| must still respect
+    the limit, not just the boundary samples."""
+
+    result = _solve_feasible_terminal_speed(
+        s_d0=5.0, s_dd0=2.5, desired_vT=25.0, horizon_s=HORIZON_S,
+        max_longitudinal_accel_mps2=ACCEL_LIMIT,
+    )
+    assert result.terminal_speed_was_limited
+    assert result.final_predicted_max_abs_accel_mps2 <= ACCEL_LIMIT + 1e-6
+    # Verify independently via the exact evaluator (not just trusting
+    # the solver's own reported value).
+    verified = _exact_max_abs_longitudinal_accel(
+        s_d0=5.0, s_dd0=2.5, vT=result.feasible_terminal_speed_mps, horizon_s=HORIZON_S,
+    )
+    assert verified <= ACCEL_LIMIT + 1e-6
+
+
+def test_feasibility_e_boundary_case_converges_without_oscillation():
+    """Requesting a terminal speed placed exactly at the feasibility
+    boundary must converge to a stable answer (no numerical blow-up/
+    oscillation) within the deterministic bisection's iteration cap."""
+
+    # From the quartic sanity check (a0_acc=0, T=3.0): delta_v=12.0
+    # implies max|accel|=6.0 exactly -- i.e. exactly at the boundary.
+    result = _solve_feasible_terminal_speed(
+        s_d0=0.0, s_dd0=0.0, desired_vT=12.0, horizon_s=HORIZON_S,
+        max_longitudinal_accel_mps2=ACCEL_LIMIT,
+    )
+    assert result.final_predicted_max_abs_accel_mps2 <= ACCEL_LIMIT + 1e-6
+    assert np.isfinite(result.feasible_terminal_speed_mps)
+
+
+def test_feasibility_f_keep_follow_merge_semantics_unchanged():
+    """Reference-lane / lateral-convergence semantics for KEEP and
+    MERGE must be untouched by feasibility shaping -- only the
+    longitudinal terminal speed is affected."""
+
+    ego = FrenetState(s=10.0, s_d=0.0, s_dd=0.0, d=1.0, d_d=0.0, d_dd=0.0)
+    path, feasibility = generate_keep_candidate(
+        ego, reference_speed_mps=20.0, horizon_s=HORIZON_S, dt_s=DT_S,
+        max_longitudinal_accel_mps2=ACCEL_LIMIT,
+    )
+    assert feasibility is not None
+    assert feasibility.terminal_speed_was_limited
+    # Lateral convergence (d -> 0) is a completely independent
+    # sub-problem from the longitudinal feasibility shaping.
+    assert np.isclose(path.d[-1], 0.0, atol=1e-6)
+    assert np.isclose(path.s_d[-1], feasibility.feasible_terminal_speed_mps, atol=1e-3)
+
+
+def test_feasibility_g_stop_trajectory_unaffected():
+    """STOP uses a completely separate natural-horizon quintic path
+    (generate_stop_candidate) that never calls the quartic
+    velocity-keeping feasibility machinery -- its own output must be
+    numerically identical regardless of this change."""
+
+    ego = FrenetState(s=10.0, s_d=12.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
+    straight_ref = ReferenceLine.from_lane_polyline(_make_polyline(_straight_line()))
+    result = generate_stop_candidate(ego, COMFORTABLE_DECEL, HORIZON_S, DT_S, straight_ref)
+    assert result.ok
+    assert np.isclose(result.frenet_path.s_d[-1], 0.0, atol=1e-6)
+
+
+def test_feasibility_h_existing_ok_candidate_unaffected_by_shaping():
+    """A candidate that was ALREADY feasible before this change must
+    produce byte-/numerically-identical output whether or not
+    max_longitudinal_accel_mps2 is supplied -- feasibility shaping must
+    be a no-op on already-feasible trajectories."""
+
+    ego = FrenetState(s=10.0, s_d=15.0, s_dd=0.0, d=0.0, d_d=0.0, d_dd=0.0)
+    path_unshaped, feasibility_none = generate_keep_candidate(
+        ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S,
+    )
+    path_shaped, feasibility_result = generate_keep_candidate(
+        ego, reference_speed_mps=15.0, horizon_s=HORIZON_S, dt_s=DT_S,
+        max_longitudinal_accel_mps2=ACCEL_LIMIT,
+    )
+    assert feasibility_none is None
+    assert feasibility_result is not None
+    assert not feasibility_result.terminal_speed_was_limited
+    assert np.allclose(path_unshaped.s, path_shaped.s, atol=1e-9)
+    assert np.allclose(path_unshaped.s_d, path_shaped.s_d, atol=1e-9)
+    assert np.allclose(path_unshaped.s_dd, path_shaped.s_dd, atol=1e-9)

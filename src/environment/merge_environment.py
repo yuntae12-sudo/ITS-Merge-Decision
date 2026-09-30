@@ -388,6 +388,16 @@ class MergeEnvironment:
         self._controller_failure_count: int = 0
         self._invalid_reference_count: int = 0
 
+        # Diagnostic-only streak tracking (never consulted by any
+        # behavior/termination decision): consecutive
+        # PLANNER_INFEASIBLE-status steps, consecutive fallback
+        # -command steps (any non-OK downstream_status), and the first
+        # episode step (if any) a PLANNER_INFEASIBLE status occurred.
+        self._previous_downstream_status: Optional[str] = None
+        self._consecutive_planner_infeasible_steps: int = 0
+        self._consecutive_fallback_steps: int = 0
+        self._first_planner_infeasible_step: Optional[int] = None
+
     # ------------------------------------------------------------------
     # reset
     # ------------------------------------------------------------------
@@ -492,6 +502,10 @@ class MergeEnvironment:
         self._collision_blocked_count = 0
         self._controller_failure_count = 0
         self._invalid_reference_count = 0
+        self._previous_downstream_status = None
+        self._consecutive_planner_infeasible_steps = 0
+        self._consecutive_fallback_steps = 0
+        self._first_planner_infeasible_step = None
 
         if self._downstream_mode == "frenet_mpc":
             # Fresh episode: clear the MPC's warm-start and any cached
@@ -540,6 +554,7 @@ class MergeEnvironment:
         )
 
         downstream_status = None
+        downstream_diagnostics = None
         downstream_reference_rebuilt = None
 
         if self._downstream_mode == "legacy":
@@ -555,7 +570,7 @@ class MergeEnvironment:
                 ego_speed_mps=ego_speed,
             )
         else:
-            command, downstream_status = self._compute_frenet_mpc_command(
+            command, downstream_status, downstream_diagnostics = self._compute_frenet_mpc_command(
                 executed_action, objective, observation_before
             )
             # Stage 3-H Section 3: count this step's intervention
@@ -633,6 +648,7 @@ class MergeEnvironment:
             chain_advanced=chain_advanced,
             termination_reason=termination_result.reason,
             downstream_status=downstream_status,
+            downstream_diagnostics=downstream_diagnostics,
             downstream_reference_rebuilt=downstream_reference_rebuilt,
         )
 
@@ -746,6 +762,24 @@ class MergeEnvironment:
         elif downstream_status == DownstreamStatus.INVALID_REFERENCE:
             self._invalid_reference_count += 1
 
+        # Diagnostic-only streak tracking (see __init__'s field
+        # docstring): never consulted by any behavior/termination
+        # decision, only surfaced in info for root-cause analysis.
+        status_value = (
+            downstream_status.value if downstream_status is not None else None
+        )
+        if status_value == DownstreamStatus.PLANNER_INFEASIBLE.value:
+            self._consecutive_planner_infeasible_steps += 1
+            if self._first_planner_infeasible_step is None:
+                self._first_planner_infeasible_step = self._steps_elapsed
+        else:
+            self._consecutive_planner_infeasible_steps = 0
+        if status_value is not None and status_value != DownstreamStatus.OK.value:
+            self._consecutive_fallback_steps += 1
+        else:
+            self._consecutive_fallback_steps = 0
+        self._previous_downstream_status = status_value
+
     def _resolve_reference_polyline(self, objective):
         source_polyline = self._polylines_by_id[
             self._episode_context.active_source_lane_id
@@ -858,12 +892,16 @@ class MergeEnvironment:
         numbers is created here, per the Stage 3-0 fairness audit) and
         calls Stage 3-E's ``CommonDownstream``.
 
-        Returns ``(command, downstream_status)``. On any non-OK
-        status, ``command`` is Stage 3-F's fallback braking command
-        (see module-level ``FALLBACK_DECELERATION_MPS2`` for the exact
-        value/rationale) -- ``downstream_status`` still reports the
-        real failure explicitly (surfaced in ``info`` by the caller),
-        so this is never a silently-reported success.
+        Returns ``(command, downstream_status, downstream_diagnostics)``.
+        On any non-OK status, ``command`` is Stage 3-F's fallback
+        braking command (see module-level ``FALLBACK_DECELERATION_MPS2``
+        for the exact value/rationale) -- ``downstream_status`` still
+        reports the real failure explicitly (surfaced in ``info`` by
+        the caller), so this is never a silently-reported success.
+        ``downstream_diagnostics`` is ``CommonDownstream``'s own
+        diagnostics dict (verbatim, read-only) -- surfaced in ``info``
+        for observability only; never consulted by any behavior
+        decision here.
         """
 
         source_reference, target_reference = self._get_active_reference_lines()
@@ -912,9 +950,9 @@ class MergeEnvironment:
                 acceleration_mps2=FALLBACK_DECELERATION_MPS2,
                 steering_curvature=FALLBACK_STEERING_CURVATURE,
             )
-            return fallback_command, result.status
+            return fallback_command, result.status, result.diagnostics
 
-        return result.command, result.status
+        return result.command, result.status, result.diagnostics
 
     def _build_observation(self) -> np.ndarray:
         traj = self._state.current_sim_trajectory
@@ -1153,6 +1191,7 @@ class MergeEnvironment:
         chain_advanced=None,
         termination_reason=None,
         downstream_status=None,
+        downstream_diagnostics=None,
         downstream_reference_rebuilt=None,
     ) -> dict:
         return {
@@ -1190,6 +1229,13 @@ class MergeEnvironment:
             "downstream_status": (
                 downstream_status.value if downstream_status is not None else None
             ),
+            # Diagnostic-only, additive (Stage 3-C/3-E feasibility/
+            # collision instrumentation): CommonDownstream's own
+            # diagnostics dict, verbatim -- never consulted by any
+            # behavior/termination/reward decision. `None` in legacy
+            # downstream mode (no planner/controller exists there) or
+            # before the first frenet_mpc step (reset-time info call).
+            "downstream_diagnostics": downstream_diagnostics,
             "downstream_reference_rebuilt": downstream_reference_rebuilt,
             # Stage 3-H Section 3: episode-CUMULATIVE (not per-step)
             # intervention diagnostics. Always 0 / 0.0 in legacy mode
@@ -1213,5 +1259,16 @@ class MergeEnvironment:
             "intervention_rate": (
                 self._downstream_failure_count / self._steps_elapsed
                 if self._steps_elapsed > 0 else 0.0
+            ),
+            # Diagnostic-only streak tracking (see __init__'s field
+            # docstring): never consulted by any behavior/termination
+            # decision.
+            "previous_downstream_status": self._previous_downstream_status,
+            "consecutive_planner_infeasible_steps": self._consecutive_planner_infeasible_steps,
+            "consecutive_fallback_steps": self._consecutive_fallback_steps,
+            "first_planner_infeasible_step": self._first_planner_infeasible_step,
+            "steps_since_first_planner_infeasible": (
+                self._steps_elapsed - self._first_planner_infeasible_step
+                if self._first_planner_infeasible_step is not None else None
             ),
         }

@@ -474,6 +474,10 @@ def test_downstream_failure_fallback_never_alters_requested_or_executed_action(
     assert info["controller_acceleration_mps2"] < 0.0
     assert info["controller_steering_curvature"] == pytest.approx(0.0)
     assert np.isfinite(info["controller_acceleration_mps2"])
+    # Diagnostic instrumentation (additive, read-only): the
+    # CommonDownstream diagnostics dict must reach info verbatim,
+    # never dropped by _compute_frenet_mpc_command/_build_info.
+    assert info["downstream_diagnostics"] == {"forced_failure_for_test": True}
 
 
 def test_fallback_command_finite_and_bounded_on_forced_controller_failure(
@@ -749,6 +753,7 @@ def test_intervention_fields_present_and_zero_in_legacy_mode():
     _, reset_info = legacy_env.reset(SINGLE_MANEUVER)
     assert reset_info["downstream_failure_count"] == 0
     assert reset_info["intervention_rate"] == pytest.approx(0.0)
+    assert reset_info["downstream_diagnostics"] is None
 
     for _ in range(5):
         _, _, terminated, truncated, step_info = legacy_env.step(BehaviorAction.KEEP)
@@ -758,5 +763,9 @@ def test_intervention_fields_present_and_zero_in_legacy_mode():
         assert step_info["controller_failure_count"] == 0
         assert step_info["invalid_reference_count"] == 0
         assert step_info["intervention_rate"] == pytest.approx(0.0)
+        # Diagnostic instrumentation is frenet_mpc-only: legacy mode
+        # never calls CommonDownstream, so this stays None (never a
+        # fabricated/empty-dict placeholder).
+        assert step_info["downstream_diagnostics"] is None
         if terminated or truncated:
             break

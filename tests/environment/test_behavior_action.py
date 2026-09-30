@@ -165,6 +165,24 @@ def test_merge_uses_target_lead_when_present():
     assert objective.reference_speed_mps < NOMINAL_CRUISE_SPEED_MPS
 
 
+def test_merge_no_lead_reference_speed_is_nominal_cruise_regardless_of_ego_speed():
+    """BehaviorExecutor's desired-speed semantics are restored to their
+    original, unconditional form (Planner-side feasibility shaping now
+    owns physical feasibility -- see
+    src/planning/candidate_generator.py's
+    _solve_feasible_terminal_speed): MERGE-with-no-lead always targets
+    NOMINAL_CRUISE_SPEED_MPS, independent of ego's current speed. This
+    is a desired/requested speed, not a claim that it is physically
+    reachable within one planning horizon."""
+
+    executor = BehaviorExecutor()
+    observation = _observation(v_e=0.5)  # near-stationary, no target-front lead
+
+    objective = executor.compute_objective(BehaviorAction.MERGE, observation)
+
+    assert objective.reference_speed_mps == pytest.approx(NOMINAL_CRUISE_SPEED_MPS)
+
+
 def test_stop_is_non_terminal_and_targets_zero_speed():
 
     executor = BehaviorExecutor()

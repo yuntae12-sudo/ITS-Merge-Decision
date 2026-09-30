@@ -100,6 +100,15 @@ class EvaluationResult:
     cartesian_trajectory: Optional[CartesianTrajectory] = None
     colliding_agent_id: Optional[int] = None
     collision_time_s: Optional[float] = None
+    feasibility_values: dict = dataclasses.field(default_factory=dict)
+    """Diagnostic-only (never read by any pass/fail decision above):
+    the measured extreme value backing each feasibility check, keyed
+    by the same names as ``checks_evaluated``/``checks_failed``
+    (``max_abs_longitudinal_accel_mps2``, ``min_forward_progress_s_dot_mps``,
+    ``max_abs_curvature_per_m``, ``max_abs_longitudinal_jerk_mps3``).
+    Always populated once the corresponding check has run, regardless
+    of pass/fail, so a caller can see how close a passing candidate
+    was to a bound, not just whether it failed."""
 
 
 def _frenet_path_to_cartesian(
@@ -207,24 +216,40 @@ def evaluate_candidate(
             cartesian_trajectory=cartesian_trajectory,
         )
 
-    # --- Kinematic/curvature/jerk feasibility checks.
+    # --- Kinematic/curvature/jerk feasibility checks. Diagnostic
+    # extreme values are computed alongside each check (read-only,
+    # never fed back into the pass/fail comparisons above) so a caller
+    # can see how close/far a candidate was from each bound.
+    feasibility_values = {}
+
     checks_evaluated.append("longitudinal_accel")
+    feasibility_values["max_abs_longitudinal_accel_mps2"] = float(
+        np.max(np.abs(frenet_path.s_dd))
+    )
     if np.any(np.abs(frenet_path.s_dd) > limits.max_longitudinal_accel_mps2):
         checks_failed.append("longitudinal_accel")
 
     checks_evaluated.append("forward_progress")
+    feasibility_values["min_forward_progress_s_dot_mps"] = float(
+        np.min(frenet_path.s_d)
+    )
     if np.any(frenet_path.s_d < limits.min_forward_progress_s_dot_mps):
         checks_failed.append("forward_progress")
 
     checks_evaluated.append("curvature")
+    feasibility_values["max_abs_curvature_per_m"] = float(
+        np.max(np.abs(cartesian_trajectory.curvature))
+    )
     if np.any(np.abs(cartesian_trajectory.curvature) > limits.max_curvature_per_m):
         checks_failed.append("curvature")
 
     checks_evaluated.append("longitudinal_jerk")
-    if frenet_path.s_ddd is not None and np.any(
-        np.abs(frenet_path.s_ddd) > limits.max_longitudinal_jerk_mps3
-    ):
-        checks_failed.append("longitudinal_jerk")
+    if frenet_path.s_ddd is not None:
+        feasibility_values["max_abs_longitudinal_jerk_mps3"] = float(
+            np.max(np.abs(frenet_path.s_ddd))
+        )
+        if np.any(np.abs(frenet_path.s_ddd) > limits.max_longitudinal_jerk_mps3):
+            checks_failed.append("longitudinal_jerk")
 
     if checks_failed:
         return EvaluationResult(
@@ -233,6 +258,7 @@ def evaluate_candidate(
             checks_evaluated=tuple(checks_evaluated),
             checks_failed=tuple(checks_failed),
             cartesian_trajectory=cartesian_trajectory,
+            feasibility_values=feasibility_values,
         )
 
     # --- Collision check (only reached if kinematically feasible;
@@ -254,6 +280,7 @@ def evaluate_candidate(
             cartesian_trajectory=cartesian_trajectory,
             colliding_agent_id=agent_id,
             collision_time_s=collision_time_s,
+            feasibility_values=feasibility_values,
         )
 
     return EvaluationResult(
@@ -261,4 +288,5 @@ def evaluate_candidate(
         checks_evaluated=tuple(checks_evaluated),
         checks_failed=(),
         cartesian_trajectory=cartesian_trajectory,
+        feasibility_values=feasibility_values,
     )
