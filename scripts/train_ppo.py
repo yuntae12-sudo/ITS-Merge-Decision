@@ -34,6 +34,7 @@ from src.training.checkpoint import (
 )
 from src.training.config import load_ppo_config, load_reward_config
 from src.training.provenance import load_dataset_provenance
+from src.training.progress_reporter import ProgressReporter
 from src.training.run_manifest import write_run_manifest
 from src.training.seeding import make_seed_state
 from src.training.trainer import run_training
@@ -232,18 +233,23 @@ def make_periodic_checkpoint_callback(
     config_snapshot: dict,
     numpy_rng,
 ):
+    """Returns a function ``(training_state, rng_key, global_env_step,
+    ppo_update_step) -> Optional[str]`` that saves a periodic checkpoint
+    when due (``ppo_update_step % interval == 0``) and returns the
+    saved path, or ``None`` on an off-interval update / when periodic
+    checkpointing is disabled. Unchanged save format/naming/cadence --
+    only the print statement moved to the caller so it can be merged
+    into the single progress line (display-only)."""
+
     if interval is None or interval == 0:
         return None
     if interval < 0:
         raise ValueError("periodic checkpoint interval must be >= 0")
     checkpoint_dir = Path(checkpoint_dir)
 
-    def on_update(
-        update_index, training_state, rng_key, global_env_step, ppo_update_step
-    ):
-        del update_index
+    def maybe_save(training_state, rng_key, global_env_step, ppo_update_step):
         if ppo_update_step % interval != 0:
-            return
+            return None
         path = checkpoint_dir / f"{filename_prefix}_step{ppo_update_step:06d}.pkl"
         payload = _build_checkpoint_payload(
             training_state=training_state,
@@ -256,7 +262,34 @@ def make_periodic_checkpoint_callback(
             reward_version=reward_version,
         )
         save_checkpoint(payload, str(path))
-        print(f"Saved periodic checkpoint to {path}")
+        return str(path)
+
+    return maybe_save
+
+
+def make_combined_update_callback(periodic_checkpoint_fn, progress_reporter):
+    """Wires the (optional) periodic-checkpoint save and the (always
+    -on) display-only progress reporter into the single ``on_update``
+    callback ``trainer.run_training`` accepts. Pure display/IO
+    composition -- never touches training_state/rng_key beyond passing
+    them through to ``periodic_checkpoint_fn`` unchanged, never raises
+    (a progress-line formatting bug must not abort training)."""
+
+    def on_update(update_index, training_state, rng_key, global_env_step, ppo_update_step):
+        checkpoint_path = None
+        if periodic_checkpoint_fn is not None:
+            checkpoint_path = periodic_checkpoint_fn(
+                training_state, rng_key, global_env_step, ppo_update_step
+            )
+        try:
+            progress_reporter.report(
+                update_index=update_index,
+                global_env_step=global_env_step,
+                ppo_update_step=ppo_update_step,
+                checkpoint_path=checkpoint_path,
+            )
+        except Exception as exc:  # noqa: BLE001 -- display-only, must never abort training.
+            print(f"WARNING: progress display failed ({exc}); training continues unaffected.", flush=True)
 
     return on_update
 
@@ -439,7 +472,7 @@ def main() -> None:
     checkpoint_path = args.checkpoint_path or (
         f"outputs/checkpoints/train_seed{seed}_{int(time.time())}.pkl"
     )
-    periodic_callback = make_periodic_checkpoint_callback(
+    periodic_checkpoint_fn = make_periodic_checkpoint_callback(
         interval=args.checkpoint_every_updates,
         checkpoint_dir="outputs/checkpoints",
         filename_prefix=(f"full_seed{seed}" if args.full_train else f"train_seed{seed}"),
@@ -448,6 +481,10 @@ def main() -> None:
         config_snapshot=checkpoint_config_snapshot,
         numpy_rng=numpy_rng,
     )
+    progress_reporter = ProgressReporter(
+        total_updates=args.num_updates, resumed_from_step=ppo_update_step,
+    )
+    combined_callback = make_combined_update_callback(periodic_checkpoint_fn, progress_reporter)
 
     t0 = time.time()
     result = run_training(
@@ -463,7 +500,7 @@ def main() -> None:
         global_env_step=global_env_step,
         ppo_update_step=ppo_update_step,
         wandb_logger=wandb_logger,
-        on_update=periodic_callback,
+        on_update=combined_callback,
         maneuver_selector=maneuver_selector,
     )
     elapsed = time.time() - t0

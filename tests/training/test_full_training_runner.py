@@ -90,11 +90,13 @@ def test_periodic_checkpoint_interval_contract_and_resume_payload(tmp_path):
         numpy_rng=numpy_rng,
     )
 
-    callback(0, state, jax.random.PRNGKey(1), 11, 1)
+    result_off_interval = callback(state, jax.random.PRNGKey(1), 11, 1)
     assert list(tmp_path.glob("*.pkl")) == []
+    assert result_off_interval is None
 
-    callback(1, state, jax.random.PRNGKey(2), 22, 2)
+    result_on_interval = callback(state, jax.random.PRNGKey(2), 22, 2)
     path = tmp_path / "full_seed0_step000002.pkl"
+    assert result_on_interval == str(path)
     assert path.is_file()
     payload = load_checkpoint(str(path))
     assert payload.global_env_step == 22
