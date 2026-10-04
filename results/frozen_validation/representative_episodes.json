@@ -1,0 +1,47 @@
+{
+  "selector": "src.visualization.outcome_scan.select_representative_episodes",
+  "ordering": "lexicographic_maneuver_id",
+  "max_per_outcome": 5,
+  "selection": {
+    "success": {
+      "maneuver_ids": [
+        "validation_tfexample.tfrecord-00000-of-00150#139__t29__245_146",
+        "validation_tfexample.tfrecord-00000-of-00150#151__t60__327_363",
+        "validation_tfexample.tfrecord-00000-of-00150#152__t9__76_84",
+        "validation_tfexample.tfrecord-00000-of-00150#181__t15__451_604",
+        "validation_tfexample.tfrecord-00000-of-00150#194__t31__287_280"
+      ],
+      "reason": "first 5 of 158 episodes in stable sorted-maneuver_id order"
+    },
+    "collision": {
+      "maneuver_ids": [
+        "validation_tfexample.tfrecord-00000-of-00150#148__t55__418_720",
+        "validation_tfexample.tfrecord-00000-of-00150#154__t73__83_63",
+        "validation_tfexample.tfrecord-00000-of-00150#157__t69__787_736",
+        "validation_tfexample.tfrecord-00000-of-00150#171__t61__274_285",
+        "validation_tfexample.tfrecord-00000-of-00150#186__t50__88_82"
+      ],
+      "reason": "first 5 of 100 episodes in stable sorted-maneuver_id order"
+    },
+    "timeout": {
+      "maneuver_ids": [
+        "validation_tfexample.tfrecord-00000-of-00150#0__t33__206_203",
+        "validation_tfexample.tfrecord-00000-of-00150#0__t89__240_249",
+        "validation_tfexample.tfrecord-00000-of-00150#124__t51__308_309",
+        "validation_tfexample.tfrecord-00000-of-00150#127__t33__104_109",
+        "validation_tfexample.tfrecord-00000-of-00150#131__t42__339_156"
+      ],
+      "reason": "first 5 of 120 episodes in stable sorted-maneuver_id order"
+    },
+    "offroad": {
+      "maneuver_ids": [
+        "validation_tfexample.tfrecord-00000-of-00150#163__t50__233_262",
+        "validation_tfexample.tfrecord-00000-of-00150#22__t15__126_164",
+        "validation_tfexample.tfrecord-00000-of-00150#283__t58__554_555",
+        "validation_tfexample.tfrecord-00002-of-00150#153__t75__584_621",
+        "validation_tfexample.tfrecord-00002-of-00150#210__t16__125_154"
+      ],
+      "reason": "first 5 of 10 episodes in stable sorted-maneuver_id order"
+    }
+  }
+}

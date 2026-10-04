@@ -1,0 +1,15 @@
+{
+  "selection_source": "fixed_train64_checkpoint_progression",
+  "selected_update": 12,
+  "selection_metric_primary": "success_rate",
+  "train64_success_rate": 0.3125,
+  "train64_timeout_rate": 0.21875,
+  "train64_mean_return": -0.09137217333664463,
+  "checkpoint_path": "outputs/checkpoints/full_seed0_step000012.pkl",
+  "checkpoint_sha256": "f1962aa52d5e50a6588732e13623a5e292d7b9d9be8af0720f099911546e4eb1",
+  "checkpoint_seed": 0,
+  "checkpoint_reward_version": "v1",
+  "checkpoint_dataset_schema_version": "merge_decision",
+  "checkpoint_git_sha": "46a01df6c6d8485ad15a30e7b0575dbb53d4edfe",
+  "validation_used_for_selection": false
+}
