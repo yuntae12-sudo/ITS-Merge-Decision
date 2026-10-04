@@ -150,7 +150,7 @@ def compute_source_front_history(record, source_polyline, agent_config, decision
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--split", choices=("training", "validation"), default="training")
+    p.add_argument("--split", choices=tuple(SPLIT_DEFAULTS), default="training")
     return p.parse_args(argv)
 
 
@@ -160,7 +160,7 @@ def main(argv=None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     AUGMENTED_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     records = load_jsonl(cfg["evidence"])
-    assert len(records) == cfg["expected_count"], (
+    assert cfg["expected_count"] is None or len(records) == cfg["expected_count"], (
         f"expected {cfg['expected_count']} for split={args.split!r}, got {len(records)}"
     )
 

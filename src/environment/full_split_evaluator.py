@@ -24,6 +24,13 @@ DECISION_SPLIT_MANIFEST = "data/manifests/merge_split.csv"
 DECISION_EVIDENCE_TRAINING = "data/manifests/evidence_training.jsonl"
 DECISION_EVIDENCE_VALIDATION = "data/manifests/evidence_validation.jsonl"
 
+# Independent frozen TEST split (data/manifests/test/): read only from the
+# frozen TEST manifest/evidence, never by re-scanning raw shards.
+DECISION_TEST_MANEUVER_TABLE = "data/manifests/test/merge_decision_test_manifest.csv"
+DECISION_TEST_SPLIT_MANIFEST = "data/manifests/test/merge_test_split.csv"
+DECISION_EVIDENCE_TEST = "data/manifests/test/evidence_test.jsonl"
+SPLIT_TEST = "test"
+
 DECISION_TIERS_FOR_PPO = ("A", "B")
 DECISION_DATASET_ROLES_FOR_PPO = ("CORE", "SUPPORT")
 DECISION_MERGE_CONTEXT_STATUS_ELIGIBLE = "MERGE_CONTEXT_ELIGIBLE"
@@ -44,6 +51,7 @@ def load_decision_dataset_maneuver_specs(
     split_manifest_path: str = DECISION_SPLIT_MANIFEST,
     evidence_training_path: str = DECISION_EVIDENCE_TRAINING,
     evidence_validation_path: str = DECISION_EVIDENCE_VALIDATION,
+    evidence_test_path: str = DECISION_EVIDENCE_TEST,
 ) -> List[ManeuverSpec]:
     """Loads every ManeuverSpec belonging to one split of the FROZEN
     final MERGE Dataset (data/manifests/merge_*.csv), joined against
@@ -58,9 +66,18 @@ def load_decision_dataset_maneuver_specs(
     contract (see ``MERGE_DATASET_SCHEMA``)."""
 
     which_split = normalize_split_name(which_split)
-    evidence_path = (
-        evidence_training_path if which_split == "train" else evidence_validation_path
-    )
+    if which_split == SPLIT_TEST:
+        # TEST reads only its own frozen manifest/evidence; the canonical
+        # TRAIN/VALIDATION defaults are swapped out unless explicitly overridden.
+        if maneuver_table_path == DECISION_MANEUVER_TABLE:
+            maneuver_table_path = DECISION_TEST_MANEUVER_TABLE
+        if split_manifest_path == DECISION_SPLIT_MANIFEST:
+            split_manifest_path = DECISION_TEST_SPLIT_MANIFEST
+        evidence_path = evidence_test_path
+    elif which_split == "train":
+        evidence_path = evidence_training_path
+    else:
+        evidence_path = evidence_validation_path
     evidence_by_candidate_id = _load_decision_evidence_by_candidate_id(evidence_path)
 
     split_rows = {

@@ -1,0 +1,16 @@
+# Independent frozen WOMD TEST dataset loading configuration.
+# Source: official WOMD validation split, shards 00006..00011 (00000-00005 are the
+# canonical VALIDATION shards and are never used here). Stop rule: first shard where
+# cumulative Tier A+B eligible >= 400 (shard 00011). See data/manifests/test/test_freeze.json.
+dataset_name: WOMD
+split: validation
+shards:
+  - data/womd/validation/validation_tfexample.tfrecord-00006-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00007-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00008-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00009-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00010-of-00150
+  - data/womd/validation/validation_tfexample.tfrecord-00011-of-00150
+max_num_objects: 64
+repeat: 1
+shuffle_seed: null

@@ -1,0 +1,7 @@
+source_shard,total_candidates,merge_context_eligible,tier_A,tier_B,tier_C,ineligible,eligible_AB,cumulative_AB
+validation_tfexample.tfrecord-00006-of-00150,386,62,29,33,65,259,62,62
+validation_tfexample.tfrecord-00007-of-00150,351,76,32,44,44,231,76,138
+validation_tfexample.tfrecord-00008-of-00150,305,58,23,35,50,197,58,196
+validation_tfexample.tfrecord-00009-of-00150,357,69,38,31,56,232,69,265
+validation_tfexample.tfrecord-00010-of-00150,313,77,38,38,39,198,76,341
+validation_tfexample.tfrecord-00011-of-00150,326,65,38,27,51,210,65,406

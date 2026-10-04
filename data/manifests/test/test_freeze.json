@@ -1,0 +1,53 @@
+{
+  "version": "test-v1.0",
+  "freeze_timestamp": "2026-10-04T10:37:05Z",
+  "git_sha": "46a01df6c6d8485ad15a30e7b0575dbb53d4edfe",
+  "source_split": "validation",
+  "source_shards": [
+    "validation_tfexample.tfrecord-00006-of-00150",
+    "validation_tfexample.tfrecord-00007-of-00150",
+    "validation_tfexample.tfrecord-00008-of-00150",
+    "validation_tfexample.tfrecord-00009-of-00150",
+    "validation_tfexample.tfrecord-00010-of-00150",
+    "validation_tfexample.tfrecord-00011-of-00150"
+  ],
+  "first_shard": "00006",
+  "last_shard": "00011",
+  "stop_rule": "first shard where cumulative eligible (MERGE_CONTEXT_ELIGIBLE, Tier A/B, CORE/SUPPORT) >= 400",
+  "per_shard_cumulative_eligible": {
+    "00006": 62,
+    "00007": 138,
+    "00008": 196,
+    "00009": 265,
+    "00010": 341,
+    "00011": 406
+  },
+  "final_eligible_maneuver_count": 406,
+  "unique_scenario_count": 380,
+  "tier_A_count": 198,
+  "tier_B_count": 208,
+  "audit_counts_all_candidates": {
+    "total": 2038,
+    "A": 198,
+    "B": 208,
+    "C": 305,
+    "INELIGIBLE": 1327
+  },
+  "train_scenario_overlap": 0,
+  "validation_scenario_overlap": 0,
+  "maneuver_duplicate": 0,
+  "candidate_duplicate": 0,
+  "maneuver_overlap_with_canonical": 0,
+  "candidate_overlap_with_canonical": 0,
+  "filter_config": "configs/merge_v2_decision_filter.yaml",
+  "filter_config_sha256": "538c40d6594493ffb3ab40164145f71ab0ba4977edde4c7b64e7d65b97d24375",
+  "dataset_config": "configs/dataset_test.yaml",
+  "test_manifest": "data/manifests/test/merge_decision_test_manifest.csv",
+  "test_manifest_sha256": "295c7955771a5b12803a05d3c4854df76c190ef7241d6e5b7559b0dcba066b90",
+  "test_split_manifest": "data/manifests/test/merge_test_split.csv",
+  "test_split_manifest_sha256": "e941deb1c4644c33a2ac8afd5d6c741cab99698fb9599296970e9da8885f6008",
+  "test_evidence": "data/manifests/test/evidence_test.jsonl",
+  "test_evidence_sha256": "219bd6fc1c25803ccf2b3e9005630ddfe69de0f3937c951d2154c10c74827129",
+  "canonical_manifest_sha256_at_freeze": "ee58ac8a085c5de832af2553536d07d3a84d200765beaf9658336ce54b004bb1",
+  "policy_evaluation_on_test": "NOT RUN"
+}
